@@ -127,6 +127,8 @@ static const MountPoint mount_table[] = {
 #endif
         { "bpf",         "/sys/fs/bpf",               "bpf",        "mode=0700",                                MS_NOSUID|MS_NOEXEC|MS_NODEV,
           NULL,          MNT_NONE,                  },
+        { "io.systemd.run-host", "/run/host",         "virtiofs",   NULL,                                       MS_NOSUID|MS_NODEV,
+          NULL,          MNT_NONE,                  },
 };
 
 assert_cc(N_EARLY_MOUNT <= ELEMENTSOF(mount_table));

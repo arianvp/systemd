@@ -288,10 +288,6 @@ if install_sysconfdir
                         install_dir : sysconfdir / 'xdg/systemd')
 endif
 
-assert(fs.parent(sbindir) / 'lib/systemd' == libexecdir)
-install_symlink('init',
-                pointing_to : '../lib/systemd/systemd',
-                install_dir : sbindir)
 
 ############################################################
 

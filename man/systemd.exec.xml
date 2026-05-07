@@ -3866,9 +3866,21 @@ StandardInputData=V2XigLJyZSBubyBzdHJhbmdlcnMgdG8gbG92ZQpZb3Uga25vdyB0aGUgcnVsZX
         credential plus a file system path, separated by a colon. The ID must be a short ASCII string
         suitable as filename in the filesystem, and may be chosen freely by the user. If the specified path
         is absolute it is opened as regular file and the credential data is read from it. If the absolute
-        path refers to an <constant>AF_UNIX</constant> stream socket in the file system a connection is made
-        to it (once at process invocation) and the credential data read from the connection, providing an
-        easy IPC integration point for dynamically transferring credentials from other services.</para>
+        path refers to an <constant>AF_UNIX</constant> socket in the file system a connection is made to it
+        and the credential data read from it, providing an easy IPC integration point for dynamically
+        transferring credentials from other services. The socket type listened on by the source determines
+        the protocol: a <constant>SOCK_STREAM</constant> source returns the credential as a single
+        connection's worth of bytes (read until EOF), while a <constant>SOCK_SEQPACKET</constant> source
+        returns it as a single datagram. The latter is also treated as a streaming source: the service
+        manager keeps a long-lived <constant>SOCK_SEQPACKET</constant> connection open in addition to the
+        one used to fetch the initial value, and each subsequent datagram received on it triggers a reload
+        of the unit through the same machinery as <varname>RefreshOnReload=credentials</varname> documented
+        in <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+        causing the credential to be re-read. This makes the directive suitable for short-lived workload
+        credentials such as those distributed by a SPIFFE/SPIRE Workload API agent. The watcher does not
+        reconnect if the source goes away (closes the connection); arrange for ordering and consumer
+        restarts via <varname>BindsTo=</varname>/<varname>PartOf=</varname>/<varname>After=</varname> on the
+        source unit if recovery is required.</para>
 
         <para>If the specified path is not absolute and itself qualifies as valid credential identifier it is
         attempted to find a credential that the service manager itself received under the specified name —

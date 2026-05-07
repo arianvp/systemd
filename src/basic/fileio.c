@@ -18,6 +18,8 @@
 #include "iovec-util.h"
 #include "label.h"
 #include "log.h"
+#include "memfd-util.h"
+#include "memory-util.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
 #include "parse-util.h"
@@ -1046,35 +1048,98 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
         return 0;
 }
 
+static int xfopenat_unix_socket_seqpacket(int sk_take, FILE **ret) {
+        /* Receive a single datagram from a SOCK_SEQPACKET source and wrap it in a memfd-backed
+         * read-only FILE*, so callers built around stream-style read-to-EOF semantics work
+         * unchanged. Takes ownership of the passed fd. */
+
+        _cleanup_close_ int sk = sk_take;
+        _cleanup_close_ int mfd = -EBADF;
+        _cleanup_(erase_and_freep) void *buf = NULL;
+        FILE *f;
+
+        assert(sk >= 0);
+        assert(ret);
+
+        /* Probe the size of the pending datagram with MSG_PEEK|MSG_TRUNC: the kernel reports the
+         * full datagram length even when the buffer is too small. */
+        ssize_t probe = recv(sk, NULL, 0, MSG_PEEK|MSG_TRUNC);
+        if (probe < 0)
+                return -errno;
+
+        size_t size = (size_t) probe;
+        if (size > 0) {
+                buf = malloc(size);
+                if (!buf)
+                        return -ENOMEM;
+
+                ssize_t n = recv(sk, buf, size, MSG_TRUNC);
+                if (n < 0)
+                        return -errno;
+                if ((size_t) n != size)
+                        return -EBADMSG;
+        } else
+                /* Drain the empty datagram. */
+                (void) recv(sk, NULL, 0, 0);
+
+        mfd = memfd_new_and_seal("credential-seqpacket", buf, size);
+        if (mfd < 0)
+                return mfd;
+
+        f = take_fdopen(&mfd, "r");
+        if (!f)
+                return -errno;
+
+        *ret = f;
+        return 0;
+}
+
 static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_name, FILE **ret) {
         _cleanup_close_ int sk = -EBADF;
         FILE *f;
         int r;
+        int type;
 
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
         assert(ret);
 
-        sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
-        if (sk < 0)
-                return -errno;
+        /* Try SOCK_SEQPACKET first: if the source listens on a SEQPACKET socket it almost
+         * certainly is a "streaming" credential source where each datagram is a record (and pid1
+         * may be holding a separate watcher connection on the same path). The first datagram on
+         * a fresh connection is the current value of the credential, which is what we want to
+         * load here. If the server listens on SOCK_STREAM the connect() will fail with
+         * -EPROTOTYPE and we fall back to the historical SOCK_STREAM behaviour. */
+        for (type = SOCK_SEQPACKET; ; type = SOCK_STREAM) {
+                sk = socket(AF_UNIX, type|SOCK_CLOEXEC, 0);
+                if (sk < 0)
+                        return -errno;
 
-        if (bind_name) {
-                /* If the caller specified a socket name to bind to, do so before connecting. This is
-                 * useful to communicate some minor, short meta-information token from the client to
-                 * the server. */
-                union sockaddr_union bsa;
+                if (bind_name) {
+                        /* If the caller specified a socket name to bind to, do so before connecting.
+                         * This is useful to communicate some minor, short meta-information token
+                         * from the client to the server. */
+                        union sockaddr_union bsa;
 
-                r = sockaddr_un_set_path(&bsa.un, bind_name);
-                if (r < 0)
+                        r = sockaddr_un_set_path(&bsa.un, bind_name);
+                        if (r < 0)
+                                return r;
+
+                        if (bind(sk, &bsa.sa, r) < 0)
+                                return -errno;
+                }
+
+                r = connect_unix_path(sk, dir_fd, path);
+                if (r >= 0)
+                        break;
+                if (type == SOCK_STREAM || r != -EPROTOTYPE)
                         return r;
 
-                if (bind(sk, &bsa.sa, r) < 0)
-                        return -errno;
+                /* Server is not SOCK_SEQPACKET; close and retry as SOCK_STREAM. */
+                sk = safe_close(sk);
         }
 
-        r = connect_unix_path(sk, dir_fd, path);
-        if (r < 0)
-                return r;
+        if (type == SOCK_SEQPACKET)
+                return xfopenat_unix_socket_seqpacket(TAKE_FD(sk), ret);
 
         if (shutdown(sk, SHUT_WR) < 0)
                 return -errno;

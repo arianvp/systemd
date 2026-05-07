@@ -22,6 +22,7 @@
 #include "chase.h"
 #include "chattr-util.h"
 #include "condition.h"
+#include "credential-stream.h"
 #include "dbus-unit.h"
 #include "dropin.h"
 #include "dynamic-user.h"
@@ -789,6 +790,8 @@ Unit* unit_free(Unit *u) {
         bus_unit_send_removed_signal(u);
 
         unit_done(u);
+
+        unit_teardown_credential_streams(u);
 
         u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
         u->bus_track = sd_bus_track_unref(u->bus_track);

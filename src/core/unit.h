@@ -247,6 +247,12 @@ typedef struct Unit {
          * value the UnitDependencyInfo type */
         Hashmap *mounts_for[_UNIT_MOUNT_DEPENDENCY_TYPE_MAX];
 
+        /* Long-lived AF_UNIX SOCK_SEQPACKET watchers for LoadCredential= sources that listen on
+         * SOCK_SEQPACKET (i.e. credential sources that push updates). Keyed by credential id, value
+         * is a CredentialStreamWatcher. Lives in pid1's event loop and is managed by
+         * src/core/credential-stream.c. */
+        Hashmap *credential_stream_watchers;
+
         char *description;
         char **documentation;
 

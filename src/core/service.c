@@ -20,6 +20,7 @@
 #include "devnum-util.h"
 #include "env-util.h"
 #include "errno-util.h"
+#include "credential-stream.h"
 #include "escape.h"
 #include "execute.h"
 #include "exec-credential.h"
@@ -2626,6 +2627,11 @@ static void service_enter_start_pre(Service *s) {
         assert(s);
 
         service_unwatch_control_pid(s);
+
+        /* Opportunistically install SOCK_SEQPACKET watchers for any LoadCredential= sources whose
+         * server happens to listen on SEQPACKET. Static (SOCK_STREAM) sources are silently ignored.
+         * Idempotent. */
+        (void) unit_setup_credential_streams(UNIT(s));
 
         s->control_command = s->exec_command[SERVICE_EXEC_START_PRE];
         if (s->control_command) {

@@ -32,6 +32,7 @@ libcore_sources = files(
         'dbus.c',
         'device.c',
         'dynamic-user.c',
+        'credential-stream.c',
         'emergency-action.c',
         'exec-credential.c',
         'execute.c',

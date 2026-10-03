@@ -327,6 +327,11 @@ void log_set_open_when_needed(bool b);
  * stderr, the console or kmsg */
 void log_set_prohibit_ipc(bool b);
 
+/* If turned on, we'll never block when sending a message to the journal: if the queue of journald's socket
+ * is full, we log the message to kmsg (if that's part of the log target) or the console right away instead.
+ * This is useful when journald might not be reading from its socket, e.g. because it isn't running (yet). */
+void log_set_journal_nonblocking(bool b);
+
 int log_dup_console(void);
 
 int log_syntax_internal(

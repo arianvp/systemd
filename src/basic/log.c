@@ -70,6 +70,7 @@ static bool upgrade_syslog_to_journal = false;
 static bool always_reopen_console = false;
 static bool open_when_needed = false;
 static bool prohibit_ipc = false;
+static bool journal_nonblocking = false;
 
 static thread_local const char *log_prefix = NULL;
 
@@ -704,6 +705,10 @@ static void log_do_context(struct iovec *iovec, size_t iovec_len, size_t *n) {
         }
 }
 
+static int journal_send_flags(void) {
+        return MSG_NOSIGNAL | (journal_nonblocking ? MSG_DONTWAIT : 0);
+}
+
 static int write_to_journal(
                 int level,
                 int error,
@@ -751,7 +756,7 @@ static int write_to_journal(
                 .msg_iovlen = n,
         };
 
-        if (sendmsg(journal_fd, &msghdr, MSG_NOSIGNAL) < 0)
+        if (sendmsg(journal_fd, &msghdr, journal_send_flags()) < 0)
                 return -errno;
 
         return 1;
@@ -826,8 +831,14 @@ int log_dispatch_internal(
                         }
                 }
 
-                if (k <= 0)
+                if (k <= 0) {
+                        /* In non-blocking mode the journal might not have taken the message merely because
+                         * it is busy, hence make sure we can fall back to the console then. */
+                        if (k < 0 && journal_nonblocking)
+                                (void) log_open_console();
+
                         (void) write_to_console(level, error, file, line, func, buffer);
+                }
 
                 buffer = e;
         } while (buffer);
@@ -1055,7 +1066,12 @@ int log_struct_internal(
                                         .msg_iovlen = n,
                                 };
 
-                                (void) sendmsg(journal_fd, &msghdr, MSG_NOSIGNAL);
+                                /* If the journal didn't take the message, fall back to unstructured logging
+                                 * below. Except if we already waited for it in vain, as we'd only wait again
+                                 * there. */
+                                if (sendmsg(journal_fd, &msghdr, journal_send_flags()) < 0 &&
+                                    (errno != EAGAIN || journal_nonblocking))
+                                        fallback = true;
                         }
 
                         va_end(ap);
@@ -1157,7 +1173,7 @@ int log_struct_iovec_internal(
                         .msg_iovlen = n,
                 };
 
-                if (sendmsg(journal_fd, &msghdr, MSG_NOSIGNAL) >= 0)
+                if (sendmsg(journal_fd, &msghdr, journal_send_flags()) >= 0)
                         return -ERRNO_VALUE(error);
         }
 
@@ -1706,6 +1722,10 @@ void log_set_open_when_needed(bool b) {
 
 void log_set_prohibit_ipc(bool b) {
         prohibit_ipc = b;
+}
+
+void log_set_journal_nonblocking(bool b) {
+        journal_nonblocking = b;
 }
 
 int log_emergency_level(void) {

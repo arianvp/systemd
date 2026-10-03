@@ -2793,6 +2793,10 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
 
         unit_update_on_console(u);
 
+        /* Check whether we can log to the journal (now) before we process the job, so that the job's
+         * completion message is already logged according to the new state of things. */
+        manager_recheck_journal(m);
+
         if (!MANAGER_IS_RELOADING(m)) {
                 bool unexpected;
 
@@ -2834,7 +2838,6 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_su
                         unit_start_on_termination_deps(u, UNIT_ATOM_ON_FAILURE);
         }
 
-        manager_recheck_journal(m);
         manager_recheck_dbus(m);
 
         unit_trigger_notify(u);

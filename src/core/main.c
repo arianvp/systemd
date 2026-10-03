@@ -3587,8 +3587,10 @@ static int run_systemd(int argc, char *argv[]) {
                 /* Disable the umask logic */
                 umask(0);
 
-                /* Make sure that at least initially we do not ever log to journald/syslogd, because it might
-                 * not be activated yet (even though the log socket for it exists). */
+                /* Make sure that at least initially we do not ever log to journald/syslogd: until the units
+                 * are loaded/deserialized we don't know whether journald's socket is actually set up (even
+                 * though the log socket for it might exist). manager_recheck_journal() lifts this once we
+                 * know. */
                 log_set_prohibit_ipc(true);
 
                 /* Always reopen /dev/console when running as PID 1 or one of its pre-execve() children. This

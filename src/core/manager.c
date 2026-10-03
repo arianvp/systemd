@@ -4727,6 +4727,39 @@ static bool manager_journal_is_running(Manager *m) {
         return true;
 }
 
+static bool manager_journal_is_listening(Manager *m) {
+        Unit *u;
+
+        assert(m);
+
+        if (MANAGER_IS_TEST_RUN(m))
+                return false;
+
+        /* If we are the user manager we can safely assume that the journal is up */
+        if (!MANAGER_IS_SYSTEM(m))
+                return true;
+
+        /* Check that the socket is up, i.e. either listening or already handed over to the daemon. In both
+         * cases the kernel queues whatever is written to it (up to net.unix.max_dgram_qlen datagrams) until
+         * journald gets around to reading it, hence it doesn't matter whether journald itself is up already.
+         * In SOCKET_DEFERRED state the socket isn't watched though, and the pending activation might be
+         * given up on, in which case whatever was queued is lost, hence don't consider it up then. */
+        u = manager_get_unit(m, SPECIAL_JOURNALD_SOCKET);
+        if (!u)
+                return false;
+        if (!IN_SET(SOCKET(u)->state, SOCKET_LISTENING, SOCKET_RUNNING))
+                return false;
+
+        /* If journald failed, it might well fail again until it hits the start limit, which takes down the
+         * socket and with it whatever was queued in it. Hence, don't rely on journald draining the socket
+         * until it is started again. Note that journald being terminated on switch-root is not a failure. */
+        u = manager_get_unit(m, SPECIAL_JOURNALD_SERVICE);
+        if (u && SERVICE(u)->result != SERVICE_SUCCESS)
+                return false;
+
+        return true;
+}
+
 void disable_printk_ratelimit(void) {
         /* Disable kernel's printk ratelimit.
          *
@@ -4752,10 +4785,19 @@ void manager_recheck_journal(Manager *m) {
         if (MANAGER_IS_RELOADING(m))
                 return;
 
-        /* The journal is fully and entirely up? If so, let's permit logging to it, if that's configured. If
-         * the journal is down, don't ever log to it, otherwise we might end up deadlocking ourselves as we
-         * might trigger an activation ourselves we can't fulfill. */
-        log_set_prohibit_ipc(!manager_journal_is_running(m));
+        /* The journal socket is up? If so, let's permit logging to it, if that's configured, regardless of
+         * whether journald itself is up already, so that the structured fields of our log messages (UNIT=,
+         * MESSAGE_ID=, JOB_ID=, …) are retained, which they wouldn't be if we logged to kmsg. This matters
+         * in particular during early boot and after switch-root, where journald is (re)started. If journald
+         * isn't up yet, the kernel queues our messages in the socket until it is, and if our message
+         * triggers its activation, that's fine too (DeferTrigger= takes care of conflicting jobs).
+         *
+         * As long as journald isn't fully up, don't ever block on the socket though, but fall back to kmsg
+         * (or the console) right away if its queue is full, as we cannot know when journald will get around
+         * to draining it. Processes we fork off inherit this, which matters as they use a much longer send
+         * timeout than us. sd-executor is told separately, see manager_get_executor_log_target(). */
+        log_set_prohibit_ipc(!manager_journal_is_listening(m));
+        log_set_journal_nonblocking(!manager_journal_is_running(m));
         log_open();
 }
 
@@ -5593,7 +5635,10 @@ void unit_defaults_done(UnitDefaults *defaults) {
 LogTarget manager_get_executor_log_target(Manager *m) {
         assert(m);
 
-        /* If journald is not available tell sd-executor to go to kmsg, as it might be starting journald */
+        /* If journald is not available tell sd-executor to go to kmsg, as it might be starting journald.
+         * Note that this is stricter than what PID 1 applies to itself in manager_recheck_journal(), as the
+         * process that is about to become journald must never log to journald's socket: if it blocks on its
+         * full queue, nobody but itself would drain it. */
         if (!MANAGER_IS_TEST_RUN(m) && !manager_journal_is_running(m))
                 return LOG_TARGET_KMSG;
 

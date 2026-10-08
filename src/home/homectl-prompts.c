@@ -10,6 +10,7 @@
 #include "group-record.h"
 #include "homectl-prompts.h"
 #include "log.h"
+#include "osc-program-status.h"
 #include "parse-util.h"
 #include "prompt-util.h"
 #include "string-util.h"
@@ -104,6 +105,22 @@ int prompt_groups(const char *username, char ***ret_groups) {
         assert(username);
         assert(ret_groups);
 
+        _cleanup_free_ char *q = strjoin("Please enter an auxiliary group for user ", username);
+        if (!q)
+                return log_oom();
+
+        /* We don't go through prompt_loop() here, hence let the terminal know ourselves that we are waiting
+         * for the user. A single record spans all groups we ask for. */
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
+        (void) osc_program_status_record_blocked(
+                        &status,
+                        STDOUT_FILENO,
+                        OSC_PROGRAM_STATUS_STDIN,
+                        "prompt",
+                        OSC_PROGRAM_STATUS_QUESTION,
+                        q);
+
         _cleanup_strv_free_ char **available = NULL, **groups = NULL;
         for (;;) {
                 strv_sort_uniq(groups);
@@ -122,9 +139,9 @@ int prompt_groups(const char *username, char ***ret_groups) {
                                 /* prefill= */ NULL,
                                 group_completion_callback,
                                 &available,
-                                "%s Please enter an auxiliary group for user %s (empty to continue, \"list\" to list available groups): ",
+                                "%s %s (empty to continue, \"list\" to list available groups): ",
                                 glyph(GLYPH_LABEL),
-                                username);
+                                q);
                 if (r < 0)
                         return log_error_errno(r, "Failed to query user for auxiliary group: %m");
 

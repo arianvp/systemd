@@ -9,6 +9,7 @@
 #include "log.h"
 #include "macro.h"
 #include "os-util.h"
+#include "osc-program-status.h"
 #include "parse-util.h"
 #include "pretty-print.h"
 #include "prompt-util.h"
@@ -81,6 +82,20 @@ int prompt_loop(
         if (!emoji_enabled()) /* If emojis aren't available, simpler unicode chars might still be around,
                                * hence try to downgrade. (Consider the Linux Console!) */
                 emoji = GLYPH_TRIANGULAR_BULLET;
+
+        /* Let the terminal know that we are waiting for the user. Do this before showing the menu, since
+         * that might page and wait for a key press. A single record spans the whole loop, i.e. we don't
+         * report again when we have to ask again after invalid input. */
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
+        (void) osc_program_status_record_blocked(
+                        &status,
+                        STDOUT_FILENO,
+                        OSC_PROGRAM_STATUS_STDIN,
+                        "prompt",
+                        FLAGS_SET(flags, PROMPT_PERMISSION) ? OSC_PROGRAM_STATUS_PERMISSION
+                                                            : OSC_PROGRAM_STATUS_QUESTION,
+                        text);
 
         /* If requested show menu right-away */
         if (FLAGS_SET(flags, PROMPT_SHOW_MENU_NOW) && !strv_isempty(menu)) {
@@ -237,7 +252,8 @@ int prompt_loop_yes_no(const char *question, const char *prefill, bool def, bool
                         /* is_valid= */ boolean_is_valid,
                         /* refresh= */ NULL,
                         /* userdata= */ NULL,
-                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT,
+                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT|
+                        PROMPT_PERMISSION,
                         &reply);
         if (r < 0)
                 return r;

@@ -10,6 +10,7 @@ typedef enum PromptFlags {
         PROMPT_HIDE_MENU_HINT  = 1 << 3, /* Don't show hint regarding "list" */
         PROMPT_HIDE_SKIP_HINT  = 1 << 4, /* Don't show hint regarding skipping */
         PROMPT_SILENT_VALIDATE = 1 << 5, /* The validation log message logs on its own, don't log again */
+        PROMPT_PERMISSION      = 1 << 6, /* Asks for approval (e.g. yes/no), rather than for an answer */
 } PromptFlags;
 
 int prompt_loop(const char *text,

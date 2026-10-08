@@ -31,6 +31,7 @@
 #include "log.h"
 #include "main-func.h"
 #include "memory-util.h"
+#include "osc-program-status.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -1322,8 +1323,20 @@ static int run(int argc, char *argv[]) {
         r = 0;
 
 finish:
-        if (arg_firstboot)
+        if (arg_firstboot) {
+                /* Let the terminal know that we wait for the user to acknowledge the result */
+                _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                        OSC_PROGRAM_STATUS_RECORD_NULL;
+                (void) osc_program_status_record_blocked(
+                                &status,
+                                STDOUT_FILENO,
+                                OSC_PROGRAM_STATUS_STDIN,
+                                "prompt",
+                                /* kind= */ _OSC_PROGRAM_STATUS_KIND_INVALID,
+                                "Press any key to proceed");
+
                 (void) any_key_to_proceed();
+        }
 
         return r;
 }

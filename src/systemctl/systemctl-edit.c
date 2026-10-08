@@ -7,6 +7,7 @@
 #include "edit-util.h"
 #include "hashmap.h"
 #include "label-util.h"
+#include "osc-program-status.h"
 #include "pager.h"
 #include "path-lookup.h"
 #include "path-util.h"
@@ -196,7 +197,23 @@ static int unit_file_create_copy(
         if (!path_equal(fragment_path, new_path) && access(new_path, F_OK) >= 0) {
                 char response;
 
-                r = ask_char(&response, "yn", "\"%s\" already exists. Overwrite with \"%s\"? [(y)es, (n)o] ", new_path, fragment_path);
+                _cleanup_free_ char *q = strjoin("\"", new_path, "\" already exists. "
+                                                 "Overwrite with \"", fragment_path, "\"?");
+                if (!q)
+                        return log_oom();
+
+                /* Let the terminal know that we are waiting for the user's approval, until we got it */
+                _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                        OSC_PROGRAM_STATUS_RECORD_NULL;
+                (void) osc_program_status_record_blocked(
+                                &status,
+                                STDOUT_FILENO,
+                                OSC_PROGRAM_STATUS_STDIN,
+                                "prompt",
+                                OSC_PROGRAM_STATUS_PERMISSION,
+                                q);
+
+                r = ask_char(&response, "yn", "%s [(y)es, (n)o] ", q);
                 if (r < 0)
                         return r;
 

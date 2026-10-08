@@ -12,6 +12,7 @@
 #include "glyph-util.h"
 #include "iovec-util.h"
 #include "locale-util.h"
+#include "osc-program-status.h"
 #include "plymouth-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -403,6 +404,23 @@ static void plymouth_end_interaction(bool *displayed) {
         (void) plymouth_send_msg("", /* pause_spinner= */ false);
 }
 
+static void program_status_start_interaction(OscProgramStatusRecord *status, const char *text) {
+        assert(status);
+
+        /* Tells the terminal that we are blocked until the user interacts with the token, but only if we
+         * asked the user to do so, i.e. not when we merely check whether the token wants that at all. */
+        if (!text)
+                return;
+
+        (void) osc_program_status_record_blocked(
+                        status,
+                        STDERR_FILENO, /* where log_notice() showed the request */
+                        /* flags= */ 0,
+                        "security-token",
+                        OSC_PROGRAM_STATUS_AUTH,
+                        text);
+}
+
 static int fido2_use_hmac_hash_specific_token(
                 const char *path,
                 const char *rp_id,
@@ -416,10 +434,13 @@ static int fido2_use_hmac_hash_specific_token(
                 size_t *ret_hmac_size) {
 
         _cleanup_(plymouth_end_interaction) bool plymouth_displayed = false;
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord program_status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
         _cleanup_(fido_assert_free_wrapper) fido_assert_t *a = NULL;
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         _cleanup_(erase_and_freep) void *hmac_copy = NULL;
         bool has_up, has_client_pin, has_uv;
+        const char *interaction = NULL;
         size_t hmac_size;
         const void *hmac;
         int r;
@@ -492,6 +513,7 @@ static int fido2_use_hmac_hash_specific_token(
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
                         plymouth_start_interaction(_("Please confirm presence on security token to unlock."), &plymouth_displayed);
+                        interaction = "Please confirm presence on security token to unlock.";
                 }
         }
 
@@ -508,6 +530,7 @@ static int fido2_use_hmac_hash_specific_token(
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
                         plymouth_start_interaction(_("Please verify user on security token to unlock."), &plymouth_displayed);
+                        interaction = "Please verify user on security token to unlock.";
                 }
         }
 
@@ -520,13 +543,16 @@ static int fido2_use_hmac_hash_specific_token(
                                 r = FIDO_ERR_PIN_REQUIRED;
                         else
                                 STRV_FOREACH(i, pins) {
+                                        program_status_start_interaction(&program_status, interaction);
                                         r = sym_fido_dev_get_assert(d, a, *i);
                                         if (r != FIDO_ERR_PIN_INVALID)
                                                 break;
                                 }
 
-                } else
+                } else {
+                        program_status_start_interaction(&program_status, interaction);
                         r = sym_fido_dev_get_assert(d, a, NULL);
+                }
 
                 /* In some conditions, where a PIN or UP is required we might accept that. Let's check the
                  * conditions and if so try immediately again. */
@@ -601,11 +627,18 @@ static int fido2_use_hmac_hash_specific_token(
                                                        "Failed to enable FIDO2 user presence test: %s", sym_fido_strerr(r));
 
                         required |= FIDO2ENROLL_UP;
+
+                        /* Also covers FIDO_ERR_UNSUPPORTED_OPTION, whose notice doesn't spell this out */
+                        interaction = "Please confirm presence on security token to unlock.";
                 }
 
                 if (retry_with_pin)
                         required |= FIDO2ENROLL_PIN;
         }
+
+        /* The token is not waiting for the user anymore. Clear the report before we return, since our
+         * caller might ask for a PIN next. */
+        osc_program_status_record_clear(&program_status);
 
         r = fido2_common_assert_error_handle(r);
         if (r < 0)
@@ -752,6 +785,8 @@ int fido2_generate_hmac_hash(
                 char **ret_usedpin,
                 Fido2EnrollFlags *ret_locked_with) {
 
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord program_status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
         _cleanup_(erase_and_freep) void *secret_copy = NULL;
         _cleanup_(fido_assert_free_wrapper) fido_assert_t *a = NULL;
         _cleanup_(fido_cred_free_wrapper) fido_cred_t *c = NULL;
@@ -759,6 +794,7 @@ int fido2_generate_hmac_hash(
         _cleanup_(erase_and_freep) char *used_pin = NULL;
         bool has_rk, has_client_pin, has_up, has_uv, has_always_uv;
         _cleanup_free_ char *cid_copy = NULL;
+        const char *interaction = NULL;
         size_t cid_size, secret_size;
         const void *cid, *secret;
         int r;
@@ -896,10 +932,12 @@ int fido2_generate_hmac_hash(
 
         log_info("Initializing FIDO2 credential on security token.");
 
-        if (has_uv || has_up)
+        if (has_uv || has_up) {
                 log_notice("%s%s(Hint: This might require confirmation of user presence on security token.)",
                            emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                            emoji_enabled() ? " " : "");
+                interaction = "This might require confirmation of user presence on security token.";
+        }
 
         /* If we are using the user PIN, then we must pass that PIN to the get_assertion call below, or
          * the authenticator will use the non-user-verification HMAC secret (which differs from the one when
@@ -909,8 +947,11 @@ int fido2_generate_hmac_hash(
          * and then pass it to both the make_credential and the get_assertion operations. */
         if (FLAGS_SET(lock_with, FIDO2ENROLL_PIN))
                 r = FIDO_ERR_PIN_REQUIRED;
-        else
+        else {
+                program_status_start_interaction(&program_status, interaction);
                 r = sym_fido_dev_make_cred(d, c, NULL);
+                osc_program_status_record_clear(&program_status);
+        }
 
         if (r == FIDO_ERR_PIN_REQUIRED) {
 
@@ -974,6 +1015,7 @@ int fido2_generate_hmac_hash(
                                         continue;
                                 }
 
+                                program_status_start_interaction(&program_status, interaction);
                                 r = sym_fido_dev_make_cred(d, c, *i);
                                 if (r == FIDO_OK) {
                                         used_pin = strdup(*i);
@@ -984,6 +1026,9 @@ int fido2_generate_hmac_hash(
                                 if (r != FIDO_ERR_PIN_INVALID)
                                         break;
                         }
+
+                        /* Don't leave the touch request up while we ask for the PIN again */
+                        osc_program_status_record_clear(&program_status);
 
                         if (r != FIDO_ERR_PIN_INVALID)
                                 break;
@@ -1041,6 +1086,9 @@ int fido2_generate_hmac_hash(
 
         log_info("Generating secret key on FIDO2 security token.");
 
+        /* Unlike creating a credential, getting an assertion only needs a touch if we ask for it */
+        interaction = NULL;
+
         if (has_up) {
                 r = sym_fido_assert_set_up(a, FLAGS_SET(lock_with, FIDO2ENROLL_UP) ? FIDO_OPT_TRUE : FIDO_OPT_FALSE);
                 if (r != FIDO_OK)
@@ -1049,10 +1097,13 @@ int fido2_generate_hmac_hash(
                                                enable_disable(FLAGS_SET(lock_with, FIDO2ENROLL_UP)),
                                                sym_fido_strerr(r));
 
-                if (FLAGS_SET(lock_with, FIDO2ENROLL_UP))
+                if (FLAGS_SET(lock_with, FIDO2ENROLL_UP)) {
                         log_notice("%s%sIn order to allow secret key generation, please confirm presence on security token.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
+                        interaction = "In order to allow secret key generation, "
+                                      "please confirm presence on security token.";
+                }
         }
 
         if (has_uv) {
@@ -1063,15 +1114,19 @@ int fido2_generate_hmac_hash(
                                                enable_disable(FLAGS_SET(lock_with, FIDO2ENROLL_UV)),
                                                sym_fido_strerr(r));
 
-                if (FLAGS_SET(lock_with, FIDO2ENROLL_UV))
+                if (FLAGS_SET(lock_with, FIDO2ENROLL_UV)) {
                         log_notice("%s%sIn order to allow secret key generation, please verify user on security token.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
+                        interaction = "In order to allow secret key generation, "
+                                      "please verify user on security token.";
+                }
         }
 
         for (;;) {
                 bool retry_with_up = false, retry_with_pin = false;
 
+                program_status_start_interaction(&program_status, interaction);
                 r = sym_fido_dev_get_assert(d, a, FLAGS_SET(lock_with, FIDO2ENROLL_PIN) ? used_pin : NULL);
 
                 switch (r) {
@@ -1138,11 +1193,15 @@ int fido2_generate_hmac_hash(
                                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to enable FIDO2 user presence test: %s", sym_fido_strerr(r));
 
                         lock_with |= FIDO2ENROLL_UP;
+                        interaction = "In order to allow secret key generation, "
+                                      "please confirm presence on security token.";
                 }
 
                 if (retry_with_pin)
                         lock_with |= FIDO2ENROLL_PIN;
         }
+
+        osc_program_status_record_clear(&program_status);
 
         if (r == FIDO_ERR_ACTION_TIMEOUT)
                 return log_error_errno(SYNTHETIC_ERRNO(ENOSTR),

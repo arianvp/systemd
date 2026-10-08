@@ -43,6 +43,7 @@
 #include "locale-util.h"
 #include "main-func.h"
 #include "options.h"
+#include "osc-program-status.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -600,6 +601,44 @@ static int handle_generic_user_record_error(
                 return log_error_errno(ret, "Operation on home %s failed: %s", user_name, bus_error_message(error, ret));
 
         return 0;
+}
+
+static int home_bus_call(
+                sd_bus *bus,
+                sd_bus_message *m,
+                const UserRecord *secret,
+                sd_bus_error *reterr_error,
+                sd_bus_message **ret_reply) {
+
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord program_status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
+        const char *text = NULL;
+
+        assert(bus);
+        assert(m);
+        assert(secret);
+
+        /* Once handle_generic_user_record_error() asked the user to interact with the security token and
+         * permitted homed to wait for that, the call blocks until the user did so. systemd-homework, which
+         * does the waiting, has no access to the terminal, hence tell the terminal ourselves, using the same
+         * text as the notice. We don't learn when the user interacted with the token, hence the report
+         * stays until the call returns, i.e. also covers whatever homed does afterwards. */
+        if (secret->fido2_user_verification_permitted > 0)
+                text = "Please verify user on security token.";
+        else if (secret->fido2_user_presence_permitted > 0)
+                text = "Please confirm presence on security token.";
+        else if (secret->pkcs11_protected_authentication_path_permitted > 0)
+                text = "Please authenticate physically on security token.";
+        if (text)
+                (void) osc_program_status_record_blocked(
+                                &program_status,
+                                STDERR_FILENO, /* where log_notice() showed the request */
+                                /* flags= */ 0,
+                                "security-token",
+                                OSC_PROGRAM_STATUS_AUTH,
+                                text);
+
+        return sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, reterr_error, ret_reply);
 }
 
 static int acquire_passed_secrets(const char *user_name, UserRecord **ret) {
@@ -1430,7 +1469,7 @@ static int create_home_common(sd_json_variant *input, bool show_enforce_password
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, hr, &error, NULL);
                 if (r < 0) {
                         if (sd_bus_error_has_name(&error, BUS_ERROR_LOW_PASSWORD_QUALITY)) {
                                 _cleanup_(erase_and_freep) char *new_password = NULL;
@@ -1732,7 +1771,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, hr, &error, NULL);
                 if (r < 0) {
                         if (and_change_password &&
                             sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
@@ -1773,7 +1812,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, hr, &error, NULL);
                 if (r < 0) {
                         if (and_change_password &&
                             sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
@@ -1809,7 +1848,7 @@ static int verb_update_home(int argc, char *argv[], uintptr_t _data, void *userd
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, hr, &error, NULL);
                 if (r < 0) {
                         if (sd_bus_error_has_name(&error, BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN))
                                 return log_error_errno(r, "Security token not inserted, refusing.");
@@ -1892,7 +1931,7 @@ static int verb_passwd_home(int argc, char *argv[], uintptr_t _data, void *userd
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, old_secret, &error, NULL);
                 if (r < 0) {
                         if (sd_bus_error_has_name(&error, BUS_ERROR_LOW_PASSWORD_QUALITY)) {
 
@@ -1995,7 +2034,7 @@ static int verb_resize_home(int argc, char *argv[], uintptr_t _data, void *userd
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, secret, &error, NULL);
                 if (r < 0) {
                         r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
                         if (r < 0)
@@ -2076,7 +2115,7 @@ static int verb_activate_home(int argc, char *argv[], uintptr_t _data, void *use
                         if (r < 0)
                                 return bus_log_create_error(r);
 
-                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                        r = home_bus_call(bus, m, secret, &error, NULL);
                         if (r < 0) {
                                 r = handle_generic_user_record_error(*i, secret, &error, r, /* emphasize_current_password= */ false);
                                 if (r < 0) {
@@ -2219,7 +2258,7 @@ static int verb_with_home(int argc, char *argv[], uintptr_t _data, void *userdat
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, &reply);
+                r = home_bus_call(bus, m, secret, &error, &reply);
                 m = sd_bus_message_unref(m);
                 if (r < 0) {
                         r = handle_generic_user_record_error(argv[1], secret, &error, r, false);
@@ -2317,7 +2356,7 @@ static int authenticate_home(sd_bus *bus, const char *name) {
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                r = home_bus_call(bus, m, secret, &error, NULL);
                 if (r < 0) {
                         r = handle_generic_user_record_error(name, secret, &error, r, false);
                         if (r >= 0)
@@ -2848,7 +2887,7 @@ static int verb_unlock_home(int argc, char *argv[], uintptr_t _data, void *userd
                         if (r < 0)
                                 return bus_log_create_error(r);
 
-                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                        r = home_bus_call(bus, m, secret, &error, NULL);
                         if (r < 0) {
                                 r = handle_generic_user_record_error(*i, secret, &error, r, false);
                                 if (r < 0) {
@@ -5053,7 +5092,7 @@ static int fallback_shell(int argc, char *argv[]) {
                         if (r < 0)
                                 return bus_log_create_error(r);
 
-                        r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+                        r = home_bus_call(bus, m, secret, &error, NULL);
                         if (r < 0) {
                                 if (sd_bus_error_has_name(&error, BUS_ERROR_HOME_NOT_REFERENCED))
                                         return log_error_errno(r, "Called without reference on home taken, can't operate.");

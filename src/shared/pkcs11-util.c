@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "crypto-util.h"
@@ -9,6 +11,7 @@
 #include "format-table.h"
 #include "log.h"
 #include "memory-util.h"
+#include "osc-program-status.h"
 #include "pkcs11-util.h"
 #include "random-util.h"
 #include "string-table.h"
@@ -231,7 +234,25 @@ int pkcs11_token_login_by_pin(
                 return r;
 
         if (FLAGS_SET(token_info->flags, CKF_PROTECTED_AUTHENTICATION_PATH)) {
+                _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord program_status =
+                        OSC_PROGRAM_STATUS_RECORD_NULL;
+                const char *text;
+
+                /* C_Login() blocks until the user authenticated on the token or reader itself, e.g. by
+                 * entering the PIN on its PIN pad. Nothing told the user about that so far, hence do so
+                 * here, with the wording homectl uses for this, and tell the terminal too. */
+                text = strjoina("Please authenticate physically on security token '", token_label, "'.");
+                log_notice("%s", text);
+                (void) osc_program_status_record_blocked(
+                                &program_status,
+                                STDERR_FILENO, /* where log_notice() shows it */
+                                /* flags= */ 0,
+                                "security-token",
+                                OSC_PROGRAM_STATUS_AUTH,
+                                text);
+
                 rv = m->C_Login(session, CKU_USER, NULL, 0);
+                osc_program_status_record_clear(&program_status);
                 if (rv != CKR_OK)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Failed to log into security token '%s': %s", token_label, sym_p11_kit_strerror(rv));

@@ -3,6 +3,10 @@
 
 #include "forward.h"
 
+/* The id of the OSC 7501 record ask_password_tty() reports on (see osc-program-status.h). The password
+ * agent uses it to clear records on behalf of agents it had to kill. */
+#define ASK_PASSWORD_PROGRAM_STATUS_ID "password"
+
 typedef enum AskPasswordFlags {
         ASK_PASSWORD_ACCEPT_CACHED = 1 << 0,  /* read from kernel keyring */
         ASK_PASSWORD_PUSH_CACHE    = 1 << 1,  /* write to kernel keyring after getting password from elsewhere */

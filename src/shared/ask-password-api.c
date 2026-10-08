@@ -24,6 +24,7 @@
 #include "keyring-util.h"
 #include "log.h"
 #include "nulstr-util.h"
+#include "osc-program-status.h"
 #include "parse-util.h"
 #include "path-lookup.h"
 #include "plymouth-util.h"
@@ -479,6 +480,9 @@ int ask_password_tty(
 
         bool reset_tty = false, dirty = false, use_color = false, press_tab_visible = false;
         _cleanup_close_ int cttyfd = -EBADF, inotify_fd = -EBADF;
+        /* Declared after cttyfd, so that the record is cleared before the fd is closed */
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
         struct termios old_termios, new_termios;
         char passphrase[LINE_MAX + 1] = {}, *x;
         _cleanup_strv_free_erase_ char **l = NULL;
@@ -575,6 +579,18 @@ int ask_password_tty(
                         goto finish;
 
                 reset_tty = true;
+
+                /* Tell the terminal that we are now waiting for the user, so that it can point them to us.
+                 * Use the message without the emoji we prefixed above. In console mode we usually have no
+                 * $TERM, hence tell the emitter to look for it elsewhere, like we do for colors. */
+                (void) osc_program_status_record_blocked(
+                                &status,
+                                ttyfd,
+                                FLAGS_SET(flags, ASK_PASSWORD_CONSOLE_COLOR) ?
+                                        OSC_PROGRAM_STATUS_CONSOLE : 0,
+                                ASK_PASSWORD_PROGRAM_STATUS_ID,
+                                OSC_PROGRAM_STATUS_AUTH,
+                                req->message ?: "Password:");
         }
 
         enum {

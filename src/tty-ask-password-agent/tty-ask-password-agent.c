@@ -27,14 +27,15 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "hashmap.h"
 #include "inotify-util.h"
 #include "io-util.h"
 #include "main-func.h"
 #include "mkdir.h"
+#include "osc-program-status.h"
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
-#include "set.h"
 #include "signal-util.h"
 #include "socket-util.h"
 #include "static-destruct.h"
@@ -566,8 +567,31 @@ static int ask_on_this_console(const char *tty, char **arguments, PidRef *ret) {
         return 0;
 }
 
-static void terminate_agents(Set *pids) {
+static void clear_console_status(const char *tty) {
+        _cleanup_close_ int fd = -EBADF;
+
+        assert(tty);
+
+        /* Don't even open the console if reports are turned off */
+        if (!osc_program_status_wanted(OSC_PROGRAM_STATUS_CONSOLE))
+                return;
+
+        /* Open in non-blocking mode, so that neither opening the device nor writing to it can hang, e.g.
+         * on a serial console without carrier or with flow control asserted. */
+        fd = open_terminal(tty, O_WRONLY|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        if (fd < 0) {
+                log_debug_errno(fd, "Failed to open %s, ignoring: %m", tty);
+                return;
+        }
+
+        /* The child re-executes us with the same argv[0], hence the emitter prefixes the same program name,
+         * and we address the very record the child created. */
+        (void) osc_program_status_clear(fd, OSC_PROGRAM_STATUS_CONSOLE, ASK_PASSWORD_PROGRAM_STATUS_ID);
+}
+
+static void terminate_agents(Hashmap *pids) {
         sigset_t set;
+        const char *tty;
         void *p;
         int r, signum;
 
@@ -575,7 +599,7 @@ static void terminate_agents(Set *pids) {
          * Request termination of the remaining processes as those
          * are not required anymore.
          */
-        SET_FOREACH(p, pids)
+        HASHMAP_FOREACH_KEY(tty, p, pids)
                 (void) kill(PTR_TO_PID(p), SIGTERM);
 
         /*
@@ -584,7 +608,7 @@ static void terminate_agents(Set *pids) {
         assert_se(sigemptyset(&set) >= 0);
         assert_se(sigaddset(&set, SIGCHLD) >= 0);
 
-        while (!set_isempty(pids)) {
+        while (!hashmap_isempty(pids)) {
                 siginfo_t status = {};
 
                 r = waitid(P_ALL, 0, &status, WEXITED|WNOHANG);
@@ -592,7 +616,7 @@ static void terminate_agents(Set *pids) {
                         continue;
 
                 if (r == 0 && status.si_pid > 0) {
-                        set_remove(pids, PID_TO_PTR(status.si_pid));
+                        hashmap_remove(pids, PID_TO_PTR(status.si_pid));
                         continue;
                 }
 
@@ -608,15 +632,29 @@ static void terminate_agents(Set *pids) {
         /*
          * Kill hanging processes.
          */
-        SET_FOREACH(p, pids) {
+        HASHMAP_FOREACH_KEY(tty, p, pids) {
                 log_warning("Failed to terminate child %d, killing it", PTR_TO_PID(p));
                 (void) kill(PTR_TO_PID(p), SIGKILL);
+        }
+
+        /* The killed children were most likely still showing the password prompt (they block SIGTERM while
+         * doing so), and won't get the chance to remove their record from the terminal anymore. Hence do
+         * so on their behalf, but only once they are gone: a child that is the controlling process of its
+         * console hangs up the console when it exits, which would drop what we write before that. Waiting
+         * is bounded, since SIGKILL cannot be blocked. */
+        HASHMAP_FOREACH_KEY(tty, p, pids) {
+                siginfo_t status = {};
+
+                while (waitid(P_PID, PTR_TO_PID(p), &status, WEXITED) < 0 && errno == EINTR)
+                        ;
+
+                clear_console_status(tty);
         }
 }
 
 static int ask_on_consoles(char *argv[]) {
         _cleanup_strv_free_ char **consoles = NULL, **arguments = NULL;
-        _cleanup_set_free_ Set *pids = NULL;
+        _cleanup_hashmap_free_ Hashmap *pids = NULL;
         int r;
 
         assert(!arg_device);
@@ -631,7 +669,7 @@ static int ask_on_consoles(char *argv[]) {
                 return 0;
         }
 
-        pids = set_new(NULL);
+        pids = hashmap_new(NULL);
         if (!pids)
                 return log_oom();
 
@@ -654,7 +692,8 @@ static int ask_on_consoles(char *argv[]) {
                 if (r < 0)
                         return r;
 
-                if (set_put(pids, PID_TO_PTR(pidref.pid)) < 0)
+                /* Remember the console of each agent, so that we can clean up after it if we kill it */
+                if (hashmap_put(pids, PID_TO_PTR(pidref.pid), *tty) < 0)
                         return log_oom();
         }
 
@@ -672,7 +711,7 @@ static int ask_on_consoles(char *argv[]) {
                 if (!is_clean_exit(status.si_code, status.si_status, EXIT_CLEAN_DAEMON, NULL))
                         log_error("Password agent failed with: %d", status.si_status);
 
-                set_remove(pids, PID_TO_PTR(status.si_pid));
+                hashmap_remove(pids, PID_TO_PTR(status.si_pid));
                 break;
         }
 

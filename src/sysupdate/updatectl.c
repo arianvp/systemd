@@ -18,6 +18,7 @@
 #include "hashmap.h"
 #include "json-util.h"
 #include "main-func.h"
+#include "osc-program-status.h"
 #include "pager.h"
 #include "polkit-agent.h"
 #include "pretty-print.h"
@@ -833,8 +834,14 @@ static int verb_check(int argc, char *argv[], uintptr_t _data, void *userdata) {
 /* Make sure it doesn't overlap w/ errno values */
 assert_cc(UPDATE_PROGRESS_FAILED < -ERRNO_MAX);
 
+typedef struct UpdateRenderContext {
+        OrderedHashmap *map;
+        OscProgramStatusRecord *status;
+} UpdateRenderContext;
+
 static int update_render_progress(sd_event_source *source, void *userdata) {
-        OrderedHashmap *map = ASSERT_PTR(userdata);
+        UpdateRenderContext *c = ASSERT_PTR(userdata);
+        OrderedHashmap *map = ASSERT_PTR(c->map);
         const char *target;
         void *p;
         unsigned total;
@@ -915,7 +922,44 @@ static int update_render_progress(sd_event_source *source, void *userdata) {
         } else if (!exiting)
                 fputs("------\n", stderr);
 
+        /* Report the total to the terminal too, so that it can show it even while the user looks elsewhere.
+         * How the update ended is reported by do_update() once the event loop finished. */
+        if (!exiting && n > 0)
+                (void) osc_program_status_record_working(
+                                c->status,
+                                STDERR_FILENO,
+                                /* flags= */ 0,
+                                "update",
+                                MIN(total / n, 100U),
+                                /* msg= */ NULL);
+
         return 0;
+}
+
+static void update_report_finished(OscProgramStatusRecord *status, OrderedHashmap *map) {
+        bool success = true;
+        void *p;
+
+        assert(status);
+
+        ORDERED_HASHMAP_FOREACH(p, map) {
+                int progress = PTR_TO_INT(p);
+
+                if (IN_SET(progress, UPDATE_PROGRESS_DONE, -EALREADY))
+                        continue;
+
+                /* If the user interrupted us, or the outcome for a target is unknown, there's nothing to
+                 * report. The caller clears the record then. */
+                if (progress >= 0 || progress == -ECANCELED)
+                        return;
+
+                success = false;
+        }
+
+        (void) osc_program_status_record_finish(
+                        status,
+                        success,
+                        success ? "Update succeeded." : "Update failed.");
 }
 
 static int update_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
@@ -1209,6 +1253,9 @@ static int do_update(sd_bus *bus, char **targets) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *render_exit = NULL;
         _cleanup_ordered_hashmap_free_ OrderedHashmap *map = NULL;
         _cleanup_strv_free_ char **versions = NULL, **target_paths = NULL;
+        /* Clears the terminal's status record on all exit paths that don't report how the update ended */
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
         size_t n;
         unsigned remaining = 0;
         void *p;
@@ -1275,11 +1322,15 @@ static int do_update(sd_bus *bus, char **targets) {
         }
 
         /* Set up the rendering */
-        r = sd_event_add_post(event, NULL, update_render_progress, map);
+        UpdateRenderContext render = {
+                .map = map,
+                .status = &status,
+        };
+        r = sd_event_add_post(event, NULL, update_render_progress, &render);
         if (r < 0)
                 return log_error_errno(r, "Failed to add progress rendering callback: %m");
 
-        r = sd_event_add_exit(event, &render_exit, update_render_progress, map);
+        r = sd_event_add_exit(event, &render_exit, update_render_progress, &render);
         if (r < 0)
                 return log_error_errno(r, "Failed to add exit callback: %m");
 
@@ -1290,6 +1341,8 @@ static int do_update(sd_bus *bus, char **targets) {
         r = sd_event_loop(event);
         if (r < 0)
                 return log_error_errno(r, "Failed to start event loop");
+
+        update_report_finished(&status, map);
 
         ORDERED_HASHMAP_FOREACH(p, map) {
                 r = PTR_TO_INT(p);

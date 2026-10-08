@@ -21,6 +21,7 @@
 #include "main-func.h"
 #include "oci-util.h"
 #include "os-util.h"
+#include "osc-program-status.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -91,7 +92,15 @@ static int settle_image_class(void) {
 typedef struct Context {
         const char *object_path;
         double progress;
+        const char *local;
+        OscProgramStatusRecord status;
 } Context;
+
+static void context_done(Context *c) {
+        assert(c);
+
+        osc_program_status_record_clear(&c->status);
+}
 
 static int match_log_message(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         Context *c = ASSERT_PTR(userdata);
@@ -142,6 +151,17 @@ static int match_progress_update(sd_bus_message *m, void *userdata, sd_bus_error
         if (!arg_quiet)
                 draw_progress_bar(PROGRESS_PREFIX, c->progress * 100);
 
+        /* importd sends the progress as a fraction, and only for transfers that know their progress. With
+         * --quiet don't write to the terminal at all, so that we can run in the background. */
+        if (!arg_quiet && c->progress >= 0.0 && c->progress <= 1.0)
+                (void) osc_program_status_record_working(
+                                &c->status,
+                                STDERR_FILENO,
+                                /* flags= */ 0,
+                                "transfer",
+                                (unsigned) (c->progress * 100.0 + 0.5),
+                                c->local);
+
         return 0;
 }
 
@@ -165,6 +185,11 @@ static int match_transfer_removed(sd_bus_message *m, void *userdata, sd_bus_erro
         if (!streq_ptr(c->object_path, path))
                 return 0;
 
+        /* Tell the terminal how the transfer ended, so that the user can see that even after we exited. If
+         * it was canceled (e.g. via "importctl cancel-transfer"), context_done() just clears the record. */
+        if (!streq_ptr(result, "canceled"))
+                (void) osc_program_status_record_finish(&c->status, streq_ptr(result, "done"), c->local);
+
         sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), !streq_ptr(result, "done"));
         return 0;
 }
@@ -185,12 +210,16 @@ static int transfer_signal_handler(sd_event_source *s, const struct signalfd_sig
         return 0;
 }
 
-static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
+static int transfer_image_common(sd_bus *bus, sd_bus_message *m, const char *local) {
         _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *slot_job_removed = NULL, *slot_log_message = NULL, *slot_progress_update = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_event_unrefp) sd_event* event = NULL;
-        Context c = {};
+        /* Clears the terminal's status record on all exit paths, including when the user detaches via C-c */
+        _cleanup_(context_done) Context c = {
+                .local = local,
+                .status = OSC_PROGRAM_STATUS_RECORD_NULL,
+        };
         uint32_t id;
         int r;
 
@@ -339,7 +368,7 @@ static int verb_pull_tar(int argc, char *argv[], uintptr_t _data, void *userdata
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_pull_raw, "pull-raw", "URL [NAME]\0", 2, 3, 0, "Download a RAW container or VM image");
@@ -413,7 +442,7 @@ static int verb_pull_raw(int argc, char *argv[], uintptr_t _data, void *userdata
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_pull_oci, "pull-oci", "REF [NAME]\0", 2, 3, 0, "Download an OCI container image");
@@ -469,7 +498,7 @@ static int verb_pull_oci(int argc, char *argv[], uintptr_t _data, void *userdata
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_import_tar, "import-tar", "FILE [NAME]\0", 2, 3, 0, "Import a local TAR container image");
@@ -549,7 +578,7 @@ static int verb_import_tar(int argc, char *argv[], uintptr_t _data, void *userda
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_import_raw, "import-raw", "FILE [NAME]\0", 2, 3, 0, "Import a local RAW container or VM image");
@@ -629,7 +658,7 @@ static int verb_import_raw(int argc, char *argv[], uintptr_t _data, void *userda
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_import_fs, "import-fs", "DIRECTORY [NAME]\0", 2, 3, 0, "Import a local directory container image");
@@ -700,7 +729,7 @@ static int verb_import_fs(int argc, char *argv[], uintptr_t _data, void *userdat
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 static void determine_compression_from_filename(const char *p) {
@@ -777,7 +806,7 @@ static int verb_export_tar(int argc, char *argv[], uintptr_t _data, void *userda
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB(verb_export_raw, "export-raw", "NAME [FILE]\0", 2, 3, 0, "Export a RAW container or VM image locally");
@@ -837,7 +866,7 @@ static int verb_export_raw(int argc, char *argv[], uintptr_t _data, void *userda
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return transfer_image_common(bus, m);
+        return transfer_image_common(bus, m, local);
 }
 
 VERB_DEFAULT_NOARG(verb_list_transfers, "list-transfers", "Show list of transfers in progress");

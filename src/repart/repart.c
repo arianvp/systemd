@@ -61,6 +61,7 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "nulstr-util.h"
+#include "osc-program-status.h"
 #include "parse-argument.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
@@ -568,6 +569,7 @@ typedef struct Partition {
 
         unsigned last_percent;
         RateLimit progress_ratelimit;
+        OscProgramStatusRecord *copy_status; /* borrowed, only set while copying in blocks */
 
         char *supplement_for_name;
         struct Partition *supplement_for, *supplemented_by;
@@ -6563,6 +6565,15 @@ static int progress_bytes(uint64_t n_bytes, uint64_t bps, void *userdata) {
                                 FORMAT_BYTES_WITH_POINT(p->copy_blocks_done),
                                 FORMAT_BYTES_WITH_POINT(p->copy_blocks_size));
 
+        if (p->copy_status)
+                (void) osc_program_status_record_working(
+                                p->copy_status,
+                                STDERR_FILENO,
+                                /* flags= */ 0,
+                                "copy",
+                                percent,
+                                p->copy_blocks_path);
+
         p->last_percent = percent;
 
         (void) context_notify(p->context, PROGRESS_COPYING_PARTITION, p->definition_path, percent);
@@ -6632,6 +6643,13 @@ static int context_copy_blocks(Context *context) {
                                 return log_error_errno(errno, "Failed to seek to copy blocks offset in %s: %m", p->copy_blocks_path);
                 }
 
+                /* Report the copy progress to the terminal too, via progress_bytes(). Afterwards, just clear
+                 * the record instead of reporting "done": the steps that follow (encryption, sync, verity)
+                 * show no progress, and we are usually just one step of whatever invoked us. */
+                _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord copy_status =
+                        OSC_PROGRAM_STATUS_RECORD_NULL;
+                p->copy_status = &copy_status;
+
                 /* We call copy_bytes_full() instead of copy_file_range() directly, because copy_file_range()
                  * needs to be called with a size limit to allow for progress updates. But we don't want that
                  * for cloning, we want one big massive reflink if possible, and unfortunately we can't know
@@ -6648,6 +6666,8 @@ static int context_copy_blocks(Context *context) {
                                 progress_bytes,
                                 p);
                 clear_progress_bar(/* prefix= */ NULL);
+                p->copy_status = NULL;
+                osc_program_status_record_clear(&copy_status);
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy in data from '%s': %m", p->copy_blocks_path);
 

@@ -111,6 +111,17 @@ All tools:
   this only controls use of Unicode emoji glyphs, and has no effect on other
   Unicode glyphs.
 
+* `$SYSTEMD_PROGRAM_STATUS=0` — if set, tools will not generate OSC 7501
+  "Program Status Protocol" escape sequences. By default, these sequences are
+  written to terminals whose `$TERM` is set and not `dumb` (password agents on
+  the console, which usually run without `$TERM`, look at the one of PID 1 or
+  the kernel command line instead), to tell the terminal emulator when a tool is
+  waiting for the user, e.g. for a password, a security token touch, or an
+  answer to a question, and how far long-running operations such as image
+  downloads have progressed. Terminal emulators that do not support these
+  sequences ignore them. See
+  https://www.superlogical.com/rex/docs/build/program-status for details.
+
 * `$RUNTIME_DIRECTORY` — various tools use this variable to locate the
   appropriate path under `/run/`. This variable is also set by the manager when
   `RuntimeDirectory=` is used, see systemd.exec(5).

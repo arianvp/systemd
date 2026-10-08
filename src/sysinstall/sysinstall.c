@@ -38,6 +38,7 @@
 #include "main-func.h"
 #include "mount-util.h"
 #include "os-util.h"
+#include "osc-program-status.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -148,6 +149,7 @@ typedef struct SysInstallContext {
         sd_varlink *repart_link;
 
         sd_varlink *link; /* If 'more' is used on the Varlink call, we'll send progress info over this link */
+        OscProgramStatusRecord *program_status; /* If set, we'll report progress to the terminal via this */
 } SysInstallContext;
 
 static void sysinstall_context_done(SysInstallContext *c) {
@@ -531,6 +533,16 @@ static int sysinstall_context_notify(
                    emoji_enabled() ? " " : "",
                    progress_phase_log_to_string(phase));
 
+        /* The phases are logged to stderr, hence report them there too */
+        if (context->program_status)
+                (void) osc_program_status_record_working(
+                                context->program_status,
+                                STDERR_FILENO,
+                                /* flags= */ 0,
+                                "install",
+                                OSC_PROGRAM_STATUS_PROGRESS_NONE,
+                                progress_phase_log_to_string(phase));
+
         if (context->link) {
                 r = sd_varlink_notifybo(
                                 context->link,
@@ -858,7 +870,8 @@ static int prompt_erase(
                         /* is_valid= */ NULL,
                         /* refresh= */ NULL,
                         /* userdata= */ NULL,
-                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT,
+                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT|
+                        PROMPT_PERMISSION,
                         &reply);
         if (r < 0)
                 return r;
@@ -897,7 +910,8 @@ static int prompt_touch_variables(void) {
                         /* is_valid= */ NULL,
                         /* refresh= */ NULL,
                         /* userdata= */ NULL,
-                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT,
+                        PROMPT_SHOW_MENU|PROMPT_MAY_SKIP|PROMPT_HIDE_MENU_HINT|PROMPT_HIDE_SKIP_HINT|
+                        PROMPT_PERMISSION,
                         &reply);
         if (r < 0)
                 return r;
@@ -1295,7 +1309,23 @@ static int maybe_reboot(void) {
         log_notice("%s%sSystem will reboot now.",
                    emoji_enabled() ? glyph(GLYPH_CIRCLE_ARROW) : "", emoji_enabled() ? " " : "");
 
-        if (!any_key_to_proceed())
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
+        (void) osc_program_status_record_blocked(
+                        &status,
+                        STDOUT_FILENO,
+                        OSC_PROGRAM_STATUS_STDIN,
+                        "prompt",
+                        OSC_PROGRAM_STATUS_PERMISSION,
+                        "System will reboot now. Press any key to proceed.");
+
+        bool proceed = any_key_to_proceed();
+
+        /* Clear the record right away, rather than when we return: if we reboot, we might not get there,
+         * and the terminal (e.g. of a VM's serial console) might outlive us. */
+        osc_program_status_record_clear(&status);
+
+        if (!proceed)
                 return 0;
 
         log_notice("%s%sInitiating reboot.",
@@ -2244,12 +2274,23 @@ static int run(int argc, char *argv[]) {
          * fine if we sent READY=1 before already, e.g. from the device auto-pick logic). */
         (void) sd_notify(/* unset_environment= */ false, "READY=1");
 
+        /* Let the terminal know that we are installing, and how it ended, so that the user can see that even
+         * if they stopped watching. */
+        _cleanup_(osc_program_status_record_clear) OscProgramStatusRecord install_status =
+                OSC_PROGRAM_STATUS_RECORD_NULL;
+        context.program_status = &install_status;
+
         r = sysinstall_context_run(&context);
-        if (r < 0)
+        if (r < 0) {
+                (void) osc_program_status_record_finish(
+                                &install_status, /* success= */ false, "Installation failed.");
                 return r;
+        }
 
         log_notice("%s%sInstallation succeeded.",
                    emoji_enabled() ? glyph(GLYPH_SPARKLES) : "", emoji_enabled() ? " " : "");
+        (void) osc_program_status_record_finish(
+                        &install_status, /* success= */ true, "Installation succeeded.");
 
         r = maybe_reboot();
         if (r < 0)

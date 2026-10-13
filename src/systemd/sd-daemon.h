@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef foosddaemonhfoo
 #define foosddaemonhfoo
 
@@ -14,11 +14,9 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <inttypes.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 
 #include "_sd-common.h"
@@ -57,16 +55,16 @@ _SD_BEGIN_DECLARATIONS;
 
 /*
   Returns how many file descriptors have been passed, or a negative
-  errno code on failure. Optionally, removes the $LISTEN_FDS and
-  $LISTEN_PID file descriptors from the environment (recommended, but
-  problematic in threaded environments). If r is the return value of
-  this function you'll find the file descriptors passed as fds
-  SD_LISTEN_FDS_START to SD_LISTEN_FDS_START+r-1. Returns a negative
-  errno style error code on failure. This function call ensures that
-  the FD_CLOEXEC flag is set for the passed file descriptors, to make
-  sure they are not passed on to child processes. If FD_CLOEXEC shall
-  not be set, the caller needs to unset it after this call for all file
-  descriptors that are used.
+  errno code on failure. Optionally, removes the $LISTEN_FDS,
+  $LISTEN_PID, $LISTEN_PIDFDID, and $LISTEN_FDNAMES variables from the
+  environment (recommended, but problematic in threaded environments).
+  If r is the return value of this function you'll find the file
+  descriptors passed as fds SD_LISTEN_FDS_START to
+  SD_LISTEN_FDS_START+r-1. Returns a negative errno style error code on
+  failure. This function call ensures that the FD_CLOEXEC flag is set
+  for the passed file descriptors, to make sure they are not passed on
+  to child processes. If FD_CLOEXEC shall not be set, the caller needs
+  to unset it after this call for all file descriptors that are used.
 
   See sd_listen_fds(3) for more information.
 */
@@ -191,9 +189,13 @@ int sd_is_mq(int fd, const char *path);
                   that describes the daemon state. This is free-form
                   and can be used for various purposes: general state
                   feedback, fsck-like programs could pass completion
-                  percentages and failing programs could pass a human
-                  readable error message. Example: "STATUS=Completed
-                  66% of file system check..."
+                  percentages and failing programs could pass a
+                  human-readable error message. Example:
+                  "STATUS=Completed 66% of file system check..."
+
+     NOTIFYACCESS=...
+                  Reset the access to the service status notification socket.
+                  Example: "NOTIFYACCESS=main"
 
      ERRNO=...    If a daemon fails, the errno-style error code,
                   formatted as string. Example: "ERRNO=2" for ENOENT.
@@ -260,8 +262,8 @@ int sd_notify(int unset_environment, const char *state);
 
      sd_notifyf(0, "STATUS=Failed to start up: %s\n"
                    "ERRNO=%i",
-                   strerror(errno),
-                   errno);
+                   strerror_r(errnum, (char[1024]){}, 1024),
+                   errnum);
 
   See sd_notifyf(3) for more information.
 */
@@ -287,6 +289,31 @@ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) _s
 int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, const int *fds, unsigned n_fds);
 
 /*
+  Combination of sd_pid_notifyf() and sd_pid_notify_with_fds()
+*/
+int sd_pid_notifyf_with_fds(pid_t pid, int unset_environment, const int *fds, size_t n_fds, const char *format, ...) _sd_printf_(5,6);
+
+/*
+  Returns > 0 if synchronization with systemd succeeded.  Returns < 0
+  on error. Returns 0 if $NOTIFY_SOCKET was not set. Note that the
+  timeout parameter of this function call takes the timeout in μs, and
+  will be passed to ppoll(2), hence the behaviour will be similar to
+  ppoll(2). This function can be called after sending a status message
+  to systemd, if one needs to synchronize against reception of the
+  status messages sent before this call is made. Therefore, this
+  cannot be used to know if the status message was processed
+  successfully, but to only synchronize against its consumption.
+*/
+int sd_notify_barrier(int unset_environment, uint64_t timeout);
+
+/*
+  Just like sd_notify_barrier() but also takes a PID to send the barrier message from.
+*/
+int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t timeout);
+
+int sd_pidfd_get_inode_id(int pidfd, uint64_t *ret);
+
+/*
   Returns > 0 if the system was booted with systemd. Returns < 0 on
   error. Returns 0 if the system was not booted with systemd. Note
   that all of the functions above handle non-systemd boots just
@@ -303,7 +330,7 @@ int sd_booted(void);
   Returns > 0 if the service manager expects watchdog keep-alive
   events to be sent regularly via sd_notify(0, "WATCHDOG=1"). Returns
   0 if it does not expect this. If the usec argument is non-NULL
-  returns the watchdog timeout in µs after which the service manager
+  returns the watchdog timeout in μs after which the service manager
   will act on a process that has not sent a watchdog keep alive
   message. This function is useful to implement services that
   recognize automatically if they are being run under supervision of

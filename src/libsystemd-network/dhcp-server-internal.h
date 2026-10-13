@@ -1,42 +1,30 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
+#include <netinet/in.h>
+
 #include "sd-dhcp-server.h"
-#include "sd-event.h"
 
-#include "dhcp-internal.h"
-#include "hashmap.h"
-#include "log.h"
-#include "time-util.h"
+#include "dhcp-forward.h"
+#include "dhcp-message.h"
+#include "network-common.h"
 
-typedef struct DHCPClientId {
-        size_t length;
-        void *data;
-} DHCPClientId;
-
-typedef struct DHCPLease {
-        DHCPClientId client_id;
-
-        be32_t address;
-        be32_t gateway;
-        uint8_t chaddr[16];
-        usec_t expiration;
-} DHCPLease;
-
-struct sd_dhcp_server {
+typedef struct sd_dhcp_server {
         unsigned n_ref;
 
         sd_event *event;
         int event_priority;
-        sd_event_source *receive_message;
-        int fd;
-        int fd_raw;
+        sd_event_source *io_event_source;
+        uint8_t ip_service_type;
+        int socket_fd; /* socket fd set externally, used by unit tests */
+        int raw_socket_fd; /* send-only raw socket fd, used on sending L2 unicast message. */
 
         int ifindex;
+        char *ifname;
         be32_t address;
         be32_t netmask;
         be32_t subnet;
@@ -44,39 +32,50 @@ struct sd_dhcp_server {
         uint32_t pool_size;
 
         char *timezone;
+        char *domain_name;
 
-        struct in_addr *ntp, *dns;
-        unsigned n_ntp, n_dns;
+        DHCPServerData servers[_SD_DHCP_LEASE_SERVER_TYPE_MAX];
+        struct in_addr boot_server_address;
+        char *boot_server_name;
+        char *boot_filename;
+
+        TLV *extra_options;
+        TLV *vendor_options;
 
         bool emit_router;
+        struct in_addr router_address;
 
-        Hashmap *leases_by_client_id;
-        DHCPLease **bound_leases;
-        DHCPLease invalid_lease;
+        Hashmap *bound_leases_by_client_id;
+        Hashmap *bound_leases_by_address;
+        Hashmap *static_leases_by_client_id;
+        Hashmap *static_leases_by_address;
 
-        uint32_t max_lease_time, default_lease_time;
-};
+        usec_t max_lease_time;
+        usec_t default_lease_time;
+        usec_t ipv6_only_preferred_usec;
+        bool rapid_commit;
 
-typedef struct DHCPRequest {
-        /* received message */
-        DHCPMessage *message;
+        sd_dhcp_server_callback_t callback;
+        void *callback_userdata;
 
-        /* options */
-        DHCPClientId client_id;
-        size_t max_optlen;
-        be32_t server_id;
-        be32_t requested_ip;
-        uint32_t lifetime;
-} DHCPRequest;
+        int lease_dir_fd;
+        char *lease_file;
+} sd_dhcp_server;
 
-#define log_dhcp_server(client, fmt, ...) log_internal(LOG_DEBUG, 0, __FILE__, __LINE__, __func__, "DHCP SERVER: " fmt, ##__VA_ARGS__)
-#define log_dhcp_server_errno(client, error, fmt, ...) log_internal(LOG_DEBUG, error, __FILE__, __LINE__, __func__, "DHCP SERVER: " fmt, ##__VA_ARGS__)
+int dhcp_server_set_extra_options(sd_dhcp_server *server, TLV *options);
+int dhcp_server_set_vendor_options(sd_dhcp_server *server, TLV *options);
 
-int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message,
-                               size_t length);
-int dhcp_server_send_packet(sd_dhcp_server *server,
-                            DHCPRequest *req, DHCPPacket *packet,
-                            int type, size_t optoffset);
+void dhcp_server_on_lease_change(sd_dhcp_server *server);
+bool dhcp_server_address_is_in_pool(sd_dhcp_server *server, be32_t address);
+bool dhcp_server_address_available(sd_dhcp_server *server, be32_t address);
 
-void client_id_hash_func(const DHCPClientId *p, struct siphash *state);
-int client_id_compare_func(const DHCPClientId *a, const DHCPClientId *b);
+#define log_dhcp_server_errno(server, error, fmt, ...)          \
+        log_interface_prefix_full_errno(                        \
+                "DHCPv4 server: ",                              \
+                sd_dhcp_server, server,                         \
+                error, fmt, ##__VA_ARGS__)
+#define log_dhcp_server(server, fmt, ...)                       \
+        log_interface_prefix_full_errno_zerook(                 \
+                "DHCPv4 server: ",                              \
+                sd_dhcp_server, server,                         \
+                0, fmt, ##__VA_ARGS__)

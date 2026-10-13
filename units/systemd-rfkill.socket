@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -10,12 +10,14 @@
 [Unit]
 Description=Load/Save RF Kill Switch Status /dev/rfkill Watch
 Documentation=man:systemd-rfkill.socket(8)
+ConditionPathExists=!/etc/initrd-release
+
 DefaultDependencies=no
 BindsTo=sys-devices-virtual-misc-rfkill.device
 After=sys-devices-virtual-misc-rfkill.device systemd-remount-fs.service
-RequiresMountsFor=/var/lib/systemd/rfkill
 Conflicts=shutdown.target
 Before=shutdown.target
+RequiresMountsFor=/var/lib/systemd/rfkill
 
 [Socket]
 ListenSpecial=/dev/rfkill

@@ -1,26 +1,25 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <unistd.h>
 
 #include "catalog.h"
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fuzz.h"
+#include "hashmap.h"
 #include "tmpfile-util.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/fuzz-catalog.XXXXXX";
-        _cleanup_close_ int fd = -1;
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        _cleanup_ordered_hashmap_free_ OrderedHashmap *h = NULL;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
-
-        assert_se(h = hashmap_new(&catalog_hash_ops));
+        fuzz_setup_logging();
 
         fd = mkostemp_safe(name);
         assert_se(fd >= 0);
         assert_se(write(fd, data, size) == (ssize_t) size);
 
-        (void) catalog_import_file(h, name);
+        (void) catalog_import_file(&h, fd, name);
 
         return 0;
 }

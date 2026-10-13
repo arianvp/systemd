@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-cat"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -23,10 +23,10 @@
 
   <refsynopsisdiv>
     <cmdsynopsis>
-      <command>systemd-cat <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>COMMAND</arg> <arg choice="opt" rep="repeat">ARGUMENTS</arg></command>
+      <command>systemd-cat</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>COMMAND</arg> <arg choice="opt" rep="repeat">ARGUMENTS</arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-cat <arg choice="opt" rep="repeat">OPTIONS</arg></command>
+      <command>systemd-cat</command> <arg choice="opt" rep="repeat">OPTIONS</arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -34,9 +34,9 @@
     <title>Description</title>
 
     <para><command>systemd-cat</command> may be used to connect the
-    standard input and output of a process to the journal, or as a
-    filter tool in a shell pipeline to pass the output the previous
-    pipeline element generates to the journal.</para>
+    standard output and error output of a command to the journal, or
+    as a filter tool in a shell pipeline to pass the output the
+    previous pipeline element generates to the journal.</para>
 
     <para>If no parameter is passed, <command>systemd-cat</command>
     will write everything it reads from standard input (stdin) to the
@@ -63,7 +63,10 @@
 
         <listitem><para>Specify a short string that is used to
         identify the logging tool. If not specified, no identification
-        string is written to the journal.</para></listitem>
+        string is set for the journal entry, and the executable name
+        (or <literal>cat</literal> if the input is read from a pipe)
+        will be used to describe the log source instead.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -109,18 +112,29 @@
         because one channel is used for both. When the default priority
         differs, two channels are used, and so stdout messages will not
         be strictly ordered with respect to stderr messages - though
-        they will tend to be approximately ordered.</para></listitem>
+        they will tend to be approximately ordered.</para>
+
+        <xi:include href="version-info.xml" xpointer="v241"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--level-prefix=</option></term>
 
-        <listitem><para>Controls whether lines read are parsed for
-        syslog priority level prefixes. If enabled (the default), a
-        line prefixed with a priority prefix such as
-        <literal>&lt;5&gt;</literal> is logged at priority 5
-        (<literal>notice</literal>), and similar for the other
-        priority levels. Takes a boolean argument.</para></listitem>
+        <listitem><para>Controls whether lines read are parsed for syslog priority level prefixes. If enabled
+        (the default), a line prefixed with a priority prefix such as <literal>&lt;5&gt;</literal> is logged
+        at priority 5 (<literal>notice</literal>), and similarly for the other priority levels. Takes a
+        boolean argument.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--namespace=</option></term>
+
+        <listitem><para>Specifies the journal namespace to which the standard IO should be connected.
+        For details about journal namespaces, see
+        <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -130,8 +144,7 @@
   <refsect1>
     <title>Exit status</title>
 
-    <para>On success, 0 is returned, a non-zero failure code
-    otherwise.</para>
+    <para>On success, 0 is returned, a non-zero failure code otherwise.</para>
   </refsect1>
 
   <refsect1>
@@ -140,7 +153,7 @@
     <example>
       <title>Invoke a program</title>
 
-      <para>This calls <filename noindex='true'>/bin/ls</filename>
+      <para>This calls <filename index="false">/bin/ls</filename>
       with standard output and error connected to the journal:</para>
 
       <programlisting># systemd-cat ls</programlisting>
@@ -156,19 +169,18 @@
       <programlisting># ls | systemd-cat</programlisting>
     </example>
 
-    <para>Even though the two examples have very similar effects the
-    first is preferable since only one process is running at a time,
-    and both stdout and stderr are captured while in the second
-    example, only stdout is captured.</para>
+    <para>Even though the two examples have very similar effects, the first is preferable, since only one
+    process is running at a time and both stdout and stderr are captured, while in the second example, only
+    stdout is captured.</para>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>logger</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>logger</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

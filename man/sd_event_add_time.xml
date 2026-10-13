@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_event_add_time" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -17,8 +17,10 @@
 
   <refnamediv>
     <refname>sd_event_add_time</refname>
+    <refname>sd_event_add_time_relative</refname>
     <refname>sd_event_source_get_time</refname>
     <refname>sd_event_source_set_time</refname>
+    <refname>sd_event_source_set_time_relative</refname>
     <refname>sd_event_source_get_time_accuracy</refname>
     <refname>sd_event_source_set_time_accuracy</refname>
     <refname>sd_event_source_get_time_clock</refname>
@@ -52,9 +54,20 @@
       </funcprototype>
 
       <funcprototype>
+        <funcdef>int <function>sd_event_add_time_relative</function></funcdef>
+        <paramdef>sd_event *<parameter>event</parameter></paramdef>
+        <paramdef>sd_event_source **<parameter>source</parameter></paramdef>
+        <paramdef>clockid_t <parameter>clock</parameter></paramdef>
+        <paramdef>uint64_t <parameter>usec</parameter></paramdef>
+        <paramdef>uint64_t <parameter>accuracy</parameter></paramdef>
+        <paramdef>sd_event_time_handler_t <parameter>handler</parameter></paramdef>
+        <paramdef>void *<parameter>userdata</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
         <funcdef>int <function>sd_event_source_get_time</function></funcdef>
         <paramdef>sd_event_source *<parameter>source</parameter></paramdef>
-        <paramdef>uint64_t *<parameter>usec</parameter></paramdef>
+        <paramdef>uint64_t *<parameter>ret</parameter></paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -64,9 +77,15 @@
       </funcprototype>
 
       <funcprototype>
+        <funcdef>int <function>sd_event_source_set_time_relative</function></funcdef>
+        <paramdef>sd_event_source *<parameter>source</parameter></paramdef>
+        <paramdef>uint64_t <parameter>usec</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
         <funcdef>int <function>sd_event_source_get_time_accuracy</function></funcdef>
         <paramdef>sd_event_source *<parameter>source</parameter></paramdef>
-        <paramdef>uint64_t *<parameter>usec</parameter></paramdef>
+        <paramdef>uint64_t *<parameter>ret</parameter></paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -78,7 +97,7 @@
       <funcprototype>
         <funcdef>int <function>sd_event_source_get_time_clock</function></funcdef>
         <paramdef>sd_event_source *<parameter>source</parameter></paramdef>
-        <paramdef>clockid_t *<parameter>clock</parameter></paramdef>
+        <paramdef>clockid_t *<parameter>ret</parameter></paramdef>
       </funcprototype>
 
     </funcsynopsis>
@@ -94,34 +113,44 @@
     <constant>CLOCK_REALTIME_ALARM</constant>, or <constant>CLOCK_BOOTTIME_ALARM</constant>. See
     <citerefentry><refentrytitle>timerfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry> for details
     regarding the various types of clocks. The <parameter>usec</parameter> parameter specifies the earliest time, in
-    microseconds (µs), relative to the clock's epoch, when the timer shall be triggered. If a time already in the past
+    microseconds (μs), relative to the clock's epoch, when the timer shall be triggered. If a time already in the past
     is specified (including <constant>0</constant>), this timer source "fires" immediately and is ready to be
     dispatched. If the parameter is specified as <constant>UINT64_MAX</constant> the timer event will never elapse,
     which may be used as an alternative to explicitly disabling a timer event source with
     <citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry>. The
-    <parameter>accuracy</parameter> parameter specifies an additional accuracy value in µs specifying how much the
-    timer event may be delayed. Use <constant>0</constant> to select the default accuracy (250ms). Use 1µs for maximum
-    accuracy. Consider specifying 60000000µs (1min) or larger for long-running events that may be delayed
+    <parameter>accuracy</parameter> parameter specifies an additional accuracy value in μs specifying how much the
+    timer event may be delayed. Use <constant>0</constant> to select the default accuracy (250ms). Use 1μs for maximum
+    accuracy. Consider specifying 60000000μs (1min) or larger for long-running events that may be delayed
     substantially. Picking higher accuracy values allows the system to coalesce timer events more aggressively,
-    improving power efficiency. The <parameter>handler</parameter> parameter shall reference a function to call when
-    the timer elapses. The handler function will be passed the <parameter>userdata</parameter> pointer, which may be
-    chosen freely by the caller. The handler is also passed the configured trigger time, even if it is actually called
-    slightly later, subject to the specified accuracy value, the kernel timer slack (see
-    <citerefentry><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>), and additional
-    scheduling latencies. To query the actual time the handler was called use
-    <citerefentry><refentrytitle>sd_event_now</refentrytitle><manvolnum>3</manvolnum></citerefentry>.</para>
+    improving power efficiency.</para>
 
-    <para>By default, the timer will elapse once
-    (<constant>SD_EVENT_ONESHOT</constant>), but this may be changed
-    with
+    <para>The <parameter>handler</parameter> is a function to call when the timer elapses or
+    <constant>NULL</constant>. The <parameter>userdata</parameter> pointer will be passed to the handler
+    function, and may be chosen freely by the caller. The configured trigger time is also passed to the
+    handler, even if the call actually happens slightly later, subject to the specified accuracy value, the
+    kernel timer slack (see
+    <citerefentry><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>), and
+    additional scheduling latencies. To query the actual time the handler was called use
+    <citerefentry><refentrytitle>sd_event_now</refentrytitle><manvolnum>3</manvolnum></citerefentry>. The
+    handler may return negative to signal an error (see below), other return values are ignored. If
+    <parameter>handler</parameter> is <constant>NULL</constant>, a default handler that calls
+    <citerefentry><refentrytitle>sd_event_exit</refentrytitle><manvolnum>3</manvolnum></citerefentry> will be
+    used.</para>
+
+    <para>By default, the timer will elapse once (<constant>SD_EVENT_ONESHOT</constant>), but this may be
+    changed with
     <citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
-    If the handler function returns a negative error code, it will be
-    disabled after the invocation, even if the
-    <constant>SD_EVENT_ON</constant> mode was requested before. Note
-    that a timer event set to <constant>SD_EVENT_ON</constant> will
-    fire continuously unless its configured time is updated using
-    <function>sd_event_source_set_time()</function>.
-    </para>
+    If the handler function returns a negative error code, it will either be disabled after the invocation,
+    even if the <constant>SD_EVENT_ON</constant> mode was requested before, or it will cause the loop to
+    terminate, see
+    <citerefentry><refentrytitle>sd_event_source_set_exit_on_failure</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
+    Note that a timer event set to <constant>SD_EVENT_ON</constant> will fire continuously unless its
+    configured time is updated using <function>sd_event_source_set_time()</function>.</para>
+
+    <para><function>sd_event_add_time_relative()</function> is like <function>sd_event_add_time()</function>,
+    but takes a relative time specification. It's relative to the current time of the event loop iteration,
+    as returned by
+    <citerefentry><refentrytitle>sd_event_now</refentrytitle><manvolnum>3</manvolnum></citerefentry>.</para>
 
     <para>To destroy an event source object use
     <citerefentry><refentrytitle>sd_event_source_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
@@ -135,16 +164,14 @@
     <para>If the second parameter of
     <function>sd_event_add_time()</function> is
     <constant>NULL</constant> no reference to the event source object
-    is returned. In this case the event source is considered
+    is returned. In this case, the event source is considered
     "floating", and will be destroyed implicitly when the event loop
     itself is destroyed.</para>
 
-    <para>If the <parameter>handler</parameter> to
-    <function>sd_event_add_time()</function> is
-    <constant>NULL</constant>, and the event source fires, this will
-    be considered a request to exit the event loop. In this case, the
-    <parameter>userdata</parameter> parameter, cast to an integer, is
-    used for the exit code passed to
+    <para>If the <parameter>handler</parameter> parameter to <function>sd_event_add_time()</function> is
+    <constant>NULL</constant>, and the event source fires, this will be considered a request to exit the
+    event loop. In this case, the <parameter>userdata</parameter> parameter, cast to an integer, is passed as
+    the exit code parameter to
     <citerefentry><refentrytitle>sd_event_exit</refentrytitle><manvolnum>3</manvolnum></citerefentry>.</para>
 
     <para>Use <constant>CLOCK_BOOTTIME_ALARM</constant> and
@@ -170,31 +197,35 @@
     base the <parameter>usec</parameter> parameter passed to the timer
     callback, or the timestamp returned by
     <function>sd_event_now()</function>. In the former case timer
-    events will be regular, while in the latter case the scheduling
+    events will be regular, while in the latter case, the scheduling
     latency will keep accumulating on the timer.</para>
 
-    <para><function>sd_event_source_get_time()</function> retrieves
-    the configured time value of an event source created
-    previously with <function>sd_event_add_time()</function>. It takes
-    the event source object and a pointer to a variable to store the
-    time in, relative to the selected clock's epoch, in µs.</para>
+    <para><function>sd_event_source_get_time()</function> retrieves the configured time value of an event
+    source created previously with <function>sd_event_add_time()</function> or
+    <function>sd_event_add_time_relative()</function>. It takes the event source object and a pointer to a
+    variable to store the time in, relative to the selected clock's epoch, in μs. The returned value is
+    relative to the epoch, even if the event source was created with a relative time via
+    <function>sd_event_add_time_relative()</function>.</para>
 
-    <para><function>sd_event_source_set_time()</function> changes the
-    time of an event source created previously with
-    <function>sd_event_add_time()</function>. It takes the event
-    source object and a time relative to the selected clock's epoch,
-    in µs.</para>
+    <para><function>sd_event_source_set_time()</function> changes the time of an event source created
+    previously with <function>sd_event_add_time()</function> or
+    <function>sd_event_add_time_relative()</function>. It takes the event source object and a time relative
+    to the selected clock's epoch, in μs.</para>
+
+    <para><function>sd_event_source_set_time_relative()</function> is similar to
+    <function>sd_event_source_set_time()</function>, but takes a time relative to the current time of the
+    event loop iteration, as returned by <function>sd_event_now()</function>.</para>
 
     <para><function>sd_event_source_get_time_accuracy()</function>
     retrieves the configured accuracy value of an event source
     created previously with <function>sd_event_add_time()</function>. It
     takes the event source object and a pointer to a variable to store
-    the accuracy in. The accuracy is specified in µs.</para>
+    the accuracy in. The accuracy is specified in μs.</para>
 
     <para><function>sd_event_source_set_time_accuracy()</function>
     changes the configured accuracy of a timer event source created
     previously with <function>sd_event_add_time()</function>. It takes
-    the event source object and accuracy, in µs.</para>
+    the event source object and accuracy, in μs.</para>
 
     <para><function>sd_event_source_get_time_clock()</function>
     retrieves the configured clock of an event source created
@@ -239,7 +270,7 @@
         <varlistentry>
           <term><constant>-ECHILD</constant></term>
 
-          <listitem><para>The event loop has been created in a different process.</para></listitem>
+          <listitem><para>The event loop has been created in a different process, library or module instance.</para></listitem>
 
         </varlistentry>
 
@@ -255,33 +286,56 @@
 
           <listitem><para>The passed event source is not a timer event source.</para></listitem>
         </varlistentry>
+
+        <varlistentry>
+          <term><constant>-EOVERFLOW</constant></term>
+
+          <listitem><para>The passed relative time is outside of the allowed range for time values (i.e. the
+          specified value added to the current time is outside the 64 bit unsigned integer range).</para>
+
+          <xi:include href="version-info.xml" xpointer="v247"/></listitem>
+        </varlistentry>
       </variablelist>
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_event_add_time()</function>,
+    <function>sd_event_source_get_time()</function>,
+    <function>sd_event_source_set_time()</function>,
+    <function>sd_event_source_get_time_accuracy()</function>,
+    <function>sd_event_source_set_time_accuracy()</function>, and
+    <function>sd_event_source_get_time_clock()</function> were added in version 213.</para>
+    <para><function>sd_event_time_handler_t()</function> was added in version 217.</para>
+    <para><function>sd_event_add_time_relative()</function> and
+    <function>sd_event_source_set_time_relative()</function> were added in version 247.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_now</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_io</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_child</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_inotify</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_defer</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_source_set_priority</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_source_set_userdata</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_source_set_description</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>clock_gettime</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>timerfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_now</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_io</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_child</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_inotify</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_defer</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_enabled</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_priority</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_userdata</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_description</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_source_set_floating</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>clock_gettime</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>timerfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

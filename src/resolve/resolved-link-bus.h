@@ -1,17 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-bus.h"
+#include "resolved-forward.h"
 
-#include "resolved-link.h"
+extern const BusObjectImplementation link_object;
 
-extern const sd_bus_vtable link_vtable[];
-
-int link_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error);
-char *link_bus_path(Link *link);
-int link_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error);
+char* link_bus_path(const Link *link);
 
 int bus_link_method_set_dns_servers(sd_bus_message *message, void *userdata, sd_bus_error *error);
+int bus_link_method_set_dns_servers_ex(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_error *error);

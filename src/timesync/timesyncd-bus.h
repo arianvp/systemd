@@ -1,6 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "timesyncd-manager.h"
+#include "timesyncd-forward.h"
+
+extern const BusObjectImplementation manager_object;
 
 int manager_connect_bus(Manager *m);

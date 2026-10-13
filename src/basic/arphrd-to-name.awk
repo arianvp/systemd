@@ -1,9 +1,14 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
 BEGIN{
-        print "static const char* const arphrd_names[] = { "
+        print "const char *arphrd_to_name(int id) {"
+        print "        switch (id) {"
 }
-!/CISCO/ {
-        printf "        [ARPHRD_%s] = \"%s\",\n", $1, $1
+!/^HDLC$/ {
+        printf "        case ARPHRD_%s: return \"%s\";\n", $1, $1
 }
 END{
-        print "};"
+        print "        default: return NULL;"
+        print "        }"
+        print "}"
 }

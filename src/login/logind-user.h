@@ -1,11 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct User User;
-
-#include "conf-parser.h"
 #include "list.h"
-#include "logind.h"
+#include "logind-forward.h"
+#include "time-util.h"
 
 typedef enum UserState {
         USER_OFFLINE,    /* Not logged in at all */
@@ -15,23 +13,42 @@ typedef enum UserState {
         USER_ACTIVE,     /* User logged in and has a session in the fg */
         USER_CLOSING,    /* User logged out, but processes still remain and lingering is not enabled */
         _USER_STATE_MAX,
-        _USER_STATE_INVALID = -1
+        _USER_STATE_INVALID = -EINVAL,
 } UserState;
 
-struct User {
+typedef enum UserGCMode {
+        USER_GC_BY_ANY,         /* any session pins this user */
+        USER_GC_BY_PIN,         /* only sessions with an explicitly pinning class pin this user */
+        _USER_GC_MODE_MAX,
+        _USER_GC_MODE_INVALID = -EINVAL,
+} UserGCMode;
+
+typedef struct User {
         Manager *manager;
-        uid_t uid;
-        gid_t gid;
-        char *name;
-        char *home;
+
+        UserRecord *user_record;
+
         char *state_file;
         char *runtime_path;
 
-        char *slice;                     /* user-UID.slice */
-        char *service;                   /* user@UID.service */
-        char *runtime_dir_service;       /* user-runtime-dir@UID.service */
+        /* user-UID.slice */
+        char *slice;
 
-        char *service_job;
+        /* user-runtime-dir@UID.service */
+        char *runtime_dir_unit;
+        char *runtime_dir_job;
+
+        /* user@UID.service */
+        bool service_manager_started;
+        char *service_manager_unit;
+        char *service_manager_job;
+
+        /* systemd-pcrlogin@UID.service — measures the user record into the 'login' NvPCR on first login.
+         * Unlike the units above, logind starts this but never stops it: it must run exactly once per boot,
+         * so it lives in system.slice, stays active until reboot, and is intentionally absent from
+         * user_stop_service(). */
+        char *measure_unit;
+        char *measure_job;
 
         Session *display;
 
@@ -41,35 +58,42 @@ struct User {
         /* Set up when the last session of the user logs out */
         sd_event_source *timer_event_source;
 
+        UserGCMode gc_mode;
         bool in_gc_queue:1;
 
-        bool started:1;       /* Whenever the user being started, has been started or is being stopped again. */
+        bool started:1;       /* Whenever the user being started, has been started or is being stopped again
+                                 (tracked through user-runtime-dir@.service) */
         bool stopping:1;      /* Whenever the user is being stopped or has been stopped. */
 
         LIST_HEAD(Session, sessions);
         LIST_FIELDS(User, gc_queue);
-};
+} User;
 
-int user_new(User **out, Manager *m, uid_t uid, gid_t gid, const char *name, const char *home);
+int user_new(Manager *m, UserRecord *ur, User **ret);
 User *user_free(User *u);
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(User *, user_free);
+DEFINE_TRIVIAL_CLEANUP_FUNC(User*, user_free);
+
+int user_start_service_manager(User *u);
+int user_start(User *u);
 
 bool user_may_gc(User *u, bool drop_not_started);
 void user_add_to_gc_queue(User *u);
-int user_start(User *u);
 int user_stop(User *u, bool force);
 int user_finalize(User *u);
 UserState user_get_state(User *u);
-int user_get_idle_hint(User *u, dual_timestamp *t);
+bool user_get_idle_hint(User *u, dual_timestamp *ret_timestamp);
 int user_save(User *u);
 int user_load(User *u);
 int user_kill(User *u, int signo);
-int user_check_linger_file(User *u);
+int user_check_linger_file(const User *u);
 void user_elect_display(User *u);
 void user_update_last_session_timer(User *u);
 
-const char* user_state_to_string(UserState s) _const_;
-UserState user_state_from_string(const char *s) _pure_;
+int user_build_json(User *u, sd_json_variant **ret);
+
+DECLARE_STRING_TABLE_LOOKUP(user_state, UserState);
+
+DECLARE_STRING_TABLE_LOOKUP(user_gc_mode, UserGCMode);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_compat_user_tasks_max);

@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="user@.service">
+<refentry id="user_.service">
   <refentryinfo>
     <title>user@.service</title>
     <productname>systemd</productname>
@@ -17,47 +17,51 @@
   <refnamediv>
     <refname>user@.service</refname>
     <refname>user-runtime-dir@.service</refname>
-    <refpurpose>System units to manage user processes</refpurpose>
+    <refname>systemd-user-runtime-dir</refname>
+    <refpurpose>System units to start the user manager</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
     <para><filename>user@<replaceable>UID</replaceable>.service</filename></para>
     <para><filename>user-runtime-dir@<replaceable>UID</replaceable>.service</filename></para>
+    <para><filename>/usr/lib/systemd/systemd-user-runtime-dir</filename></para>
     <para><filename>user-<replaceable>UID</replaceable>.slice</filename></para>
   </refsynopsisdiv>
 
   <refsect1>
     <title>Description</title>
 
-    <para>The
-    <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+    <para>The <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>
     system manager (PID 1) starts user manager instances as
-    <filename>user@<replaceable>UID</replaceable>.service</filename>, where the user's numerical UID
-    is used as the instance identifier. Each <command>systemd --user</command> instance manages a
-    hierarchy of its own units. See
-    <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
-    a discussion of systemd units and
-    <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    for a list of units that form the basis of the unit hierarchies of system and user units.</para>
+    <filename>user@<replaceable>UID</replaceable>.service</filename>, with the user's numerical UID used as
+    the instance identifier. These instances use the same executable as the system manager, but running in a
+    mode where it starts a different set of units. Each <command>systemd --user</command> instance manages a
+    hierarchy of units specific to that user. See
+    <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry> for a
+    discussion of units and
+    <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry> for a
+    list of units that form the basis of the unit hierarchies of system and user units.</para>
 
-    <para><filename>user@<replaceable>UID</replaceable>.service</filename> is accompanied by the
-    system unit <filename>user-runtime-dir@<replaceable>UID</replaceable>.service</filename>, which
-    creates the user's runtime directory
-    <filename>/run/user/<replaceable>UID</replaceable></filename>, and then removes it when this
-    unit is stopped.</para>
+    <para><filename>user@<replaceable>UID</replaceable>.service</filename> is accompanied by the system unit
+    <filename>user-runtime-dir@<replaceable>UID</replaceable>.service</filename>, which creates the user's
+    runtime directory <filename>/run/user/<replaceable>UID</replaceable></filename> when started, and removes
+    it when it is stopped. It also might apply runtime quota settings on <filename>/tmp/</filename> and/or
+    <filename>/dev/shm/</filename> for the
+    user. <filename>user-runtime-dir@<replaceable>UID</replaceable>.service</filename> executes the
+    <filename>systemd-user-runtime-dir</filename> binary to do the actual work.</para>
 
     <para>User processes may be started by the <filename>user@.service</filename> instance, in which
     case they will be part of that unit in the system hierarchy. They may also be started elsewhere,
     for example by
-    <citerefentry><refentrytitle>sshd</refentrytitle><manvolnum>8</manvolnum></citerefentry> or a
+    <citerefentry project='man-pages'><refentrytitle>sshd</refentrytitle><manvolnum>8</manvolnum></citerefentry> or a
     display manager like <command>gdm</command>, in which case they form a .scope unit (see
     <citerefentry><refentrytitle>systemd.scope</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
     Both <filename>user@<replaceable>UID</replaceable>.service</filename> and the scope units are
-    collected under a <filename>user-<replaceable>UID</replaceable>.slice</filename>.</para>
+    collected under the <filename>user-<replaceable>UID</replaceable>.slice</filename>.</para>
 
     <para>Individual <filename>user-<replaceable>UID</replaceable>.slice</filename> slices are
     collected under <filename>user.slice</filename>, see
-    <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+    <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
     </para>
   </refsect1>
 
@@ -68,16 +72,16 @@
     different levels. As described in the previous section, <filename>user.slice</filename> contains
     processes of all users, so any resource limits on that slice apply to all users together. The
     usual way to configure them would be through drop-ins, e.g. <filename
-    noindex='true'>/etc/systemd/system/user.slice.d/resources.conf</filename>.
+    index="false">/etc/systemd/system/user.slice.d/resources.conf</filename>.
     </para>
 
     <para>The processes of a single user are collected under
     <filename>user-<replaceable>UID</replaceable>.slice</filename>. Resource limits for that user
     can be configured through drop-ins for that unit, e.g. <filename
-    noindex='true'>/etc/systemd/system/user-1000.slice.d/resources.conf</filename>. If the limits
+    index="false">/etc/systemd/system/user-1000.slice.d/resources.conf</filename>. If the limits
     should apply to all users instead, they may be configured through drop-ins for the truncated
     unit name, <filename>user-.slice</filename>. For example, configuration in <filename
-    noindex='true'>/etc/systemd/system/user-.slice.d/resources.conf</filename> is included in all
+    index="false">/etc/systemd/system/user-.slice.d/resources.conf</filename> is included in all
     <filename>user-<replaceable>UID</replaceable>.slice</filename> units, see
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for a discussion of the drop-in mechanism.</para>
@@ -141,20 +145,20 @@ Control group /:
 │       └─6706 /usr/bin/sleep 30
 …</programlisting>
       <para>User with UID 1000 is logged in using <command>gdm</command> (<filename
-      noindex='true'>session-4.scope</filename>) and
-      <citerefentry><refentrytitle>ssh</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-      (<filename noindex='true'>session-19.scope</filename>), and also has a user manager instance
-      running (<filename noindex='true'>user@1000.service</filename>).  User with UID 1001 is logged
-      in using <command>ssh</command> (<filename noindex='true'>session-20.scope</filename>) and
+      index="false">session-4.scope</filename>) and
+      <citerefentry project='man-pages'><refentrytitle>ssh</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+      (<filename index="false">session-19.scope</filename>), and also has a user manager instance
+      running (<filename index="false">user@1000.service</filename>).  User with UID 1001 is logged
+      in using <command>ssh</command> (<filename index="false">session-20.scope</filename>) and
       also has a user manager instance running (<filename
-      noindex='true'>user@1001.service</filename>).  Those are all (leaf) system units, and form
-      part of the slice hierarchy, with <filename noindex='true'>user-1000.slice</filename> and
-      <filename noindex='true'>user-1001.slice</filename> below <filename
-      noindex='true'>user.slice</filename>.  User units are visible below the
+      index="false">user@1001.service</filename>).  Those are all (leaf) system units, and form
+      part of the slice hierarchy, with <filename index="false">user-1000.slice</filename> and
+      <filename index="false">user-1001.slice</filename> below <filename
+      index="false">user.slice</filename>.  User units are visible below the
       <filename>user@.service</filename> instances (<filename
-      noindex='true'>pulseaudio.service</filename>, <filename
-      noindex='true'>gnome-terminal-server.service</filename>, <filename
-      noindex='true'>init.scope</filename>, <filename noindex='true'>sleep.service</filename>).
+      index="false">pulseaudio.service</filename>, <filename
+      index="false">gnome-terminal-server.service</filename>, <filename
+      index="false">init.scope</filename>, <filename index="false">sleep.service</filename>).
       </para>
     </example>
 
@@ -170,7 +174,7 @@ After=systemd-user-sessions.service
 
 [Slice]
 TasksMax=33%</programlisting>
-     <para>The <filename>user-<replaceable>UID</replaceable>.slice</filename> units by default don't
+     <para>The <filename>user-<replaceable>UID</replaceable>.slice</filename> units by default do not
      have a unit file. The resource limits are set through a drop-in, which can be easily replaced
      or extended following standard drop-in mechanisms discussed in the first section.</para>
     </example>
@@ -178,14 +182,15 @@ TasksMax=33%</programlisting>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>capsule@.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=Test service for delegated logs filtering
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/tests/testdata/TEST-04-JOURNAL.units/delegated_cgroup_filtering_payload.sh
+Delegate=yes
+SyslogLevel=notice
+LogLevelMax=info

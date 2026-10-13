@@ -1,10 +1,10 @@
-#compdef loginctl                    -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+#compdef loginctl
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 (( $+functions[_loginctl_all_sessions] )) ||
 _loginctl_all_sessions() {
     local session description
-    loginctl --no-legend list-sessions | while read -r session description; do
+    loginctl --no-legend list-sessions 2>/dev/null | while read -r session description; do
         _sys_all_sessions+=( "$session" )
         _sys_all_sessions_descr+=( "${session}:$description" )
     done
@@ -13,7 +13,7 @@ _loginctl_all_sessions() {
 (( $+functions[_loginctl_all_users] )) ||
 _loginctl_all_users() {
     local uid description
-    loginctl --no-legend list-users | while read -r uid description; do
+    loginctl --no-legend list-users 2>/dev/null | while read -r uid description; do
         _sys_all_users+=( "$uid" )
         _sys_all_users_descr+=( "${uid}:$description" )
     done
@@ -22,7 +22,7 @@ _loginctl_all_users() {
 (( $+functions[_loginctl_all_seats] )) ||
 _loginctl_all_seats() {
     local seat description
-    loginctl --no-legend list-seats | while read -r seat description; do
+    loginctl --no-legend list-seats 2>/dev/null | while read -r seat description; do
         _sys_all_seats+=( "$seat" )
         _sys_all_seats_descr+=( "${seat}:$description" )
     done
@@ -34,6 +34,9 @@ for fun in session-status show-session activate lock-session unlock-session term
     (( $+functions[_loginctl_$fun] )) ||
 _loginctl_$fun() {
     local -a _sys_all_sessions{,_descr}
+
+    _sys_all_sessions=( "self" )
+    _sys_all_sessions_descr=( "self:alias for the current session" )
 
     _loginctl_all_sessions
     for _ignore in $words[2,-1]; do
@@ -80,6 +83,9 @@ done
 (( $+functions[_loginctl_seats] )) ||
 _loginctl_seats() {
     local -a _sys_all_seats{,_descr}
+
+    _sys_all_seats=( "self" )
+    _sys_all_seats_descr=( "self:alias for the current seat" )
 
     _loginctl_all_seats
     for _ignore in $words[2,-1]; do
@@ -159,18 +165,22 @@ _loginctl_commands() {
 
 
 _arguments -s \
-    {-h,--help}'[Show help]' \
-    '--version[Show package version]' \
-    \*{-p+,--property=}'[Show only properties by this name]:unit property' \
-    {-a,--all}'[Show all properties, including empty ones]' \
-    '--kill-who=[Who to send signal to]:killwho:(main control all)' \
-    {-s+,--signal=}'[Which signal to send]:signal:_signals' \
-    {-H+,--host=}'[Operate on remote host]:userathost:_sd_hosts_or_user_at_host' \
-    {-M+,--machine=}'[Operate on local container]:machine:_sd_machines' \
-    {-l,--full}'[Do not ellipsize output]' \
+    '(- *)'{-h,--help}'[Show help]' \
+    '(- *)--version[Show package version]' \
+    '*'{-p+,--property=}'[Show only properties by this name]:unit property' \
+    '*-P+[Equivalent to --value --property=NAME]:unit property' \
+    '(-a --all)'{-a,--all}'[Show all properties, including empty ones]' \
+    '--value[When showing properties, only print the value]' \
+    '--kill-whom=[Whom to send signal to]:killwhom:(main control all)' \
+    '(-s --signal)'{-s+,--signal=}'[Which signal to send]:signal:_signals' \
+    '(-H --host)'{-H+,--host=}'[Operate on remote host]:userathost:_sd_hosts_or_user_at_host' \
+    '(-M --machine)'{-M+,--machine=}'[Operate on local container]:machine:_sd_machines' \
+    '(-l --full)'{-l,--full}'[Do not ellipsize output]' \
     '--no-pager[Do not pipe output into a pager]' \
     '--no-legend[Do not show the headers and footers]' \
     '--no-ask-password[Do not ask for system passwords]' \
-    {-n+,--lines=}'[Number of journal entries to show]' \
-    {-o+,--output=}'[Change journal output mode]:output modes:_sd_outputmodes' \
+    '(-n --lines)'{-n+,--lines=}'[Number of journal entries to show]' \
+    '(-o --output)'{-o+,--output=}'[Change journal output mode]:output modes:_sd_outputmodes' \
+    '--json=[Shows output formatted as JSON]:format:(pretty short off)' \
+    '-j[Equivalent to --json=pretty on TTY, --json=short otherwise]' \
     '*::loginctl command:_loginctl_commands'

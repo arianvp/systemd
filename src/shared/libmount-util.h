@@ -1,47 +1,94 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdio.h>
+#include "dlopen-note.h"
+#include "forward.h"
+
+#if HAVE_LIBMOUNT
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBMOUNT
+#  error "missing libmount_cflags in meson dependency."
+#endif
 
 /* This needs to be after sys/mount.h */
-#include <libmount.h>
+#include <libmount.h> /* IWYU pragma: export */
 
-#include "macro.h"
+#include "dlfcn-util.h"
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(struct libmnt_table*, mnt_free_table);
-DEFINE_TRIVIAL_CLEANUP_FUNC(struct libmnt_iter*, mnt_free_iter);
+extern DLSYM_PROTOTYPE(mnt_free_iter);
+extern DLSYM_PROTOTYPE(mnt_free_table);
+extern DLSYM_PROTOTYPE(mnt_fs_get_devno);
+extern DLSYM_PROTOTYPE(mnt_fs_get_fs_options);
+extern DLSYM_PROTOTYPE(mnt_fs_get_fstype);
+extern DLSYM_PROTOTYPE(mnt_fs_get_id);
+extern DLSYM_PROTOTYPE(mnt_fs_get_option);
+extern DLSYM_PROTOTYPE(mnt_fs_get_options);
+extern DLSYM_PROTOTYPE(mnt_fs_get_passno);
+extern DLSYM_PROTOTYPE(mnt_fs_get_propagation);
+extern DLSYM_PROTOTYPE(mnt_fs_get_source);
+extern DLSYM_PROTOTYPE(mnt_fs_get_target);
+extern DLSYM_PROTOTYPE(mnt_fs_get_vfs_options);
+extern DLSYM_PROTOTYPE(mnt_get_builtin_optmap);
+extern DLSYM_PROTOTYPE(mnt_init_debug);
+extern DLSYM_PROTOTYPE(mnt_monitor_enable_kernel);
+extern DLSYM_PROTOTYPE(mnt_monitor_enable_userspace);
+extern DLSYM_PROTOTYPE(mnt_monitor_get_fd);
+extern DLSYM_PROTOTYPE(mnt_monitor_next_change);
+extern DLSYM_PROTOTYPE(mnt_new_iter);
+extern DLSYM_PROTOTYPE(mnt_new_monitor);
+extern DLSYM_PROTOTYPE(mnt_new_table);
+extern DLSYM_PROTOTYPE(mnt_optstr_get_flags);
+extern DLSYM_PROTOTYPE(mnt_table_find_devno);
+extern DLSYM_PROTOTYPE(mnt_table_find_target);
+extern DLSYM_PROTOTYPE(mnt_table_next_child_fs);
+extern DLSYM_PROTOTYPE(mnt_table_next_fs);
+extern DLSYM_PROTOTYPE(mnt_table_parse_file);
+extern DLSYM_PROTOTYPE(mnt_table_parse_mtab);
+extern DLSYM_PROTOTYPE(mnt_table_parse_stream);
+extern DLSYM_PROTOTYPE(mnt_table_parse_swaps);
+extern DLSYM_PROTOTYPE(mnt_unref_monitor);
 
-static inline int libmount_parse(
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct libmnt_table*, sym_mnt_free_table, mnt_free_tablep, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct libmnt_iter*, sym_mnt_free_iter, mnt_free_iterp, NULL);
+
+int libmount_parse_full(
                 const char *path,
+                FILE *source,
+                int direction,
+                struct libmnt_table **ret_table,
+                struct libmnt_iter **ret_iter);
+
+static inline int libmount_parse_mountinfo(
                 FILE *source,
                 struct libmnt_table **ret_table,
                 struct libmnt_iter **ret_iter) {
 
-        _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
-        _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
-        int r;
-
-        /* Older libmount seems to require this. */
-        assert(!source || path);
-
-        table = mnt_new_table();
-        iter = mnt_new_iter(MNT_ITER_FORWARD);
-        if (!table || !iter)
-                return -ENOMEM;
-
-        /* If source or path are specified, we use on the functions which ignore utab.
-         * Only if both are empty, we use mnt_table_parse_mtab(). */
-
-        if (source)
-                r = mnt_table_parse_stream(table, source, path);
-        else if (path)
-                r = mnt_table_parse_file(table, path);
-        else
-                r = mnt_table_parse_mtab(table, NULL);
-        if (r < 0)
-                return r;
-
-        *ret_table = TAKE_PTR(table);
-        *ret_iter = TAKE_PTR(iter);
-        return 0;
+        return libmount_parse_full("/proc/self/mountinfo", source, MNT_ITER_FORWARD, ret_table, ret_iter);
 }
+
+static inline int libmount_parse_with_utab(
+                struct libmnt_table **ret_table,
+                struct libmnt_iter **ret_iter) {
+
+        return libmount_parse_full(NULL, NULL, MNT_ITER_FORWARD, ret_table, ret_iter);
+}
+
+int libmount_parse_fstab(struct libmnt_table **ret_table, struct libmnt_iter **ret_iter);
+
+int libmount_is_leaf(
+                struct libmnt_table *table,
+                struct libmnt_fs *fs);
+
+int libmount_fs_id_matches_path(struct libmnt_fs *fs, const char *path);
+
+#else
+
+struct libmnt_monitor;
+
+static inline void* sym_mnt_unref_monitor(struct libmnt_monitor *p) {
+        assert(p == NULL);
+        return NULL;
+}
+
+#endif
+
+int dlopen_libmount(int log_level) _dlopen_loader_;

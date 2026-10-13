@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT-0 */
+
 #include <stdio.h>
 #include <systemd/sd-id128.h>
 

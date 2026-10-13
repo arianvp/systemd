@@ -1,8 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
-#include "fd-util.h"
 #include "escape.h"
+#include "fd-util.h"
 #include "libmount-util.h"
 #include "tests.h"
 
@@ -21,10 +21,10 @@ static void test_libmount_unescaping_one(
         _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         _cleanup_fclose_ FILE *f = NULL;
 
-        f = fmemopen((char*) string, strlen(string), "re");
+        f = fmemopen((char*) string, strlen(string), "r");
         assert_se(f);
 
-        assert_se(libmount_parse(title, f, &table, &iter) >= 0);
+        assert_se(libmount_parse_mountinfo(f, &table, &iter) >= 0);
 
         struct libmnt_fs *fs;
         const char *source, *target;
@@ -32,7 +32,7 @@ static void test_libmount_unescaping_one(
 
         /* We allow this call and the checks below to fail in some cases. See the case definitions below. */
 
-        r = mnt_table_next_fs(table, iter, &fs);
+        r = sym_mnt_table_next_fs(table, iter, &fs);
         if (r != 0 && may_fail) {
                 log_error_errno(r, "mnt_table_next_fs failed: %m");
                 return;
@@ -41,8 +41,8 @@ static void test_libmount_unescaping_one(
 
         assert_se(x = cescape(string));
 
-        assert_se(source = mnt_fs_get_source(fs));
-        assert_se(target = mnt_fs_get_target(fs));
+        assert_se(source = sym_mnt_fs_get_source(fs));
+        assert_se(target = sym_mnt_fs_get_target(fs));
 
         assert_se(cs = cescape(source));
         assert_se(ct = cescape(target));
@@ -63,10 +63,10 @@ static void test_libmount_unescaping_one(
         assert_se(may_fail || streq(source, expected_source));
         assert_se(may_fail || streq(target, expected_target));
 
-        assert_se(mnt_table_next_fs(table, iter, &fs) == 1);
+        assert_se(sym_mnt_table_next_fs(table, iter, &fs) == 1);
 }
 
-static void test_libmount_unescaping(void) {
+TEST(libmount_unescaping) {
         test_libmount_unescaping_one(
                         "escaped space + utf8",
                         "729 38 0:59 / /tmp/„zupa\\040zębowa” rw,relatime shared:395 - tmpfs die\\040Brühe rw,seclabel",
@@ -107,9 +107,4 @@ static void test_libmount_unescaping(void) {
         );
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
-        test_libmount_unescaping();
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

@@ -1,37 +1,46 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <locale.h>
 #include <math.h>
-#include <stdbool.h>
 #include <stdlib.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
+#include "alloc-util.h"
+#include "build.h"
 #include "bus-error.h"
+#include "bus-locator.h"
+#include "bus-map-properties.h"
+#include "bus-print-properties.h"
 #include "bus-util.h"
+#include "constants.h"
+#include "format-table.h"
 #include "in-addr-util.h"
+#include "log.h"
 #include "main-func.h"
+#include "options.h"
 #include "pager.h"
+#include "parse-argument.h"
 #include "parse-util.h"
-#include "pretty-print.h"
-#include "spawn-polkit-agent.h"
+#include "polkit-agent.h"
+#include "runtime-scope.h"
 #include "sparse-endian.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
-#include "util.h"
+#include "time-util.h"
 #include "verbs.h"
 
 static PagerFlags arg_pager_flags = 0;
 static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
-static char *arg_host = NULL;
+static const char *arg_host = NULL;
 static bool arg_adjust_system_clock = false;
 static bool arg_monitor = false;
 static char **arg_property = NULL;
-static bool arg_value = false;
-static bool arg_all = false;
+static BusPrintPropertyFlags arg_print_flags = 0;
 
 typedef struct StatusInfo {
         usec_t time;
@@ -45,90 +54,140 @@ typedef struct StatusInfo {
         bool ntp_synced;
 } StatusInfo;
 
-static void print_status_info(const StatusInfo *i) {
-        const char *old_tz = NULL, *tz;
-        bool have_time = false;
+static int print_status_info(const StatusInfo *i) {
+        _cleanup_(table_unrefp) Table *table = NULL;
         char a[LINE_MAX];
+        TableCell *cell;
         struct tm tm;
-        time_t sec;
+        usec_t t = USEC_INFINITY;
         size_t n;
         int r;
 
         assert(i);
 
+        table = table_new_vertical();
+        if (!table)
+                return log_oom();
+
+        assert_se(cell = table_get_cell(table, 0, 0));
+        (void) table_set_ellipsize_percent(table, cell, 100);
+
+        assert_se(cell = table_get_cell(table, 0, 1));
+        (void) table_set_ellipsize_percent(table, cell, 100);
+
         /* Save the old $TZ */
-        tz = getenv("TZ");
-        if (tz)
-                old_tz = strdupa(tz);
+        SAVE_TIMEZONE;
 
         /* Set the new $TZ */
-        if (setenv("TZ", isempty(i->timezone) ? "UTC" : i->timezone, true) < 0)
+        if (setenv("TZ", isempty(i->timezone) ? "UTC" : i->timezone, /* overwrite= */ true) < 0)
                 log_warning_errno(errno, "Failed to set TZ environment variable, ignoring: %m");
         else
                 tzset();
 
-        if (i->time != 0) {
-                sec = (time_t) (i->time / USEC_PER_SEC);
-                have_time = true;
-        } else if (IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE)) {
-                sec = time(NULL);
-                have_time = true;
-        } else
+        if (timestamp_is_set(i->time))
+                t = i->time;
+        else if (IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE))
+                t = now(CLOCK_REALTIME);
+        else
                 log_warning("Could not get time from timedated and not operating locally, ignoring.");
 
-        if (have_time) {
-                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S %Z", localtime_r(&sec, &tm));
-                printf("               Local time: %s\n", n > 0 ? a : "n/a");
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ false, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert system time to local time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S %Z", &tm);
+        } else
+                n = 0;
+        r = table_add_many(table,
+                           TABLE_FIELD, "Local time",
+                           TABLE_STRING, n > 0 ? a : "n/a");
+        if (r < 0)
+                return table_log_add_error(r);
 
-                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S UTC", gmtime_r(&sec, &tm));
-                printf("           Universal time: %s\n", n > 0 ? a : "n/a");
-        } else {
-                printf("               Local time: %s\n", "n/a");
-                printf("           Universal time: %s\n", "n/a");
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ true, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert system time to universal time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S UTC", &tm);
+        } else
+                n = 0;
+        r = table_add_many(table,
+                           TABLE_FIELD, "Universal time",
+                           TABLE_STRING, n > 0 ? a : "n/a");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        if (timestamp_is_set(i->rtc_time)) {
+                r = localtime_or_gmtime_usec(i->rtc_time, /* utc= */ true, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to convert RTC time to universal time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S", &tm);
+        } else
+                n = 0;
+        r = table_add_many(table,
+                           TABLE_FIELD, "RTC time",
+                           TABLE_STRING, n > 0 ? a : "n/a");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Time zone");
+        if (r < 0)
+                return table_log_add_error(r);
+        if (timestamp_is_set(t)) {
+                r = localtime_or_gmtime_usec(t, /* utc= */ false, &tm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to determine timezone from system time, ignoring: %m");
+                        n = 0;
+                } else
+                        n = strftime(a, sizeof a, "%Z, %z", &tm);
+        } else
+                n = 0;
+        r = table_add_cell_stringf(table, NULL, "%s (%s)", strna(i->timezone), n > 0 ? a : "n/a");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_many(table,
+                           TABLE_FIELD, "System clock synchronized",
+                           TABLE_BOOLEAN, i->ntp_synced,
+                           TABLE_FIELD, "NTP service",
+                           TABLE_STRING, i->ntp_capable ? (i->ntp_active ? "active" : "inactive") : "n/a",
+                           TABLE_FIELD, "RTC in local TZ",
+                           TABLE_BOOLEAN, i->rtc_local);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_print_or_warn(table);
+        if (r < 0)
+                return r;
+
+        if (i->rtc_local) {
+                fflush(stdout);
+                log_warning(" \nWarning: The system is configured to read the RTC time in the local time zone.\n"
+                            "         This mode cannot be fully supported. It will create various problems\n"
+                            "         with time zone changes and daylight saving time adjustments. The RTC\n"
+                            "         time is never updated, it relies on external facilities to maintain it.\n"
+                            "         If at all possible, use RTC in UTC by calling\n"
+                            "         'timedatectl set-local-rtc 0'.\n");
         }
 
-        if (i->rtc_time > 0) {
-                time_t rtc_sec;
-
-                rtc_sec = (time_t) (i->rtc_time / USEC_PER_SEC);
-                n = strftime(a, sizeof a, "%a %Y-%m-%d %H:%M:%S", gmtime_r(&rtc_sec, &tm));
-                printf("                 RTC time: %s\n", n > 0 ? a : "n/a");
-        } else
-                printf("                 RTC time: %s\n", "n/a");
-
-        if (have_time)
-                n = strftime(a, sizeof a, "%Z, %z", localtime_r(&sec, &tm));
-
-        /* Restore the $TZ */
-        if (old_tz)
-                r = setenv("TZ", old_tz, true);
-        else
-                r = unsetenv("TZ");
-        if (r < 0)
-                log_warning_errno(errno, "Failed to set TZ environment variable, ignoring: %m");
-        else
-                tzset();
-
-        printf("                Time zone: %s (%s)\n"
-               "System clock synchronized: %s\n"
-               "              NTP service: %s\n"
-               "          RTC in local TZ: %s\n",
-               strna(i->timezone), have_time && n > 0 ? a : "n/a",
-               yes_no(i->ntp_synced),
-               i->ntp_capable ? (i->ntp_active ? "active" : "inactive") : "n/a",
-               yes_no(i->rtc_local));
-
-        if (i->rtc_local)
-                printf("\n%s"
-                       "Warning: The system is configured to read the RTC time in the local time zone.\n"
-                       "         This mode cannot be fully supported. It will create various problems\n"
-                       "         with time zone changes and daylight saving time adjustments. The RTC\n"
-                       "         time is never updated, it relies on external facilities to maintain it.\n"
-                       "         If at all possible, use RTC in UTC by calling\n"
-                       "         'timedatectl set-local-rtc 0'.%s\n", ansi_highlight(), ansi_normal());
+        return 0;
 }
 
-static int show_status(int argc, char **argv, void *userdata) {
+COMMAND(
+        "timedatectl\0",
+        "Query or change system time and date settings.",
+        .man_pages = "timedatectl(1)\0",
+        .pager_flags = &arg_pager_flags,
+);
+
+VERB_DEFAULT_NOARG(verb_status, "status", "Show current time settings");
+static int verb_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         StatusInfo info = {};
         static const struct bus_properties_map map[]  = {
                 { "Timezone",        "s", NULL, offsetof(StatusInfo, timezone)    },
@@ -143,10 +202,8 @@ static int show_status(int argc, char **argv, void *userdata) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        sd_bus *bus = userdata;
+        sd_bus *bus = ASSERT_PTR(userdata);
         int r;
-
-        assert(bus);
 
         r = bus_map_all_properties(bus,
                                    "org.freedesktop.timedate1",
@@ -159,24 +216,20 @@ static int show_status(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to query server: %s", bus_error_message(&error, r));
 
-        print_status_info(&info);
-
-        return r;
+        return print_status_info(&info);
 }
 
-static int show_properties(int argc, char **argv, void *userdata) {
-        sd_bus *bus = userdata;
+VERB_NOARG(verb_show, "show", "Show properties of systemd-timedated");
+static int verb_show(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        sd_bus *bus = ASSERT_PTR(userdata);
         int r;
-
-        assert(bus);
 
         r = bus_print_all_properties(bus,
                                      "org.freedesktop.timedate1",
                                      "/org/freedesktop/timedate1",
                                      NULL,
                                      arg_property,
-                                     arg_value,
-                                     arg_all,
+                                     arg_print_flags,
                                      NULL);
         if (r < 0)
                 return bus_log_parse_error(r);
@@ -184,119 +237,56 @@ static int show_properties(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int set_time(int argc, char **argv, void *userdata) {
+VERB(verb_set_time, "set-time", "TIME\0", 2, 2, 0, "Set system time");
+static int verb_set_time(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        bool relative = false, interactive = arg_ask_password;
         sd_bus *bus = userdata;
         usec_t t;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = parse_timestamp(argv[1], &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse time specification '%s': %m", argv[1]);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.timedate1",
-                               "/org/freedesktop/timedate1",
-                               "org.freedesktop.timedate1",
-                               "SetTime",
-                               &error,
-                               NULL,
-                               "xbb", (int64_t) t, relative, interactive);
+        r = bus_call_method(
+                        bus,
+                        bus_timedate,
+                        "SetTime",
+                        &error,
+                        NULL,
+                        "xbb", (int64_t) t, false, arg_ask_password);
         if (r < 0)
                 return log_error_errno(r, "Failed to set time: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static int set_timezone(int argc, char **argv, void *userdata) {
+VERB(verb_set_timezone, "set-timezone", "ZONE\0", 2, 2, 0, "Set system time zone");
+static int verb_set_timezone(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.timedate1",
-                               "/org/freedesktop/timedate1",
-                               "org.freedesktop.timedate1",
-                               "SetTimezone",
-                               &error,
-                               NULL,
-                               "sb", argv[1], arg_ask_password);
+        r = bus_call_method(bus, bus_timedate, "SetTimezone", &error, NULL, "sb", argv[1], arg_ask_password);
         if (r < 0)
                 return log_error_errno(r, "Failed to set time zone: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static int set_local_rtc(int argc, char **argv, void *userdata) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        sd_bus *bus = userdata;
-        int r, b;
-
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
-
-        b = parse_boolean(argv[1]);
-        if (b < 0)
-                return log_error_errno(b, "Failed to parse local RTC setting '%s': %m", argv[1]);
-
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.timedate1",
-                               "/org/freedesktop/timedate1",
-                               "org.freedesktop.timedate1",
-                               "SetLocalRTC",
-                               &error,
-                               NULL,
-                               "bbb", b, arg_adjust_system_clock, arg_ask_password);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set local RTC: %s", bus_error_message(&error, r));
-
-        return 0;
-}
-
-static int set_ntp(int argc, char **argv, void *userdata) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        sd_bus *bus = userdata;
-        int b, r;
-
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
-
-        b = parse_boolean(argv[1]);
-        if (b < 0)
-                return log_error_errno(b, "Failed to parse NTP setting '%s': %m", argv[1]);
-
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.timedate1",
-                               "/org/freedesktop/timedate1",
-                               "org.freedesktop.timedate1",
-                               "SetNTP",
-                               &error,
-                               NULL,
-                               "bb", b, arg_ask_password);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set ntp: %s", bus_error_message(&error, r));
-
-        return 0;
-}
-
-static int list_timezones(int argc, char **argv, void *userdata) {
+VERB_NOARG(verb_list_timezones, "list-timezones", "Show known time zones");
+static int verb_list_timezones(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
-        char** zones;
+        _cleanup_strv_free_ char **zones = NULL;
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.timedate1",
-                               "/org/freedesktop/timedate1",
-                               "org.freedesktop.timedate1",
-                               "ListTimezones",
-                               &error,
-                               &reply,
-                               NULL);
+        r = bus_call_method(bus, bus_timedate, "ListTimezones", &error, &reply, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request list of time zones: %s",
                                        bus_error_message(&error, r));
@@ -305,8 +295,69 @@ static int list_timezones(int argc, char **argv, void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
         strv_print(zones);
+
+        return 0;
+}
+
+VERB(verb_set_local_rtc, "set-local-rtc", "BOOL\0", 2, 2, 0, "Control whether RTC is in local time");
+static int verb_set_local_rtc(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus *bus = userdata;
+        int r, b;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        b = parse_boolean(argv[1]);
+        if (b < 0)
+                return log_error_errno(b, "Failed to parse local RTC setting '%s': %m", argv[1]);
+
+        if (b == 1)
+                log_warning("Warning: The system is now being configured to read the RTC time in the local time zone\n"
+                            "         This mode cannot be fully supported. It will create various problems\n"
+                            "         with time zone changes and daylight saving time adjustments. The RTC\n"
+                            "         time is never updated, it relies on external facilities to maintain it.\n"
+                            "         If at all possible, use RTC in UTC");
+
+        r = bus_call_method(
+                        bus,
+                        bus_timedate,
+                        "SetLocalRTC",
+                        &error,
+                        NULL,
+                        "bbb", b, arg_adjust_system_clock, arg_ask_password);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set local RTC: %s", bus_error_message(&error, r));
+
+        return 0;
+}
+
+VERB(verb_set_ntp, "set-ntp", "BOOL\0", 2, 2, 0, "Enable or disable network time synchronization");
+static int verb_set_ntp(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus *bus = userdata;
+        int b, r;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        b = parse_boolean(argv[1]);
+        if (b < 0)
+                return log_error_errno(b, "Failed to parse NTP setting '%s': %m", argv[1]);
+
+        r = bus_message_new_method_call(bus, &m, bus_timedate, "SetNTP");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append(m, "bb", b, arg_ask_password);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        /* Reloading the daemon may take long, hence set a longer timeout here */
+        r = sd_bus_call(bus, m, DAEMON_RELOAD_TIMEOUT_SEC, &error, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set ntp: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -344,17 +395,28 @@ static const char * const ntp_leap_table[4] = {
         [3] = "not synchronized",
 };
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wtype-limits"
+DISABLE_WARNING_TYPE_LIMITS;
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(ntp_leap, uint32_t);
-#pragma GCC diagnostic pop
+REENABLE_WARNING;
 
-static void print_ntp_status_info(NTPStatusInfo *i) {
-        char ts[FORMAT_TIMESPAN_MAX], tmin[FORMAT_TIMESPAN_MAX], tmax[FORMAT_TIMESPAN_MAX];
+static int print_ntp_status_info(NTPStatusInfo *i) {
         usec_t delay, t14, t23, offset, root_distance;
+        _cleanup_(table_unrefp) Table *table = NULL;
         bool offset_sign;
+        TableCell *cell;
+        int r;
 
         assert(i);
+
+        table = table_new_vertical();
+        if (!table)
+                return log_oom();
+
+        assert_se(cell = table_get_cell(table, 0, 0));
+        (void) table_set_ellipsize_percent(table, cell, 100);
+
+        assert_se(cell = table_get_cell(table, 0, 1));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
         /*
          * "Timestamp Name          ID   When Generated
@@ -368,21 +430,38 @@ static void print_ntp_status_info(NTPStatusInfo *i) {
          *  d = (T4 - T1) - (T3 - T2)     t = ((T2 - T1) + (T3 - T4)) / 2"
          */
 
-        printf("       Server: %s (%s)\n",
-               i->server_address, i->server_name);
-        printf("Poll interval: %s (min: %s; max %s)\n",
-               format_timespan(ts, sizeof(ts), i->poll_interval, 0),
-               format_timespan(tmin, sizeof(tmin), i->poll_min, 0),
-               format_timespan(tmax, sizeof(tmax), i->poll_max, 0));
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Server");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell_stringf(table, NULL, "%s (%s)", strna(i->server_address), strna(i->server_name));
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Poll interval");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell_stringf(table, NULL, "%s (min: %s; max %s)",
+                                   FORMAT_TIMESPAN(i->poll_interval, 0),
+                                   FORMAT_TIMESPAN(i->poll_min, 0),
+                                   FORMAT_TIMESPAN(i->poll_max, 0));
+        if (r < 0)
+                return table_log_add_error(r);
 
         if (i->packet_count == 0) {
-                printf(" Packet count: 0\n");
-                return;
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Packet count",
+                                   TABLE_STRING, "0");
+                if (r < 0)
+                        return table_log_add_error(r);
+
+                return table_print_or_warn(table);
         }
 
         if (i->dest < i->origin || i->trans < i->recv || i->dest - i->origin < i->trans - i->recv) {
                 log_error("Invalid NTP response");
-                return;
+                return table_print_or_warn(table);
         }
 
         delay = (i->dest - i->origin) - (i->trans - i->recv);
@@ -394,34 +473,75 @@ static void print_ntp_status_info(NTPStatusInfo *i) {
 
         root_distance = i->root_delay / 2 + i->root_dispersion;
 
-        printf("         Leap: %s\n"
-               "      Version: %" PRIu32 "\n"
-               "      Stratum: %" PRIu32 "\n",
-               ntp_leap_to_string(i->leap),
-               i->version,
-               i->stratum);
-        if (i->stratum <= 1)
-                printf("    Reference: %s\n", i->reference.str);
-        else
-                printf("    Reference: %" PRIX32 "\n", be32toh(i->reference.val));
-        printf("    Precision: %s (%" PRIi32 ")\n",
-               format_timespan(ts, sizeof(ts), DIV_ROUND_UP((nsec_t) (exp2(i->precision) * NSEC_PER_SEC), NSEC_PER_USEC), 0),
-               i->precision);
-        printf("Root distance: %s (max: %s)\n",
-               format_timespan(ts, sizeof(ts), root_distance, 0),
-               format_timespan(tmax, sizeof(tmax), i->root_distance_max, 0));
-        printf("       Offset: %s%s\n",
-               offset_sign ? "+" : "-",
-               format_timespan(ts, sizeof(ts), offset, 0));
-        printf("        Delay: %s\n",
-               format_timespan(ts, sizeof(ts), delay, 0));
-        printf("       Jitter: %s\n",
-               format_timespan(ts, sizeof(ts), i->jitter, 0));
-        printf(" Packet count: %" PRIu64 "\n", i->packet_count);
+        r = table_add_many(table,
+                           TABLE_FIELD, "Leap",
+                           TABLE_STRING, ntp_leap_to_string(i->leap),
+                           TABLE_FIELD, "Version",
+                           TABLE_UINT32, i->version,
+                           TABLE_FIELD, "Stratum",
+                           TABLE_UINT32, i->stratum,
+                           TABLE_FIELD, "Reference");
+        if (r < 0)
+                return table_log_add_error(r);
 
-        if (!i->spike)
-                printf("    Frequency: %+.3fppm\n",
-                       (double) i->freq / 0x10000);
+        if (i->stratum <= 1)
+                r = table_add_cell(table, NULL, TABLE_STRING, i->reference.str);
+        else
+                r = table_add_cell_stringf(table, NULL, "%" PRIX32, be32toh(i->reference.val));
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Precision");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell_stringf(table, NULL, "%s (%" PRIi32 ")",
+                                   FORMAT_TIMESPAN(DIV_ROUND_UP((nsec_t) (exp2(i->precision) * NSEC_PER_SEC), NSEC_PER_USEC), 0),
+                                   i->precision);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Root distance");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell_stringf(table, NULL, "%s (max: %s)",
+                                   FORMAT_TIMESPAN(root_distance, 0),
+                                   FORMAT_TIMESPAN(i->root_distance_max, 0));
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell(table, NULL, TABLE_FIELD, "Offset");
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_cell_stringf(table, NULL, "%s%s",
+                                   offset_sign ? "+" : "-",
+                                   FORMAT_TIMESPAN(offset, 0));
+        if (r < 0)
+                return table_log_add_error(r);
+
+        r = table_add_many(table,
+                           TABLE_FIELD, "Delay",
+                           TABLE_STRING, FORMAT_TIMESPAN(delay, 0),
+                           TABLE_FIELD, "Jitter",
+                           TABLE_STRING, FORMAT_TIMESPAN(i->jitter, 0),
+                           TABLE_FIELD, "Packet count",
+                           TABLE_UINT64, i->packet_count);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        if (!i->spike) {
+                r = table_add_cell(table, NULL, TABLE_FIELD, "Frequency");
+                if (r < 0)
+                        return table_log_add_error(r);
+
+                r = table_add_cell_stringf(table, NULL, "%+.3fppm", (double) i->freq / 0x10000);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        return table_print_or_warn(table);
 }
 
 static int map_server_address(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
@@ -469,13 +589,11 @@ static int map_server_address(sd_bus *bus, const char *member, sd_bus_message *m
 }
 
 static int map_ntp_message(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        NTPStatusInfo *p = userdata;
+        NTPStatusInfo *p = ASSERT_PTR(userdata);
         const void *d;
         size_t sz;
         int32_t b;
         int r;
-
-        assert(p);
 
         r = sd_bus_message_enter_container(m, 'r', "uuuuittayttttbtt");
         if (r < 0)
@@ -538,8 +656,14 @@ static int show_timesync_status_once(sd_bus *bus) {
                                    &error,
                                    &m,
                                    &info);
-        if (r < 0)
+        if (r < 0) {
+                if (bus_error_is_unknown_service(&error))
+                        return log_error_errno(r,
+                                               "Command requires systemd-timesyncd.service, but it is not available: %s",
+                                               bus_error_message(&error, r));
+
                 return log_error_errno(r, "Failed to query server: %s", bus_error_message(&error, r));
+        }
 
         if (arg_monitor && !terminal_is_dumb())
                 fputs(ANSI_HOME_CLEAR, stdout);
@@ -557,7 +681,7 @@ static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error
 
         r = sd_bus_message_read(m, "s", &name);
         if (r < 0)
-                return log_error_errno(r, "Failed to read interface name: %m");
+                return bus_log_parse_error(r);
 
         if (!streq_ptr(name, "org.freedesktop.timesync1.Manager"))
                 return 0;
@@ -565,12 +689,13 @@ static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error
         return show_timesync_status_once(sd_bus_message_get_bus(m));
 }
 
-static int show_timesync_status(int argc, char **argv, void *userdata) {
-        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-        sd_bus *bus = userdata;
-        int r;
+VERB_GROUP("systemd-timesyncd Commands");
 
-        assert(bus);
+VERB_NOARG(verb_timesync_status, "timesync-status", "Show status of systemd-timesyncd");
+static int verb_timesync_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
 
         r = show_timesync_status_once(bus);
         if (r < 0)
@@ -604,24 +729,24 @@ static int show_timesync_status(int argc, char **argv, void *userdata) {
         return 0;
 }
 
-static int print_timesync_property(const char *name, const char *expected_value, sd_bus_message *m, bool value, bool all) {
-        char type;
-        const char *contents;
+static int print_timesync_property(
+                const char *name,
+                const char *expected_value,
+                char type,
+                const char *contents,
+                sd_bus_message *m,
+                BusPrintPropertyFlags flags) {
+
         int r;
 
         assert(name);
         assert(m);
-
-        r = sd_bus_message_peek_type(m, &type, &contents);
-        if (r < 0)
-                return r;
 
         switch (type) {
 
         case SD_BUS_TYPE_STRUCT:
                 if (streq(name, "NTPMessage")) {
                         _cleanup_(ntp_status_info_clear) NTPStatusInfo i = {};
-                        char ts[FORMAT_TIMESPAN_MAX], stamp[FORMAT_TIMESTAMP_MAX];
 
                         r = map_ntp_message(NULL, NULL, m, NULL, &i);
                         if (r < 0)
@@ -630,35 +755,28 @@ static int print_timesync_property(const char *name, const char *expected_value,
                         if (i.packet_count == 0)
                                 return 1;
 
-                        if (!value) {
+                        if (!FLAGS_SET(flags, BUS_PRINT_PROPERTY_ONLY_VALUE)) {
                                 fputs(name, stdout);
                                 fputc('=', stdout);
                         }
 
                         printf("{ Leap=%u, Version=%u, Mode=%u, Stratum=%u, Precision=%i,",
                                i.leap, i.version, i.mode, i.stratum, i.precision);
-                        printf(" RootDelay=%s,",
-                               format_timespan(ts, sizeof(ts), i.root_delay, 0));
-                        printf(" RootDispersion=%s,",
-                               format_timespan(ts, sizeof(ts), i.root_dispersion, 0));
+                        printf(" RootDelay=%s,", FORMAT_TIMESPAN(i.root_delay, 0));
+                        printf(" RootDispersion=%s,", FORMAT_TIMESPAN(i.root_dispersion, 0));
 
                         if (i.stratum == 1)
                                 printf(" Reference=%s,", i.reference.str);
                         else
                                 printf(" Reference=%" PRIX32 ",", be32toh(i.reference.val));
 
-                        printf(" OriginateTimestamp=%s,",
-                               format_timestamp(stamp, sizeof(stamp), i.origin));
-                        printf(" ReceiveTimestamp=%s,",
-                               format_timestamp(stamp, sizeof(stamp), i.recv));
-                        printf(" TransmitTimestamp=%s,",
-                               format_timestamp(stamp, sizeof(stamp), i.trans));
-                        printf(" DestinationTimestamp=%s,",
-                               format_timestamp(stamp, sizeof(stamp), i.dest));
-                        printf(" Ignored=%s PacketCount=%" PRIu64 ",",
+                        printf(" OriginateTimestamp=%s,", FORMAT_TIMESTAMP(i.origin));
+                        printf(" ReceiveTimestamp=%s,", FORMAT_TIMESTAMP(i.recv));
+                        printf(" TransmitTimestamp=%s,", FORMAT_TIMESTAMP(i.trans));
+                        printf(" DestinationTimestamp=%s,", FORMAT_TIMESTAMP(i.dest));
+                        printf(" Ignored=%s, PacketCount=%" PRIu64 ",",
                                yes_no(i.spike), i.packet_count);
-                        printf(" Jitter=%s }\n",
-                               format_timespan(ts, sizeof(ts), i.jitter, 0));
+                        printf(" Jitter=%s }\n", FORMAT_TIMESPAN(i.jitter, 0));
 
                         return 1;
 
@@ -669,8 +787,7 @@ static int print_timesync_property(const char *name, const char *expected_value,
                         if (r < 0)
                                 return r;
 
-                        if (arg_all || !isempty(str))
-                                bus_print_property_value(name, expected_value, value, str);
+                        bus_print_property_value(name, expected_value, flags, str);
 
                         return 1;
                 }
@@ -680,205 +797,201 @@ static int print_timesync_property(const char *name, const char *expected_value,
         return 0;
 }
 
-static int show_timesync(int argc, char **argv, void *userdata) {
-        sd_bus *bus = userdata;
+VERB_NOARG(verb_show_timesync, "show-timesync", "Show properties of systemd-timesyncd");
+static int verb_show_timesync(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
         int r;
-
-        assert(bus);
 
         r = bus_print_all_properties(bus,
                                      "org.freedesktop.timesync1",
                                      "/org/freedesktop/timesync1",
                                      print_timesync_property,
                                      arg_property,
-                                     arg_value,
-                                     arg_all,
-                                     NULL);
-        if (r < 0)
+                                     arg_print_flags,
+                                     &error);
+        if (r < 0) {
+                if (bus_error_is_unknown_service(&error))
+                        return log_error_errno(r,
+                                               "Command requires systemd-timesyncd.service, but it is not available: %s",
+                                               bus_error_message(&error, r));
+
                 return bus_log_parse_error(r);
+        }
 
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+static int parse_ifindex_bus(sd_bus *bus, const char *str) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        int32_t i;
         int r;
 
-        r = terminal_urlify_man("timedatectl", "1", &link);
-        if (r < 0)
-                return log_oom();
+        assert(bus);
+        assert(str);
 
-        printf("%s [OPTIONS...] COMMAND ...\n\n"
-               "Query or change system time and date settings.\n\n"
-               "  -h --help                Show this help message\n"
-               "     --version             Show package version\n"
-               "     --no-pager            Do not pipe output into a pager\n"
-               "     --no-ask-password     Do not prompt for password\n"
-               "  -H --host=[USER@]HOST    Operate on remote host\n"
-               "  -M --machine=CONTAINER   Operate on local container\n"
-               "     --adjust-system-clock Adjust system clock when changing local RTC mode\n"
-               "     --monitor             Monitor status of systemd-timesyncd\n"
-               "  -p --property=NAME       Show only properties by this name\n"
-               "  -a --all                 Show all properties, including empty ones\n"
-               "     --value               When showing properties, only print the value\n"
-               "\n"
-               "Commands:\n"
-               "  status                   Show current time settings\n"
-               "  show                     Show properties of systemd-timedated\n"
-               "  set-time TIME            Set system time\n"
-               "  set-timezone ZONE        Set system time zone\n"
-               "  list-timezones           Show known time zones\n"
-               "  set-local-rtc BOOL       Control whether RTC is in local time\n"
-               "  set-ntp BOOL             Enable or disable network time synchronization\n"
-               "\n"
-               "systemd-timesyncd Commands:\n"
-               "  timesync-status          Show status of systemd-timesyncd\n"
-               "  show-timesync            Show properties of systemd-timesyncd\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
+        r = parse_ifindex(str);
+        if (r > 0)
+                return r;
+        assert(r < 0);
+
+        r = bus_call_method(bus, bus_network_mgr, "GetLinkByName", &error, &reply, "s", str);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get ifindex of interfaces %s: %s", str, bus_error_message(&error, r));
+
+        r = sd_bus_message_read(reply, "io", &i, NULL);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return i;
+}
+
+VERB(verb_ntp_servers, "ntp-servers", "INTERFACE SERVER…\0", 3, VERB_ANY, 0,
+     "Set the interface specific NTP servers");
+static int verb_ntp_servers(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *req = NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int ifindex, r;
+
+        ifindex = parse_ifindex_bus(bus, argv[1]);
+        if (ifindex < 0)
+                return ifindex;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        r = bus_message_new_method_call(bus, &req, bus_network_mgr, "SetLinkNTP");
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append(req, "i", ifindex);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_message_append_strv(req, argv + 2);
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        r = sd_bus_call(bus, req, 0, &error, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set NTP servers: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static int verb_help(int argc, char **argv, void *userdata) {
-        return help();
+VERB(verb_revert, "revert", "INTERFACE\0", 2, 2, 0, "Revert the interface specific NTP servers");
+static int verb_revert(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int ifindex, r;
+
+        ifindex = parse_ifindex_bus(bus, argv[1]);
+        if (ifindex < 0)
+                return ifindex;
+
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+
+        r = bus_call_method(bus, bus_network_mgr, "RevertLinkNTP", &error, NULL, "i", ifindex);
+        if (r < 0)
+                return log_error_errno(r, "Failed to revert interface configuration: %s", bus_error_message(&error, r));
+
+        return 0;
 }
 
-static int parse_argv(int argc, char *argv[]) {
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_ADJUST_SYSTEM_CLOCK,
-                ARG_NO_ASK_PASSWORD,
-                ARG_MONITOR,
-                ARG_VALUE,
-        };
-
-        static const struct option options[] = {
-                { "help",                no_argument,       NULL, 'h'                     },
-                { "version",             no_argument,       NULL, ARG_VERSION             },
-                { "no-pager",            no_argument,       NULL, ARG_NO_PAGER            },
-                { "host",                required_argument, NULL, 'H'                     },
-                { "machine",             required_argument, NULL, 'M'                     },
-                { "no-ask-password",     no_argument,       NULL, ARG_NO_ASK_PASSWORD     },
-                { "adjust-system-clock", no_argument,       NULL, ARG_ADJUST_SYSTEM_CLOCK },
-                { "monitor",             no_argument,       NULL, ARG_MONITOR             },
-                { "property",            required_argument, NULL, 'p'                     },
-                { "all",                 no_argument,       NULL, 'a'                     },
-                { "value",               no_argument,       NULL, ARG_VALUE               },
-                {}
-        };
-
-        int c, r;
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:p:a", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'H':
-                        arg_transport = BUS_TRANSPORT_REMOTE;
-                        arg_host = optarg;
-                        break;
-
-                case 'M':
-                        arg_transport = BUS_TRANSPORT_MACHINE;
-                        arg_host = optarg;
-                        break;
-
-                case ARG_NO_ASK_PASSWORD:
-                        arg_ask_password = false;
-                        break;
-
-                case ARG_ADJUST_SYSTEM_CLOCK:
-                        arg_adjust_system_clock = true;
-                        break;
-
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_MONITOR:
+                OPTION_COMMON_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
+                        break;
+
+                OPTION_COMMON_HOST:
+                        arg_transport = BUS_TRANSPORT_REMOTE;
+                        arg_host = opts.arg;
+                        break;
+
+                OPTION_COMMON_MACHINE:
+                        r = parse_machine_argument(opts.arg, &arg_host, &arg_transport);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("adjust-system-clock", NULL, "Adjust system clock when changing local RTC mode"):
+                        arg_adjust_system_clock = true;
+                        break;
+
+                OPTION_LONG("monitor", NULL, "Monitor status of systemd-timesyncd"):
                         arg_monitor = true;
                         break;
 
-                case 'p': {
-                        r = strv_extend(&arg_property, optarg);
+                OPTION('p', "property", "NAME", "Show only properties by this name"): {}
+                OPTION_SHORT('P', "NAME", "Equivalent to --value --property=NAME"):
+                        r = strv_extend(&arg_property, opts.arg);
                         if (r < 0)
                                 return log_oom();
 
-                        /* If the user asked for a particular
-                         * property, show it to him, even if it is
-                         * empty. */
-                        arg_all = true;
+                        /* If the user asked for a particular property, show it to them, even if empty. */
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
+
+                        if (opts.opt->short_code == 'P')
+                                SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_ONLY_VALUE, true);
                         break;
+
+                OPTION_LONG("value", NULL, "When showing properties, only print the value"):
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_ONLY_VALUE, true);
+                        break;
+
+                OPTION('a', "all", NULL, "Show all properties, including empty ones"):
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-                case 'a':
-                        arg_all = true;
-                        break;
-
-                case ARG_VALUE:
-                        arg_value = true;
-                        break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached("Unhandled option");
-                }
-
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int timedatectl_main(sd_bus *bus, int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "status",          VERB_ANY, 1,        VERB_DEFAULT, show_status          },
-                { "show",            VERB_ANY, 1,        0,            show_properties      },
-                { "set-time",        2,        2,        0,            set_time             },
-                { "set-timezone",    2,        2,        0,            set_timezone         },
-                { "list-timezones",  VERB_ANY, 1,        0,            list_timezones       },
-                { "set-local-rtc",   2,        2,        0,            set_local_rtc        },
-                { "set-ntp",         2,        2,        0,            set_ntp              },
-                { "timesync-status", VERB_ANY, 1,        0,            show_timesync_status },
-                { "show-timesync",   VERB_ANY, 1,        0,            show_timesync        },
-                { "help",            VERB_ANY, VERB_ANY, 0,            verb_help            }, /* Not documented, but supported since it is created. */
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, bus);
 }
 
 static int run(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        char **args = NULL;
         int r;
 
         setlocale(LC_ALL, "");
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
-        r = parse_argv(argc, argv);
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to create bus connection: %m");
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
-        return timedatectl_main(bus, argc, argv);
+        (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
+
+        return dispatch_verb(args, bus);
 }
 
 DEFINE_MAIN_FUNCTION(run);

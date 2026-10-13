@@ -1,50 +1,54 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "show-status.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "terminal-util.h"
-#include "util.h"
 
 static const char* const show_status_table[_SHOW_STATUS_MAX] = {
-        [SHOW_STATUS_NO] = "no",
-        [SHOW_STATUS_AUTO] = "auto",
+        [SHOW_STATUS_NO]        = "no",
+        [SHOW_STATUS_ERROR]     = "error",
+        [SHOW_STATUS_AUTO]      = "auto",
         [SHOW_STATUS_TEMPORARY] = "temporary",
-        [SHOW_STATUS_YES] = "yes",
+        [SHOW_STATUS_YES]       = "yes",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(show_status, ShowStatus, SHOW_STATUS_YES);
 
-int parse_show_status(const char *v, ShowStatus *ret) {
-        ShowStatus s;
+int parse_show_status(const char *s, ShowStatus *ret) {
+        ShowStatus status;
 
         assert(ret);
 
-        s = show_status_from_string(v);
-        if (s < 0 || s == SHOW_STATUS_TEMPORARY)
+        status = show_status_from_string(s);
+        if (status < 0 || status == SHOW_STATUS_TEMPORARY)
                 return -EINVAL;
 
-        *ret = s;
+        *ret = status;
         return 0;
 }
 
 int status_vprintf(const char *status, ShowStatusFlags flags, const char *format, va_list ap) {
         static const char status_indent[] = "         "; /* "[" STATUS "] " */
+        static bool prev_ephemeral = false;
+        static int dumb = -1;
+
         _cleanup_free_ char *s = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct iovec iovec[7] = {};
         int n = 0;
-        static bool prev_ephemeral;
 
         assert(format);
+
+        if (dumb < 0)
+                dumb = getenv_terminal_is_dumb();
 
         /* This is independent of logging, as status messages are
          * optional and go exclusively to the console. */
@@ -61,16 +65,22 @@ int status_vprintf(const char *status, ShowStatusFlags flags, const char *format
         if (fd < 0)
                 return fd;
 
-        if (FLAGS_SET(flags, SHOW_STATUS_ELLIPSIZE)) {
+        if (FLAGS_SET(flags, SHOW_STATUS_ELLIPSIZE) && !dumb) {
                 char *e;
                 size_t emax, sl;
                 int c;
 
                 c = fd_columns(fd);
-                if (c <= 0)
-                        c = 80;
+                if (c <= 0) {
+                        const char *env = getenv("COLUMNS");
+                        if (env)
+                                (void) safe_atoi(env, &c);
 
-                sl = status ? sizeof(status_indent)-1 : 0;
+                        if (c <= 0)
+                                c = 80;
+                }
+
+                sl = status ? strlen(status_indent) : 0;
 
                 emax = c - sl - 1;
                 if (emax < 3)
@@ -81,7 +91,7 @@ int status_vprintf(const char *status, ShowStatusFlags flags, const char *format
                         free_and_replace(s, e);
         }
 
-        if (prev_ephemeral)
+        if (prev_ephemeral && !dumb)
                 iovec[n++] = IOVEC_MAKE_STRING(ANSI_REVERSE_LINEFEED "\r" ANSI_ERASE_TO_END_OF_LINE);
 
         if (status) {
@@ -94,11 +104,13 @@ int status_vprintf(const char *status, ShowStatusFlags flags, const char *format
         }
 
         iovec[n++] = IOVEC_MAKE_STRING(s);
-        iovec[n++] = IOVEC_MAKE_STRING("\n");
+        /* use CRNL instead of just NL, to be robust towards TTYs in raw mode. If we're writing to a dumb
+         * terminal, use NL as CRNL might be interpreted as a double newline. */
+        iovec[n++] = IOVEC_MAKE_STRING(dumb ? "\n" : "\r\n");
 
-        if (prev_ephemeral && !FLAGS_SET(flags, SHOW_STATUS_EPHEMERAL))
+        if (prev_ephemeral && !FLAGS_SET(flags, SHOW_STATUS_EPHEMERAL) && !dumb)
                 iovec[n++] = IOVEC_MAKE_STRING(ANSI_ERASE_TO_END_OF_LINE);
-        prev_ephemeral = FLAGS_SET(flags, SHOW_STATUS_EPHEMERAL) ;
+        prev_ephemeral = FLAGS_SET(flags, SHOW_STATUS_EPHEMERAL);
 
         if (writev(fd, iovec, n) < 0)
                 return -errno;
@@ -118,3 +130,11 @@ int status_printf(const char *status, ShowStatusFlags flags, const char *format,
 
         return r;
 }
+
+static const char* const status_unit_format_table[_STATUS_UNIT_FORMAT_MAX] = {
+        [STATUS_UNIT_FORMAT_NAME]        = "name",
+        [STATUS_UNIT_FORMAT_DESCRIPTION] = "description",
+        [STATUS_UNIT_FORMAT_COMBINED]    = "combined",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(status_unit_format, StatusUnitFormat);

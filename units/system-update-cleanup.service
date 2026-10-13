@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -29,7 +29,9 @@ SuccessAction=reboot
 # reboot or some other action on its own.
 ConditionPathExists=|/system-update
 ConditionPathIsSymbolicLink=|/system-update
+ConditionPathExists=|/etc/system-update
+ConditionPathIsSymbolicLink=|/etc/system-update
 
 [Service]
 Type=oneshot
-ExecStart=/bin/rm -fv /system-update
+ExecStart=systemd-tmpfiles --inline --remove 'r /system-update' 'r /etc/system-update'

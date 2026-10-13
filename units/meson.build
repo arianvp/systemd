@@ -1,320 +1,1234 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+runlevels = conf.get('ENABLE_COMPAT_SYSV_INTERFACES') == 1
 
 units = [
-        ['basic.target',                        ''],
-        ['bluetooth.target',                    ''],
-        ['boot-complete.target',                ''],
-        ['cryptsetup-pre.target',               'HAVE_LIBCRYPTSETUP'],
-        ['cryptsetup.target',                   'HAVE_LIBCRYPTSETUP',
-         'sysinit.target.wants/'],
-        ['dev-hugepages.mount',                 '',
-         'sysinit.target.wants/'],
-        ['dev-mqueue.mount',                    '',
-         'sysinit.target.wants/'],
-        ['emergency.target',                    ''],
-        ['exit.target',                         ''],
-        ['final.target',                        ''],
-        ['getty.target',                        '',
-         'multi-user.target.wants/'],
-        ['getty-pre.target',                    ''],
-        ['graphical.target',                    '',
-         'runlevel5.target default.target'],
-        ['halt.target',                         ''],
-        ['hibernate.target',                    'ENABLE_HIBERNATE'],
-        ['hybrid-sleep.target',                 'ENABLE_HIBERNATE'],
-        ['suspend-then-hibernate.target',       'ENABLE_HIBERNATE'],
-        ['initrd-fs.target',                    ''],
-        ['initrd-root-device.target',           ''],
-        ['initrd-root-fs.target',               ''],
-        ['initrd-switch-root.target',           ''],
-        ['initrd.target',                       ''],
-        ['kexec.target',                        ''],
-        ['ldconfig.service',                    'ENABLE_LDCONFIG',
-         'sysinit.target.wants/'],
-        ['local-fs-pre.target',                 ''],
-        ['local-fs.target',                     ''],
-        ['machine.slice',                       'ENABLE_MACHINED'],
-        ['machines.target',                     'ENABLE_MACHINED'],
-        ['multi-user.target',                   '',
-         'runlevel2.target runlevel3.target runlevel4.target'],
-        ['network-online.target',               ''],
-        ['network-pre.target',                  ''],
-        ['network.target',                      ''],
-        ['nss-lookup.target',                   ''],
-        ['nss-user-lookup.target',              ''],
-        ['paths.target',                        ''],
-        ['poweroff.target',                     '',
-         'runlevel0.target'],
-        ['printer.target',                      ''],
-        ['proc-sys-fs-binfmt_misc.automount',   'ENABLE_BINFMT',
-         'sysinit.target.wants/'],
-        ['proc-sys-fs-binfmt_misc.mount',       'ENABLE_BINFMT'],
-        ['reboot.target',                       '',
-         'runlevel6.target ctrl-alt-del.target'],
-        ['remote-cryptsetup.target',            'HAVE_LIBCRYPTSETUP'],
-        ['remote-fs-pre.target',                ''],
-        ['remote-fs.target',                    ''],
-        ['rescue.target',                       '',
-         'runlevel1.target'],
-        ['rpcbind.target',                      ''],
-        ['shutdown.target',                     ''],
-        ['sigpwr.target',                       ''],
-        ['sleep.target',                        ''],
-        ['slices.target',                       ''],
-        ['smartcard.target',                    ''],
-        ['sockets.target',                      ''],
-        ['sound.target',                        ''],
-        ['suspend.target',                      ''],
-        ['swap.target',                         ''],
-        ['sys-fs-fuse-connections.mount',       '',
-         'sysinit.target.wants/'],
-        ['sys-kernel-config.mount',             '',
-         'sysinit.target.wants/'],
-        ['sys-kernel-debug.mount',              '',
-         'sysinit.target.wants/'],
-        ['sysinit.target',                      ''],
-        ['syslog.socket',                       ''],
-        ['system-update.target',                ''],
-        ['system-update-pre.target',            ''],
-        ['system-update-cleanup.service',       ''],
-        ['systemd-ask-password-console.path',   '',
-         'sysinit.target.wants/'],
-        ['systemd-ask-password-wall.path',      '',
-         'multi-user.target.wants/'],
-        ['systemd-coredump.socket',             'ENABLE_COREDUMP',
-         'sockets.target.wants/'],
-        ['systemd-exit.service',                 ''],
-        ['systemd-initctl.socket',              '',
-         'sockets.target.wants/'],
-        ['systemd-journal-gatewayd.socket',     'ENABLE_REMOTE HAVE_MICROHTTPD'],
-        ['systemd-journal-remote.socket',       'ENABLE_REMOTE HAVE_MICROHTTPD'],
-        ['systemd-journald-audit.socket',       '',
-         'sockets.target.wants/'],
-        ['systemd-journald-dev-log.socket',     '',
-         'sockets.target.wants/'],
-        ['systemd-journald.socket',             '',
-         'sockets.target.wants/'],
-        ['systemd-networkd.socket',             'ENABLE_NETWORKD'],
-        ['systemd-poweroff.service',             ''],
-        ['systemd-reboot.service',               ''],
-        ['systemd-rfkill.socket',               'ENABLE_RFKILL'],
-        ['systemd-tmpfiles-clean.timer',        '',
-         'timers.target.wants/'],
-        ['systemd-udevd-control.socket',        '',
-         'sockets.target.wants/'],
-        ['systemd-udevd-kernel.socket',         '',
-         'sockets.target.wants/'],
-        ['time-set.target',                     ''],
-        ['time-sync.target',                    ''],
-        ['timers.target',                       ''],
-        ['tmp.mount',                           '',
-         'local-fs.target.wants/'],
-        ['umount.target',                       ''],
-        ['user.slice',                          ''],
-        ['var-lib-machines.mount',              'ENABLE_MACHINED',
-         'remote-fs.target.wants/ machines.target.wants/'],
+        { 'file' : 'basic.target' },
+        { 'file' : 'blockdev@.target' },
+        { 'file' : 'bluetooth.target' },
+        { 'file' : 'boot-complete.target' },
+        { 'file' : 'breakpoint-pre-basic.service.in' },
+        { 'file' : 'breakpoint-pre-mount.service.in' },
+        { 'file' : 'breakpoint-pre-switch-root.service.in' },
+        { 'file' : 'breakpoint-pre-udev.service.in' },
+        { 'file' : 'capsule@.service.in' },
+        { 'file' : 'capsule.slice' },
+        {
+          'file' : 'clonesetup.target',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'console-getty.service.in' },
+        { 'file' : 'container-getty@.service.in' },
+        {
+          'file' : 'cryptsetup-pre.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'cryptsetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'debug-shell.service.in' },
+        {
+          'file' : 'dev-hugepages.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'dev-mqueue.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'emergency.service.in' },
+        { 'file' : 'emergency.target' },
+        { 'file' : 'exit.target' },
+        { 'file' : 'factory-reset.target' },
+        { 'file' : 'factory-reset-now.target' },
+        { 'file' : 'final.target' },
+        { 'file' : 'first-boot-complete.target' },
+        { 'file' : 'getty-pre.target' },
+        {
+          'file' : 'getty.target',
+          'symlinks' : ['multi-user.target.wants/'],
+        },
+        { 'file' : 'getty@.service.in' },
+        {
+          'file' : 'graphical.target',
+          'symlinks' : ['default.target'] + (runlevels ? ['runlevel5.target'] : []),
+        },
+        { 'file' : 'halt.target' },
+        {
+          'file' : 'hibernate.target',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'hybrid-sleep.target',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'systemd-battery-check.service.in',
+          'conditions' : ['ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-bsod.service.in',
+          'conditions' : ['HAVE_QRENCODE', 'ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'initrd-cleanup.service',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-fs.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-parse-etc.service.in',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-root-device.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-root-fs.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-switch-root.service',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-switch-root.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd-udevadm-cleanup-db.service',
+          'conditions' : ['ENABLE_INITRD'],
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'initrd-usr-fs.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'initrd.target',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        {
+          'file' : 'integritysetup-pre.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'integritysetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'kexec.target' },
+        {
+          'file' : 'kmod-static-nodes.service.in',
+          'conditions' : ['HAVE_KMOD', 'ENABLE_TMPFILES'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'ldconfig.service',
+          'conditions' : ['ENABLE_LDCONFIG'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'local-fs-pre.target' },
+        { 'file' : 'local-fs.target' },
+        {
+          'file' : 'machine.slice',
+          'conditions' : ['ENABLE_MACHINED'],
+        },
+        {
+          'file' : 'machines.target',
+          'conditions' : ['ENABLE_MACHINED'],
+        },
+        { 'file' : 'modprobe@.service' },
+        {
+          'file' : 'multi-user.target',
+          'symlinks' : runlevels ? ['runlevel2.target', 'runlevel3.target', 'runlevel4.target'] : [],
+        },
+        {
+          'file' : 'systemd-mute-console.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        { 'file' : 'systemd-mute-console@.service' },
+        {
+          'file' : 'system-systemd-mute-console.slice',
+          'name' : 'system-systemd\\x2dmute\\x2dconsole.slice',
+        },
+        { 'file' : 'network-online.target' },
+        { 'file' : 'network-pre.target' },
+        { 'file' : 'network.target' },
+        { 'file' : 'nss-lookup.target' },
+        { 'file' : 'nss-user-lookup.target' },
+        { 'file' : 'paths.target' },
+        {
+          'file' : 'poweroff.target',
+          'symlinks' : runlevels ? ['runlevel0.target'] : [],
+        },
+        { 'file' : 'printer.target' },
+        {
+          'file' : 'proc-sys-fs-binfmt_misc.automount',
+          'conditions' : ['ENABLE_BINFMT'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'proc-sys-fs-binfmt_misc.mount',
+          'conditions' : ['ENABLE_BINFMT'],
+        },
+        {
+          'file' : 'quotaon@.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'quotaon-root.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'reboot.target',
+          'symlinks' : ['ctrl-alt-del.target'] + (runlevels ? ['runlevel6.target'] : []),
+        },
+        {
+          'file' : 'remote-cryptsetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['initrd-root-device.target.wants/'],
+        },
+        { 'file' : 'remote-fs-pre.target' },
+        { 'file' : 'remote-fs.target' },
+        {
+          'file' : 'remote-integritysetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['initrd-root-device.target.wants/'],
+        },
+        {
+          'file' : 'remote-veritysetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['initrd-root-device.target.wants/'],
+        },
+        { 'file' : 'rescue.service.in' },
+        {
+          'file' : 'rescue.target',
+          'symlinks' : runlevels ? ['runlevel1.target'] : [],
+        },
+        { 'file' : 'rpcbind.target' },
+        { 'file' : 'serial-getty@.service.in' },
+        { 'file' : 'shutdown.target' },
+        { 'file' : 'sigpwr.target' },
+        { 'file' : 'sleep.target' },
+        { 'file' : 'slices.target' },
+        { 'file' : 'smartcard.target' },
+        { 'file' : 'sockets.target' },
+        { 'file' : 'soft-reboot.target' },
+        { 'file' : 'sound.target' },
+        { 'file' : 'ssh-access.target' },
+        {
+          'file' : 'suspend-then-hibernate.target',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        { 'file' : 'suspend.target' },
+        { 'file' : 'swap.target' },
+        {
+          'file' : 'sys-fs-fuse-connections.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'sys-kernel-config.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'sys-kernel-debug.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'sys-kernel-tracing.mount',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'sysinit.target' },
+        { 'file' : 'syslog.socket' },
+        { 'file' : 'system-install.target' },
+        {
+          'file' : 'system-systemd-cryptsetup.slice',
+          'name' : 'system-systemd\\x2dcryptsetup.slice',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'system-systemd-veritysetup.slice',
+          'name' : 'system-systemd\\x2dveritysetup.slice',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        { 'file' : 'system-update-cleanup.service' },
+        { 'file' : 'system-update-pre.target' },
+        { 'file' : 'system-update.target' },
+        {
+          'file' : 'systemd-ask-password.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        { 'file' : 'systemd-ask-password@.service' },
+        {
+          'file' : 'systemd-ask-password-console.path',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'systemd-ask-password-console.service' },
+        {
+          'file' : 'systemd-ask-password-wall.path',
+          'symlinks' : ['multi-user.target.wants/'],
+        },
+        { 'file' : 'systemd-ask-password-wall.service' },
+        {
+          'file' : 'systemd-backlight@.service.in',
+          'conditions' : ['ENABLE_BACKLIGHT'],
+        },
+        {
+          'file' : 'systemd-binfmt.service.in',
+          'conditions' : ['ENABLE_BINFMT'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-bless-boot.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_BLKID'],
+        },
+        { 'file' : 'systemd-boot-check-no-failures.service.in' },
+        {
+          'file' : 'systemd-boot-random-seed.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-boot-clear-sysfail.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-boot-update.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-bootctl@.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-bootctl.socket',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-bootctl@.service',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-bootctl.socket',
+          'conditions' : ['ENABLE_BOOTLOADER'],
+        },
+        {
+          'file' : 'systemd-confext.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-confext-initrd.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-confext-sysroot.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-coredump.socket',
+          'conditions' : ['ENABLE_COREDUMP'],
+          'symlinks' : ['sockets.target.wants/', 'system-update-pre.target.wants/'],
+        },
+        {
+          'file' : 'systemd-coredump@.service.in',
+          'conditions' : ['ENABLE_COREDUMP'],
+        },
+        {
+          'file' : 'systemd-coredump-register.service.in',
+          'conditions' : ['ENABLE_COREDUMP'],
+        },
+        {
+          'file' : 'systemd-coredumpd.service.in',
+          'conditions' : ['ENABLE_COREDUMP'],
+        },
+        {
+          'file' : 'systemd-creds.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-creds@.service' },
+        {
+          'file' : 'systemd-cryptenroll.socket',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-cryptenroll@.service',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'systemd-cryptenroll-firstboot.service',
+          'conditions' : ['HAVE_LIBCRYPTSETUP', 'ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        { 'file' : 'systemd-exit.service' },
+        { 'file' : 'systemd-factory-reset@.service.in' },
+        {
+          'file' : 'systemd-factory-reset.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-factory-reset-complete.service.in' },
+        { 'file' : 'systemd-factory-reset-reboot.service' },
+        {
+          'file' : 'systemd-factory-reset-request.service.in',
+          'symlinks' : ['factory-reset.target.wants/'],
+        },
+        {
+          'file' : 'systemd-firstboot.service',
+          'conditions' : ['ENABLE_FIRSTBOOT'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'systemd-fsck-root.service.in' },
+        { 'file' : 'systemd-fsck@.service.in' },
+        { 'file' : 'systemd-growfs-root.service.in' },
+        { 'file' : 'systemd-growfs@.service.in' },
+        { 'file' : 'systemd-halt.service' },
+        {
+          'file' : 'systemd-hibernate-clear.service.in',
+          'conditions' : ['ENABLE_HIBERNATE', 'ENABLE_EFI'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-hibernate-resume.service.in',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'systemd-hibernate.service.in',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'systemd-homed-activate.service',
+          'conditions' : ['ENABLE_HOMED'],
+        },
+        {
+          'file' : 'systemd-homed-firstboot.service',
+          'conditions' : ['ENABLE_HOMED'],
+        },
+        {
+          'file' : 'systemd-homed.service.in',
+          'conditions' : ['ENABLE_HOMED'],
+        },
+        {
+          'file' : 'systemd-hostnamed.service.in',
+          'conditions' : ['ENABLE_HOSTNAMED'],
+          'symlinks' : ['dbus-org.freedesktop.hostname1.service'],
+        },
+        {
+          'file' : 'systemd-hostnamed.socket',
+          'conditions' : ['ENABLE_HOSTNAMED'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-hwdb-update.service.in',
+          'conditions' : ['ENABLE_HWDB'],
+          'symlinks' : ['sysinit.target.wants/'],
+          'install_tag' : 'hwdb',
+        },
+        {
+          'file' : 'systemd-hybrid-sleep.service.in',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'systemd-imdsd@.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imdsd.socket',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-early-network.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-import.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-metrics.socket',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-metrics@.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-importd.service.in',
+          'conditions' : ['ENABLE_IMPORTD'],
+          'symlinks' : ['dbus-org.freedesktop.import1.service'],
+        },
+        {
+          'file' : 'systemd-importd.socket',
+          'conditions' : ['ENABLE_IMPORTD'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'imports-pre.target',
+          'conditions' : ['ENABLE_IMPORTD'],
+        },
+        {
+          'file' : 'imports.target',
+          'conditions' : ['ENABLE_IMPORTD'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-journal-catalog-update.service',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-journal-flush.service',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-journal-gatewayd.service.in',
+          'conditions' : ['ENABLE_REMOTE', 'HAVE_MICROHTTPD'],
+        },
+        {
+          'file' : 'systemd-journal-gatewayd.socket',
+          'conditions' : ['ENABLE_REMOTE', 'HAVE_MICROHTTPD'],
+        },
+        {
+          'file' : 'systemd-journal-remote.service.in',
+          'conditions' : ['ENABLE_REMOTE', 'HAVE_MICROHTTPD'],
+        },
+        {
+          'file' : 'systemd-journal-remote.socket',
+          'conditions' : ['ENABLE_REMOTE', 'HAVE_MICROHTTPD'],
+        },
+        {
+          'file' : 'systemd-journal-upload.service.in',
+          'conditions' : ['ENABLE_REMOTE', 'HAVE_LIBCURL'],
+        },
+        { 'file' : 'systemd-journalctl@.service' },
+        {
+          'file' : 'systemd-journalctl.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-journalctl-metrics@.service' },
+        { 'file' : 'systemd-journalctl-metrics.socket' },
+        { 'file' : 'systemd-journald-audit.socket' },
+        {
+          'file' : 'systemd-journald-dev-log.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-journald-sync@.service' },
+        { 'file' : 'systemd-journald-varlink@.socket' },
+        {
+          'file' : 'systemd-journald.service.in',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-journald.socket',
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        { 'file' : 'systemd-journald@.service.in' },
+        { 'file' : 'systemd-journald@.socket' },
+        { 'file' : 'systemd-kexec.service' },
+        {
+          'file' : 'systemd-localed.service.in',
+          'conditions' : ['ENABLE_LOCALED'],
+          'symlinks' : ['dbus-org.freedesktop.locale1.service'],
+        },
+        {
+          'file': 'systemd-logind-varlink.socket',
+          'conditions': ['ENABLE_LOGIND'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-logind.service.in',
+          'conditions' : ['ENABLE_LOGIND'],
+          'symlinks' : ['multi-user.target.wants/', 'dbus-org.freedesktop.login1.service'],
+        },
+        { 'file' : 'systemd-loop@.service' },
+        {
+          'file' : 'systemd-machine-id-commit.service',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-machine-tag@.service',
+          'conditions' : ['ENABLE_HOSTNAMED'],
+        },
+        {
+          'file' : 'systemd-machined.service.in',
+          'conditions' : ['ENABLE_MACHINED'],
+          'symlinks' : ['dbus-org.freedesktop.machine1.service'],
+        },
+        {
+          'file' : 'systemd-machined.socket',
+          'conditions' : ['ENABLE_MACHINED'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-modules-load.service.in',
+          'conditions' : ['HAVE_KMOD'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'systemd-network-generator.service.in' },
+        {
+          'file' : 'systemd-networkd-persistent-storage.service',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd-resolve-hook.socket',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd-varlink.socket',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd-varlink-metrics.socket',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd-wait-online.service.in',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd-wait-online@.service.in',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd.service.in',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-networkd.socket',
+          'conditions' : ['ENABLE_NETWORKD'],
+        },
+        {
+          'file' : 'systemd-nspawn@.service.in',
+          'conditions' : ['ENABLE_NSPAWN'],
+        },
+        {
+          'file' : 'systemd-vmspawn@.service.in',
+          'conditions' : ['ENABLE_VMSPAWN'],
+        },
+        {
+          'file' : 'systemd-oomd.service.in',
+          'conditions' : ['ENABLE_OOMD'],
+        },
+        {
+          'file' : 'systemd-oomd.socket',
+          'conditions' : ['ENABLE_OOMD'],
+        },
+        {
+          'file' : 'systemd-pcrextend@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrextend.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrfs-root.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrfs@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrmachine.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrosseparator.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrphase-factory-reset.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['factory-reset.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrproduct.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrlogin@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrphase-initrd.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2', 'ENABLE_INITRD'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrphase-sysinit.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrphase-storage-target-mode.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['storage-target-mode.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrphase.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrnvdone.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'systemd-report.socket' },
+        { 'file' : 'systemd-report@.service.in' },
+        { 'file' : 'systemd-report-basic.socket' },
+        { 'file' : 'systemd-report-basic@.service.in' },
+        {
+          'file' : 'systemd-tpm2-clear.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-tpm2-setup.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tpm2-setup-early.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tpm2-swtpm.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-make-policy.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-secureboot-policy.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-secureboot-authority.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-file-system.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-machine-id.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-firmware-code.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock-firmware-config.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-pcrlock.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-pcrlock@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-pcrlock.socket',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-portabled.service.in',
+          'conditions' : ['ENABLE_PORTABLED'],
+          'symlinks' : ['dbus-org.freedesktop.portable1.service'],
+        },
+        { 'file' : 'systemd-poweroff.service' },
+        {
+          'file' : 'systemd-pstore.service.in',
+          'conditions' : ['ENABLE_PSTORE'],
+        },
+        {
+          'file' : 'systemd-quotacheck@.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'systemd-quotacheck-root.service.in',
+          'conditions' : ['ENABLE_QUOTACHECK'],
+        },
+        {
+          'file' : 'systemd-random-seed.service.in',
+          'conditions' : ['ENABLE_RANDOMSEED'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        { 'file' : 'systemd-reboot.service' },
+        { 'file' : 'systemd-remount-fs.service.in' },
+        {
+          'file' : 'systemd-repart.service',
+          'conditions' : ['ENABLE_REPART'],
+          'symlinks' : ['sysinit.target.wants/', 'initrd-root-fs.target.wants/'],
+        },
+        {
+          'file' : 'systemd-repart.socket',
+          'conditions' : ['ENABLE_REPART'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-repart@.service',
+          'conditions' : ['ENABLE_REPART'],
+        },
+        { 'file' : 'systemd-report-cgroup.socket' },
+        { 'file' : 'systemd-report-cgroup@.service.in' },
+        {
+          'file' : 'systemd-report-diskspace.socket',
+          'conditions' : ['HAVE_LIBMOUNT'],
+        },
+        {
+          'file' : 'systemd-report-diskspace@.service.in',
+          'conditions' : ['HAVE_LIBMOUNT'],
+        },
+        { 'file' : 'systemd-report-files.socket' },
+        { 'file' : 'systemd-report-files@.service.in' },
+        { 'file' : 'systemd-report-hwmon.socket' },
+        { 'file' : 'systemd-report-hwmon@.service.in' },
+        {
+          'file' : 'systemd-report-sign-plain.socket',
+          'conditions' : ['HAVE_OPENSSL'],
+        },
+        {
+          'file' : 'systemd-report-sign-plain@.service.in',
+          'conditions' : ['HAVE_OPENSSL'],
+        },
+        {
+          'file' : 'systemd-report-sign-tpm2.socket',
+          'conditions' : ['HAVE_OPENSSL','HAVE_TPM2'],
+        },
+        {
+          'file' : 'systemd-report-sign-tpm2@.service.in',
+          'conditions' : ['HAVE_OPENSSL', 'HAVE_TPM2'],
+        },
+        { 'file' : 'systemd-report-sign-tsm.socket' },
+        { 'file' : 'systemd-report-sign-tsm@.service.in' },
+        {
+          'file' : 'systemd-resolved.service.in',
+          'conditions' : ['ENABLE_RESOLVE'],
+        },
+        {
+          'file' : 'systemd-resolved-varlink.socket',
+          'conditions' : ['ENABLE_RESOLVE'],
+        },
+        {
+          'file' : 'systemd-resolved-monitor.socket',
+          'conditions' : ['ENABLE_RESOLVE'],
+        },
+        {
+          'file' : 'systemd-rfkill.service.in',
+          'conditions' : ['ENABLE_RFKILL'],
+        },
+        {
+          'file' : 'systemd-rfkill.socket',
+          'conditions' : ['ENABLE_RFKILL'],
+        },
+        { 'file' : 'systemd-soft-reboot.service' },
+        {
+          'file' : 'systemd-suspend-then-hibernate.service.in',
+          'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        { 'file' : 'systemd-suspend.service.in' },
+        {
+          'file' : 'systemd-sysctl.service.in',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysext.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysext-initrd.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+          'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysext-sysroot.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysext.socket',
+          'conditions' : ['ENABLE_SYSEXT'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-sysext@.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysupdate-notify-sysext.socket',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysext@.service',
+          'conditions' : ['ENABLE_SYSEXT'],
+        },
+        {
+          'file' : 'systemd-sysinstall.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['system-install.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysinstall.socket',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysinstall@.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+        },
+        {
+          'file' : 'systemd-sysupdate-auto-enable.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
+          'file' : 'systemd-sysupdate-reboot.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
+          'file' : 'systemd-sysupdate-reboot.timer',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
+          'file' : 'systemd-sysupdate-update.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['systemd-sysupdate.service'],  # compatibility after rename
+        },
+        {
+          'file' : 'systemd-sysupdate@.service.in',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
+          'file' : 'systemd-sysupdate.socket',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['sockets.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-update.timer',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+          'symlinks' : ['systemd-sysupdate.timer'],  # compatibility after rename
+        },
+        {
+          'file' : 'systemd-sysupdated.service.in',
+          'conditions' : ['ENABLE_SYSUPDATED'],
+          'symlinks' : ['dbus-org.freedesktop.sysupdate1.service'],
+        },
+        {
+          'file' : 'systemd-sysusers.service',
+          'conditions' : ['ENABLE_SYSUSERS'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-storage-block.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-block@.service.in',
+        },
+        {
+          'file' : 'systemd-storage-fs.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-fs@.service.in',
+        },
+        {
+          'file' : 'systemd-storagetm.service.in',
+          'conditions' : ['ENABLE_STORAGETM'],
+        },
+        {
+          'file' : 'storage-target-mode.target',
+          'conditions' : ['ENABLE_STORAGETM'],
+        },
+        {
+          'file' : 'systemd-time-wait-sync.service.in',
+          'conditions' : ['ENABLE_TIMESYNCD'],
+        },
+        {
+          'file' : 'systemd-timedated.service.in',
+          'conditions' : ['ENABLE_TIMEDATED'],
+          'symlinks' : ['dbus-org.freedesktop.timedate1.service'],
+        },
+        {
+          'file' : 'systemd-timesyncd.service.in',
+          'conditions' : ['ENABLE_TIMESYNCD'],
+        },
+        {
+          'file' : 'systemd-tmpfiles-clean.service',
+          'conditions' : ['ENABLE_TMPFILES'],
+        },
+        {
+          'file' : 'systemd-tmpfiles-clean.timer',
+          'conditions' : ['ENABLE_TMPFILES'],
+          'symlinks' : ['timers.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tmpfiles-setup-dev-early.service',
+          'conditions' : ['ENABLE_TMPFILES'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tmpfiles-setup-dev.service',
+          'conditions' : ['ENABLE_TMPFILES'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tmpfiles-setup.service',
+          'conditions' : ['ENABLE_TMPFILES'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-udev-load-credentials.service',
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-udev-settle.service',
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-udev-trigger.service',
+          'symlinks' : ['sysinit.target.wants/'],
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-udevd-kernel.socket',
+          'symlinks' : ['sockets.target.wants/'],
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-udevd-varlink.socket',
+          'symlinks' : ['sockets.target.wants/', 'systemd-udevd-control.socket'],
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-udevd.service.in',
+          'symlinks' : ['sysinit.target.wants/'],
+          'install_tag' : 'udev',
+        },
+        {
+          'file' : 'systemd-update-done.service.in',
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-update-utmp.service.in',
+          'conditions' : ['ENABLE_UTMP'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-user-sessions.service.in',
+          'conditions' : ['HAVE_PAM'],
+          'symlinks' : ['multi-user.target.wants/'],
+        },
+        {
+          'file' : 'systemd-userdb-load-credentials.service',
+          'conditions' : ['ENABLE_USERDB'],
+        },
+        {
+          'file' : 'systemd-userdbd.service.in',
+          'conditions' : ['ENABLE_USERDB'],
+        },
+        {
+          'file' : 'systemd-userdbd.socket',
+          'conditions' : ['ENABLE_USERDB'],
+        },
+        {
+          'file' : 'systemd-mountfsd.service.in',
+          'conditions' : ['ENABLE_MOUNTFSD'],
+        },
+        {
+          'file' : 'systemd-mountfsd.socket',
+          'conditions' : ['ENABLE_MOUNTFSD'],
+        },
+        {
+          'file' : 'systemd-nsresourced.service.in',
+          'conditions' : ['ENABLE_NSRESOURCED'],
+        },
+        {
+          'file' : 'systemd-nsresourced.socket.in',
+          'conditions' : ['ENABLE_NSRESOURCED'],
+        },
+        {
+          'file' : 'systemd-validatefs@.service.in',
+          'conditions' : ['HAVE_BLKID'],
+        },
+        {
+          'file' : 'systemd-vconsole-setup.service.in',
+          'conditions' : ['ENABLE_VCONSOLE'],
+        },
+        {
+          'file' : 'systemd-volatile-root.service.in',
+          'conditions' : ['ENABLE_INITRD'],
+        },
+        { 'file' : 'time-set.target' },
+        { 'file' : 'time-sync.target' },
+        { 'file' : 'timers.target' },
+        {
+          'file' : 'tmp.mount',
+          'symlinks' : ['local-fs.target.wants/'],
+        },
+        { 'file' : 'tpm2.target' },
+        { 'file' : 'umount.target' },
+        { 'file' : 'usb-gadget.target' },
+        { 'file' : 'user-runtime-dir@.service.in' },
+        { 'file' : 'user.slice' },
+        { 'file' : 'user@.service.in' },
+        {
+          'file' : 'var-lib-machines.mount',
+          'conditions' : ['ENABLE_MACHINED'],
+          'symlinks' : ['remote-fs.target.wants/', 'machines.target.wants/'],
+        },
+        {
+          'file' : 'veritysetup-pre.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+        },
+        {
+          'file' : 'veritysetup.target',
+          'conditions' : ['HAVE_LIBCRYPTSETUP'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
 ]
 
-in_units = [
-        ['debug-shell.service',                  ''],
-        ['emergency.service',                    ''],
-        ['initrd-cleanup.service',               ''],
-        ['initrd-parse-etc.service',             ''],
-        ['initrd-switch-root.service',           ''],
-        ['initrd-udevadm-cleanup-db.service',    ''],
-        ['kmod-static-nodes.service',            'HAVE_KMOD ENABLE_TMPFILES',
-         'sysinit.target.wants/'],
-        ['quotaon.service',                      'ENABLE_QUOTACHECK'],
-        ['rc-local.service',                     'HAVE_SYSV_COMPAT'],
-        ['rescue.service',                       ''],
-        ['systemd-ask-password-console.service', ''],
-        ['systemd-ask-password-wall.service',    ''],
-        ['systemd-backlight@.service',           'ENABLE_BACKLIGHT'],
-        ['systemd-binfmt.service',               'ENABLE_BINFMT',
-         'sysinit.target.wants/'],
-        ['systemd-bless-boot.service',           'ENABLE_EFI HAVE_BLKID'],
-        ['systemd-boot-check-no-failures.service', ''],
-        ['systemd-coredump@.service',            'ENABLE_COREDUMP'],
-        ['systemd-firstboot.service',            'ENABLE_FIRSTBOOT',
-         'sysinit.target.wants/'],
-        ['systemd-fsck-root.service',            ''],
-        ['systemd-fsck@.service',                ''],
-        ['systemd-halt.service',                 ''],
-        ['systemd-hibernate-resume@.service',    'ENABLE_HIBERNATE'],
-        ['systemd-hibernate.service',            'ENABLE_HIBERNATE'],
-        ['systemd-hybrid-sleep.service',         'ENABLE_HIBERNATE'],
-        ['systemd-suspend-then-hibernate.service', 'ENABLE_HIBERNATE'],
-        ['systemd-hostnamed.service',            'ENABLE_HOSTNAMED',
-         'dbus-org.freedesktop.hostname1.service'],
-        ['systemd-hwdb-update.service',          'ENABLE_HWDB',
-         'sysinit.target.wants/'],
-        ['systemd-importd.service',              'ENABLE_IMPORTD',
-         'dbus-org.freedesktop.import1.service'],
-        ['systemd-initctl.service',               ''],
-        ['systemd-journal-catalog-update.service', '',
-         'sysinit.target.wants/'],
-        ['systemd-journal-flush.service',         '',
-         'sysinit.target.wants/'],
-        ['systemd-journal-gatewayd.service',     'ENABLE_REMOTE HAVE_MICROHTTPD'],
-        ['systemd-journal-remote.service',       'ENABLE_REMOTE HAVE_MICROHTTPD'],
-        ['systemd-journal-upload.service',       'ENABLE_REMOTE HAVE_LIBCURL'],
-        ['systemd-journald.service',             '',
-         'sysinit.target.wants/'],
-        ['systemd-kexec.service',                ''],
-        ['systemd-localed.service',              'ENABLE_LOCALED',
-         'dbus-org.freedesktop.locale1.service'],
-        ['systemd-logind.service',               'ENABLE_LOGIND',
-         'multi-user.target.wants/ dbus-org.freedesktop.login1.service'],
-        ['systemd-machine-id-commit.service',    '',
-         'sysinit.target.wants/'],
-        ['systemd-machined.service',             'ENABLE_MACHINED',
-         'dbus-org.freedesktop.machine1.service'],
-        ['systemd-modules-load.service',         'HAVE_KMOD',
-         'sysinit.target.wants/'],
-        ['systemd-networkd.service',             'ENABLE_NETWORKD'],
-        ['systemd-networkd-wait-online.service', 'ENABLE_NETWORKD'],
-        ['systemd-nspawn@.service',              ''],
-        ['systemd-portabled.service',            'ENABLE_PORTABLED',
-         'dbus-org.freedesktop.portable1.service'],
-        ['systemd-quotacheck.service',           'ENABLE_QUOTACHECK'],
-        ['systemd-random-seed.service',          'ENABLE_RANDOMSEED',
-         'sysinit.target.wants/'],
-        ['systemd-remount-fs.service',           ''],
-        ['systemd-resolved.service',             'ENABLE_RESOLVE'],
-        ['systemd-rfkill.service',               'ENABLE_RFKILL'],
-        ['systemd-suspend.service',              ''],
-        ['systemd-sysctl.service',               '',
-         'sysinit.target.wants/'],
-        ['systemd-sysusers.service',             'ENABLE_SYSUSERS',
-         'sysinit.target.wants/'],
-        ['systemd-timedated.service',            'ENABLE_TIMEDATED',
-         'dbus-org.freedesktop.timedate1.service'],
-        ['systemd-timesyncd.service',            'ENABLE_TIMESYNCD'],
-        ['systemd-time-wait-sync.service',       'ENABLE_TIMESYNCD'],
-        ['systemd-tmpfiles-clean.service',       'ENABLE_TMPFILES'],
-        ['systemd-tmpfiles-setup-dev.service',   'ENABLE_TMPFILES',
-         'sysinit.target.wants/'],
-        ['systemd-tmpfiles-setup.service',       'ENABLE_TMPFILES',
-         'sysinit.target.wants/'],
-        ['systemd-udev-settle.service',          ''],
-        ['systemd-udev-trigger.service',         '',
-         'sysinit.target.wants/'],
-        ['systemd-udevd.service',                '',
-         'sysinit.target.wants/'],
-        ['systemd-update-done.service',          '',
-         'sysinit.target.wants/'],
-        ['systemd-update-utmp-runlevel.service', 'ENABLE_UTMP HAVE_SYSV_COMPAT',
-         'multi-user.target.wants/ graphical.target.wants/ rescue.target.wants/'],
-        ['systemd-update-utmp.service',          'ENABLE_UTMP',
-         'sysinit.target.wants/'],
-        ['systemd-user-sessions.service',        'HAVE_PAM',
-         'multi-user.target.wants/'],
-        ['systemd-vconsole-setup.service',       'ENABLE_VCONSOLE'],
-        ['systemd-volatile-root.service',        ''],
-        ['user-runtime-dir@.service',            ''],
-        ['user@.service',                        ''],
+# For the udev/hwdb aliases
+udev_units = []
+hwdb_units = []
+
+# Unit files whose contents are embedded into the manager binary, so that it can
+# fall back to a built-in copy when the file is not present on disk. Referenced
+# from src/core/meson.build.
+embedded_unit_names = [
+        'basic.target',
+        'exit.target',
+        'final.target',
+        'graphical.target',
+        'halt.target',
+        'kexec.target',
+        'multi-user.target',
+        'poweroff.target',
+        'reboot.target',
+        'shutdown.target',
+        'sigpwr.target',
+        'soft-reboot.target',
+        'sysinit.target',
+        'systemd-exit.service',
+        'systemd-halt.service',
+        'systemd-kexec.service',
+        'systemd-poweroff.service',
+        'systemd-reboot.service',
+        'systemd-soft-reboot.service',
+        'umount.target',
 ]
+embedded_units = []
 
-m4_units = [
-        ['console-getty.service',              ''],
-        ['container-getty@.service',           ''],
-        ['getty@.service',                     '',
-         'autovt@.service '],
-        ['serial-getty@.service',              ''],
-]
+foreach unit : units
+        source = unit.get('file')
 
-foreach tuple : in_units
-        file = tuple[0]
-
-        # we do this here because install_data does not accept custom_target output
-        conds = tuple[1].split(' ')
-        install = ((conds.get(0, '') == '' or conf.get(conds[0]) == 1) and
-                   (conds.get(1, '') == '' or conf.get(conds[1]) == 1))
-
-        gen1 = configure_file(
-                input : file + '.in',
-                output : file + '.tmp',
-                configuration : substs)
-        gen2 = custom_target(
-                file,
-                input : gen1,
-                output : file,
-                command : [sed, '/^## /d', '@INPUT@'],
-                capture : true,
-                install : install,
-                install_dir : systemunitdir)
-
-        if install and tuple.length() > 2
-                foreach target : tuple[2].split()
-                        meson.add_install_script('meson-add-wants.sh', systemunitdir, target, file)
-                endforeach
+        if source.endswith('.in')
+                needs_jinja = true
+                name = source.substring(0, -3)
+                assert(name + '.in' == source)
+        else
+                needs_jinja = false
+                name = source
         endif
-endforeach
+        # Unit names that contain characters which are awkward in source file names (e.g. the
+        # backslash in \x2d escapes) are stored under a sanitized file name and renamed on install.
+        name = unit.get('name', name)
+        source = files(source)
 
-foreach tuple : m4_units
-        file = tuple[0]
-        input = tuple.get(3, file + '.m4')
+        install = true
+        foreach cond : unit.get('conditions', [])
+                if conf.get(cond) != 1
+                        install = false
+                        break
+                endif
+        endforeach
 
-        # we do this here because install_data does not accept custom_target output
-        conds = tuple[1].split(' ')
-        install = ((conds.get(0, '') == '' or conf.get(conds[0]) == 1) and
-                   (conds.get(1, '') == '' or conf.get(conds[1]) == 1))
-
-        custom_target(
-                file,
-                input : input,
-                output: file,
-                command : [meson_apply_m4, config_h, '@INPUT@'],
-                capture : true,
-                install : install,
-                install_dir : systemunitdir)
-
-        if tuple.length() > 2 and install
-                foreach target : tuple[2].split()
-                        meson.add_install_script('meson-add-wants.sh', systemunitdir, target, file)
-                endforeach
+        if needs_jinja
+                processed = custom_target(
+                        input : source,
+                        output : name,
+                        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+                        install : install,
+                        install_dir : systemunitdir,
+                        install_tag : unit.get('install_tag', ''))
+                if unit.get('install_tag', '') == 'udev'
+                        udev_units += processed
+                elif unit.get('install_tag', '') == 'hwdb'
+                        hwdb_units += processed
+                endif
+        elif install
+                install_data(source,
+                             rename : name,
+                             install_dir : systemunitdir,
+                             install_tag : unit.get('install_tag', ''))
         endif
-endforeach
 
-foreach tuple : units
-        file = tuple[0]
-        input = tuple.get(3, file)
-
-        conds = tuple[1].split(' ')
-        install = ((conds.get(0, '') == '' or conf.get(conds[0]) == 1) and
-                   (conds.get(1, '') == '' or conf.get(conds[1]) == 1))
+        if name in embedded_unit_names
+                # Embed either the processed output or the original file.
+                embedded_units += needs_jinja ? processed : source
+        endif
 
         if install
-                install_data(input,
-                             install_dir : systemunitdir)
-
-                if tuple.length() > 2
-                        foreach target : tuple[2].split()
-                                meson.add_install_script(
-                                        'meson-add-wants.sh', systemunitdir, target, file)
-                        endforeach
-                endif
+                foreach target : unit.get('symlinks', [])
+                        if target.endswith('/')
+                                # '/' is only allowed at the end of the target
+                                assert(target.replace('/', '') + '/' == target)
+                                install_symlink(name,
+                                                pointing_to : '..' / name,
+                                                install_dir : systemunitdir / target,
+                                                install_tag : unit.get('install_tag', ''))
+                        else
+                                install_symlink(target,
+                                                pointing_to : name,
+                                                install_dir : systemunitdir,
+                                                install_tag : unit.get('install_tag', ''))
+                        endif
+                endforeach
         endif
 endforeach
 
 install_data('user-.slice.d/10-defaults.conf',
              install_dir : systemunitdir + '/user-.slice.d')
 
+install_data('user@.service.d/10-login-barrier.conf',
+             install_dir : systemunitdir + '/user@.service.d')
+install_data('user@0.service.d/10-login-barrier.conf',
+             install_dir : systemunitdir + '/user@0.service.d')
+
 ############################################################
 
-meson.add_install_script(meson_make_symlink,
-                         join_paths(pkgsysconfdir, 'user'),
-                         join_paths(sysconfdir, 'xdg/systemd/user'))
-meson.add_install_script(meson_make_symlink,
-                         join_paths(dbussystemservicedir, 'org.freedesktop.systemd1.service'),
-                         join_paths(dbussessionservicedir, 'org.freedesktop.systemd1.service'))
-if conf.get('HAVE_SYSV_COMPAT') == 1
-        foreach i : [1, 2, 3, 4, 5]
-                meson.add_install_script(
-                        'sh', '-c',
-                        mkdir_p
-                        .format(join_paths(systemunitdir, 'runlevel@0@.target.wants'.format(i))))
-        endforeach
+if meson.version().version_compare('>=1.3.0')
+        install_symlink(
+                'org.freedesktop.systemd1.service',
+                pointing_to : fs.relative_to(dbussystemservicedir / 'org.freedesktop.systemd1.service',
+                                             dbussessionservicedir),
+                install_dir : dbussessionservicedir)
+else
+        install_emptydir(dbussessionservicedir)
+        meson.add_install_script(sh, '-c',
+                ln_s.format(dbussystemservicedir / 'org.freedesktop.systemd1.service',
+                            dbussessionservicedir / 'org.freedesktop.systemd1.service'))
 endif
 
 subdir('user')

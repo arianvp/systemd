@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # journalctl(1) completion                                -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -16,7 +17,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -27,11 +28,13 @@ __contains_word () {
 
 __get_machines() {
     local a b
-    (machinectl list-images --no-legend --no-pager; machinectl list --no-legend --no-pager; echo ".host") | \
-        { while read a b; do echo " $a"; done; } | sort -u;
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 __syslog_priorities=(emerg alert crit err warning notice info debug)
+__syslog_facilities=(kern user mail daemon auth syslog lpr news uucp cron authpriv ftp local0 local1 local2 local3 local4 local5 local6 local7)
 
 _journalctl() {
     local field_vals= cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
@@ -43,10 +46,13 @@ _journalctl() {
                       --version --list-catalog --update-catalog --list-boots
                       --show-cursor --dmesg -k --pager-end -e -r --reverse
                       --utc -x --catalog --no-full --force --dump-catalog
-                      --flush --rotate --sync --no-hostname -N --fields'
-        [ARG]='-b --boot -D --directory --file -F --field -t --identifier
-                      -M --machine -o --output -u --unit --user-unit -p --priority
-                      --root --case-sensitive'
+                      --flush --rotate --sync --relinquish-var
+                      --smart-relinquish-var --no-hostname -W -N --fields
+                      --list-namespaces --list-invocations -I -v --verbose'
+        [ARG]='-b --boot -D --directory -i --file -F --field -t --identifier
+                      -T --exclude-identifier --facility -M --machine -o --output
+                      -u --unit --user-unit -p --priority --root --case-sensitive
+                      --namespace --invocation'
         [ARGUNKNOWN]='-c --cursor --interval -n --lines -S --since -U --until
                       --after-cursor --cursor-file --verify-key -g --grep
                       --vacuum-size --vacuum-time --vacuum-files --output-fields'
@@ -56,7 +62,14 @@ _journalctl() {
     if __contains_word "$prev" '>' '>>' '&>'; then
         compopt -o filenames
         COMPREPLY=( $(compgen -f -- "$cur") )
-        return 0;
+        return 0
+    fi
+
+    # If the previous word looks like a short options group,
+    # handle it as if it were just the last short option.
+    # e.g. "-aefu" -> "-u"
+    if [[ "$prev" =~ ^-[a-zA-Z]{2,}$ ]]; then
+        prev="-${prev:(-1)}"
     fi
 
     if __contains_word "$prev" ${OPTS[ARG]} ${OPTS[ARGUNKNOWN]}; then
@@ -68,7 +81,7 @@ _journalctl() {
                 comps=$(compgen -d -- "$cur")
                 compopt -o filenames
                 ;;
-            --file)
+            --file|-i)
                 comps=$(compgen -f -- "$cur")
                 compopt -o filenames
                 ;;
@@ -76,17 +89,24 @@ _journalctl() {
                 comps=$( journalctl --output=help 2>/dev/null )
                 ;;
             --field|-F)
-                comps=$(journalctl --fields | sort 2>/dev/null)
+                comps=$(journalctl --fields 2>/dev/null | sort)
                 ;;
             --machine|-M)
                 comps=$( __get_machines )
+                ;;
+            --facility)
+                comps=${__syslog_facilities[*]}
                 ;;
             --priority|-p)
                 comps=${__syslog_priorities[*]}
                 compopt -o nosort
                 ;;
             --unit|-u)
-                comps=$(journalctl -F '_SYSTEMD_UNIT' 2>/dev/null)
+                if __contains_word "--user" ${COMP_WORDS[*]}; then
+                    comps=$(journalctl -F '_SYSTEMD_USER_UNIT' 2>/dev/null)
+                else
+                    comps=$(journalctl -F '_SYSTEMD_UNIT' 2>/dev/null)
+                fi
                 # Similarly to systemctl, we need to distinguish between
                 # escaped and unescaped names in order to be able to correctly
                 # complete them. In this particular case, if the name we're
@@ -101,12 +121,19 @@ _journalctl() {
                 ;;
             --user-unit)
                 comps=$(journalctl -F '_SYSTEMD_USER_UNIT' 2>/dev/null)
+                if ! [[ $cur =~ '\\' ]]; then
+                    cur="$(printf '%q' $cur)"
+                fi
+                compopt -o filenames
                 ;;
-            --identifier|-t)
+            --identifier|-t|--exclude-identifier|-T)
                 comps=$(journalctl -F 'SYSLOG_IDENTIFIER' 2>/dev/null)
                 ;;
             --case-sensitive)
                 comps='yes no'
+                ;;
+            --namespace)
+                comps=$(journalctl --list-namespaces --output=cat 2>/dev/null)
                 ;;
             *)
                 return 0

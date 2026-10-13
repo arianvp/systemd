@@ -1,54 +1,44 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "conf-parser.h"
+#include "dropin.h"
 #include "fs-util.h"
 #include "load-dropin.h"
 #include "load-fragment.h"
 #include "log.h"
+#include "manager.h"
+#include "path-util.h"
 #include "stat-util.h"
-#include "string-util.h"
 #include "strv.h"
-#include "unit-name.h"
 #include "unit.h"
+#include "unit-name.h"
 
-static int unit_name_compatible(const char *a, const char *b) {
-        _cleanup_free_ char *template = NULL;
-        int r;
+int unit_find_dropin_paths(Unit *u, bool use_unit_path_cache, char ***paths) {
+        assert(u);
 
-        /* The straightforward case: the symlink name matches the target */
-        if (streq(a, b))
-                return 1;
-
-        r = unit_name_template(a, &template);
-        if (r == -EINVAL)
-                return 0; /* Not a template */
-        if (r < 0)
-                return r; /* OOM, or some other failure. Just skip the warning. */
-
-        /* An instance name points to a target that is just the template name */
-        return streq(template, b);
+        return unit_file_find_dropin_paths(NULL,
+                                           u->manager->lookup_paths.search_path,
+                                           use_unit_path_cache ? u->manager->unit_path_cache : NULL,
+                                           ".d", ".conf",
+                                           u->id, u->aliases,
+                                           paths);
 }
 
 static int process_deps(Unit *u, UnitDependency dependency, const char *dir_suffix) {
         _cleanup_strv_free_ char **paths = NULL;
-        char **p;
         int r;
 
         r = unit_file_find_dropin_paths(NULL,
                                         u->manager->lookup_paths.search_path,
                                         u->manager->unit_path_cache,
-                                        dir_suffix,
-                                        NULL,
-                                        u->names,
+                                        dir_suffix, NULL,
+                                        u->id, u->aliases,
                                         &paths);
         if (r < 0)
                 return r;
 
         STRV_FOREACH(p, paths) {
-                _cleanup_free_ char *target = NULL;
-                const char *entry;
-
-                entry = basename(*p);
+                _cleanup_free_ char *target = NULL, *target_file = NULL, *entry = NULL;
 
                 if (null_or_empty_path(*p) > 0) {
                         /* an error usually means an invalid symlink, which is not a mask */
@@ -69,6 +59,13 @@ static int process_deps(Unit *u, UnitDependency dependency, const char *dir_suff
                         continue;
                 }
 
+                r = path_extract_filename(*p, &entry);
+                if (r < 0) {
+                        log_unit_warning_errno(u, r, "Failed to extract file name of %s dependency dropin %s, ignoring: %m",
+                                               unit_dependency_to_string(dependency), *p);
+                        continue;
+                }
+
                 if (!unit_name_is_valid(entry, UNIT_NAME_ANY)) {
                         log_unit_warning(u, "%s dependency dropin %s is not a valid unit name, ignoring.",
                                          unit_dependency_to_string(dependency), *p);
@@ -81,11 +78,19 @@ static int process_deps(Unit *u, UnitDependency dependency, const char *dir_suff
                         continue;
                 }
 
+                r = path_extract_filename(target, &target_file);
+                if (r < 0) {
+                        log_unit_warning_errno(u, r, "Failed to extract file name for dropin target %s, ignoring: %m",
+                                               target);
+                        continue;
+                }
+
                 /* We don't treat this as an error, especially because we didn't check this for a
                  * long time. Nevertheless, we warn, because such mismatch can be mighty confusing. */
-                r = unit_name_compatible(entry, basename(target));
+                r = unit_symlink_name_compatible(entry, target_file, u->instance);
                 if (r < 0) {
-                        log_unit_warning_errno(u, r, "Can't check if names %s and %s are compatible, ignoring: %m", entry, basename(target));
+                        log_unit_warning_errno(u, r, "Can't check if names %s and %s are compatible, ignoring: %m",
+                                               entry, target_file);
                         continue;
                 }
                 if (r == 0)
@@ -103,12 +108,11 @@ static int process_deps(Unit *u, UnitDependency dependency, const char *dir_suff
 
 int unit_load_dropin(Unit *u) {
         _cleanup_strv_free_ char **l = NULL;
-        char **f;
         int r;
 
         assert(u);
 
-        /* Load dependencies from .wants and .requires directories */
+        /* Load dependencies from .wants, .requires and .upholds directories */
         r = process_deps(u, UNIT_WANTS, ".wants");
         if (r < 0)
                 return r;
@@ -117,26 +121,30 @@ int unit_load_dropin(Unit *u) {
         if (r < 0)
                 return r;
 
+        r = process_deps(u, UNIT_UPHOLDS, ".upholds");
+        if (r < 0)
+                return r;
+
         /* Load .conf dropins */
-        r = unit_find_dropin_paths(u, &l);
+        r = unit_find_dropin_paths(u, /* use_unit_path_cache= */ true, &l);
         if (r <= 0)
                 return 0;
 
-        if (!u->dropin_paths)
-                u->dropin_paths = TAKE_PTR(l);
-        else {
-                r = strv_extend_strv(&u->dropin_paths, l, true);
-                if (r < 0)
-                        return log_oom();
+        r = strv_extend_strv_consume(&u->dropin_paths, TAKE_PTR(l), /* filter_duplicates= */ true);
+        if (r < 0)
+                return log_oom();
+
+        u->dropin_mtime = 0;
+        STRV_FOREACH(f, u->dropin_paths) {
+                struct stat st;
+
+                r = config_parse(u->id, *f, NULL,
+                                 UNIT_VTABLE(u)->sections,
+                                 config_item_perf_lookup, load_fragment_gperf_lookup,
+                                 0, u, &st);
+                if (r > 0)
+                        u->dropin_mtime = MAX(u->dropin_mtime, timespec_load(&st.st_mtim));
         }
-
-        STRV_FOREACH(f, u->dropin_paths)
-                (void) config_parse(u->id, *f, NULL,
-                                    UNIT_VTABLE(u)->sections,
-                                    config_item_perf_lookup, load_fragment_gperf_lookup,
-                                    0, u);
-
-        u->dropin_mtime = now(CLOCK_REALTIME);
 
         return 0;
 }

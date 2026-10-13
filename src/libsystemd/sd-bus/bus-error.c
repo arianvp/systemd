@@ -1,11 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <errno.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-bus.h"
 
@@ -14,43 +7,43 @@
 #include "errno-list.h"
 #include "errno-util.h"
 #include "string-util.h"
-#include "util.h"
+#include "utf8.h"
 
 BUS_ERROR_MAP_ELF_REGISTER const sd_bus_error_map bus_standard_errors[] = {
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.Failed",                           EACCES),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NoMemory",                         ENOMEM),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.ServiceUnknown",                   EHOSTUNREACH),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NameHasNoOwner",                   ENXIO),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NoReply",                          ETIMEDOUT),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.IOError",                          EIO),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.BadAddress",                       EADDRNOTAVAIL),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NotSupported",                     EOPNOTSUPP),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.LimitsExceeded",                   ENOBUFS),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.AccessDenied",                     EACCES),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.AuthFailed",                       EACCES),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.InteractiveAuthorizationRequired", EACCES),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NoServer",                         EHOSTDOWN),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.Timeout",                          ETIMEDOUT),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.NoNetwork",                        ENONET),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.AddressInUse",                     EADDRINUSE),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.Disconnected",                     ECONNRESET),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.InvalidArgs",                      EINVAL),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.FileNotFound",                     ENOENT),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.FileExists",                       EEXIST),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.UnknownMethod",                    EBADR),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.UnknownObject",                    EBADR),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.UnknownInterface",                 EBADR),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.UnknownProperty",                  EBADR),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.PropertyReadOnly",                 EROFS),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.UnixProcessIdUnknown",             ESRCH),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.InvalidSignature",                 EINVAL),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.InconsistentMessage",              EBADMSG),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.TimedOut",                         ETIMEDOUT),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.MatchRuleInvalid",                 EINVAL),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.InvalidFileContent",               EINVAL),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.MatchRuleNotFound",                ENOENT),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.SELinuxSecurityContextUnknown",    ESRCH),
-        SD_BUS_ERROR_MAP("org.freedesktop.DBus.Error.ObjectPathInUse",                  EBUSY),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_FAILED,                             EACCES),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NO_MEMORY,                          ENOMEM),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_SERVICE_UNKNOWN,                    EHOSTUNREACH),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NAME_HAS_NO_OWNER,                  ENXIO),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NO_REPLY,                           ETIMEDOUT),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_IO_ERROR,                           EIO),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_BAD_ADDRESS,                        EADDRNOTAVAIL),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NOT_SUPPORTED,                      EOPNOTSUPP),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_LIMITS_EXCEEDED,                    ENOBUFS),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_ACCESS_DENIED,                      EACCES),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_AUTH_FAILED,                        EACCES),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NO_SERVER,                          EHOSTDOWN),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_TIMEOUT,                            ETIMEDOUT),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_NO_NETWORK,                         ENONET),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_ADDRESS_IN_USE,                     EADDRINUSE),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_DISCONNECTED,                       ECONNRESET),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_INVALID_ARGS,                       EINVAL),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_FILE_NOT_FOUND,                     ENOENT),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_FILE_EXISTS,                        EEXIST),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_UNKNOWN_METHOD,                     EBADR),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_UNKNOWN_OBJECT,                     EBADR),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_UNKNOWN_INTERFACE,                  EBADR),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_UNKNOWN_PROPERTY,                   EBADR),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_PROPERTY_READ_ONLY,                 EROFS),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_UNIX_PROCESS_ID_UNKNOWN,            ESRCH),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_INVALID_SIGNATURE,                  EINVAL),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_INCONSISTENT_MESSAGE,               EBADMSG),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_TIMED_OUT,                          ETIMEDOUT),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_MATCH_RULE_NOT_FOUND,               ENOENT),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_MATCH_RULE_INVALID,                 EINVAL),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED, EACCES),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_INVALID_FILE_CONTENT,               EINVAL),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_SELINUX_SECURITY_CONTEXT_UNKNOWN,   ESRCH),
+        SD_BUS_ERROR_MAP(SD_BUS_ERROR_OBJECT_PATH_IN_USE,                 EBUSY),
         SD_BUS_ERROR_MAP_END
 };
 
@@ -63,12 +56,10 @@ extern const sd_bus_error_map __stop_SYSTEMD_BUS_ERROR_MAP[];
 static const sd_bus_error_map **additional_error_maps = NULL;
 
 static int bus_error_name_to_errno(const char *name) {
-        const sd_bus_error_map **map, *m;
         const char *p;
         int r;
 
-        if (!name)
-                return EINVAL;
+        assert_return(name, EINVAL);
 
         p = startswith(name, "System.Error.");
         if (p) {
@@ -80,33 +71,29 @@ static int bus_error_name_to_errno(const char *name) {
         }
 
         if (additional_error_maps)
-                for (map = additional_error_maps; *map; map++)
-                        for (m = *map;; m++) {
+                for (const sd_bus_error_map **map = additional_error_maps; *map; map++)
+                        for (const sd_bus_error_map *m = *map;; m++) {
                                 /* For additional error maps the end marker is actually the end marker */
                                 if (m->code == BUS_ERROR_MAP_END_MARKER)
                                         break;
 
-                                if (streq(m->name, name))
+                                if (streq(m->name, name)) {
+                                        assert(m->code > 0);
                                         return m->code;
+                                }
                         }
 
-        m = ALIGN_TO_PTR(__start_SYSTEMD_BUS_ERROR_MAP, sizeof(void*));
-        while (m < __stop_SYSTEMD_BUS_ERROR_MAP) {
-                /* For magic ELF error maps, the end marker might
-                 * appear in the middle of things, since multiple maps
-                 * might appear in the same section. Hence, let's skip
-                 * over it, but realign the pointer to the next 8 byte
-                 * boundary, which is the selected alignment for the
-                 * arrays. */
-                if (m->code == BUS_ERROR_MAP_END_MARKER) {
-                        m = ALIGN_TO_PTR(m + 1, sizeof(void*));
-                        continue;
-                }
+        assert_cc(sizeof(sd_bus_error_map) % sizeof(void*) == 0);
 
-                if (streq(m->name, name))
+        for (const sd_bus_error_map *m = __start_SYSTEMD_BUS_ERROR_MAP; m < __stop_SYSTEMD_BUS_ERROR_MAP; m++) {
+                /* For magic ELF error maps, the end marker might appear in the middle of things, since
+                 * multiple maps might appear in the same section. Skip over it. */
+
+                if (m->code != BUS_ERROR_MAP_END_MARKER &&
+                    streq(m->name, name)) {
+                        assert(m->code > 0);
                         return m->code;
-
-                m++;
+                }
         }
 
         return EIO;
@@ -173,14 +160,17 @@ static int errno_to_bus_error_name_new(int error, char **ret) {
         const char *name;
         char *n;
 
-        if (error < 0)
-                error = -error;
+        assert(ret);
 
-        name = errno_to_name(error);
+        /* D-Bus names must not start with a digit. Thus, an name like System.Error.500 would not be legal.
+         * Let's just return 0 if an unknown errno is encountered, which will cause the caller to fall back
+         * to BUS_ERROR_FAILED.
+         */
+        name = errno_name_no_fallback(error);
         if (!name)
                 return 0;
 
-        n = strappend("System.Error.", name);
+        n = strjoin("System.Error.", name);
         if (!n)
                 return -ENOMEM;
 
@@ -208,30 +198,7 @@ _public_ void sd_bus_error_free(sd_bus_error *e) {
 }
 
 _public_ int sd_bus_error_set(sd_bus_error *e, const char *name, const char *message) {
-
-        if (!name)
-                return 0;
-        if (!e)
-                goto finish;
-
-        assert_return(!bus_error_is_dirty(e), -EINVAL);
-
-        e->name = strdup(name);
-        if (!e->name) {
-                *e = BUS_ERROR_OOM;
-                return -ENOMEM;
-        }
-
-        if (message)
-                e->message = strdup(message);
-
-        e->_need_free = 1;
-
-finish:
-        return -bus_error_name_to_errno(name);
-}
-
-int bus_error_setfv(sd_bus_error *e, const char *name, const char *format, va_list ap) {
+        int r;
 
         if (!name)
                 return 0;
@@ -245,31 +212,69 @@ int bus_error_setfv(sd_bus_error *e, const char *name, const char *format, va_li
                         return -ENOMEM;
                 }
 
-                /* If we hit OOM on formatting the pretty message, we ignore
-                 * this, since we at least managed to write the error name */
-                if (format)
-                        (void) vasprintf((char**) &e->message, format, ap);
+                if (message)
+                        e->message = strdup(message);
 
                 e->_need_free = 1;
         }
 
-        return -bus_error_name_to_errno(name);
+        r = bus_error_name_to_errno(name);
+        assert(r > 0);
+        return -r;
+}
+
+_public_ int sd_bus_error_setfv(sd_bus_error *e, const char *name, const char *format, va_list ap) {
+        int r;
+
+        if (!name)
+                return 0;
+
+        if (e) {
+                assert_return(!bus_error_is_dirty(e), -EINVAL);
+
+                e->name = strdup(name);
+                if (!e->name) {
+                        *e = BUS_ERROR_OOM;
+                        return -ENOMEM;
+                }
+
+                if (format) {
+                        _cleanup_free_ char *mesg = NULL;
+
+                        /* If we hit OOM on formatting the pretty message, we ignore
+                         * this, since we at least managed to write the error name */
+
+                        if (vasprintf(&mesg, format, ap) >= 0)
+                                e->message = utf8_escape_non_printable(mesg);
+                }
+
+                e->_need_free = 1;
+        }
+
+        r = bus_error_name_to_errno(name);
+        assert(r > 0);
+        return -r;
 }
 
 _public_ int sd_bus_error_setf(sd_bus_error *e, const char *name, const char *format, ...) {
+        int r;
 
         if (format) {
-                int r;
                 va_list ap;
 
                 va_start(ap, format);
-                r = bus_error_setfv(e, name, format, ap);
+                r = sd_bus_error_setfv(e, name, format, ap);
+                if (name)
+                        assert(r < 0);
                 va_end(ap);
 
                 return r;
         }
 
-        return sd_bus_error_set(e, name, NULL);
+        r = sd_bus_error_set(e, name, NULL);
+        if (name)
+                assert(r < 0);
+        return r;
 }
 
 _public_ int sd_bus_error_copy(sd_bus_error *dest, const sd_bus_error *e) {
@@ -356,11 +361,23 @@ _public_ int sd_bus_error_has_name(const sd_bus_error *e, const char *name) {
         return streq_ptr(e->name, name);
 }
 
-_public_ int sd_bus_error_get_errno(const sd_bus_error* e) {
-        if (!e)
+_public_ int sd_bus_error_has_names_sentinel(const sd_bus_error *e, ...) {
+        if (!e || !e->name)
                 return 0;
 
-        if (!e->name)
+        va_list ap;
+        const char *p;
+
+        va_start(ap, e);
+        while ((p = va_arg(ap, const char *)))
+                if (streq(p, e->name))
+                        break;
+        va_end(ap);
+        return !!p;
+}
+
+_public_ int sd_bus_error_get_errno(const sd_bus_error *e) {
+        if (!e || !e->name)
                 return 0;
 
         return bus_error_name_to_errno(e->name);
@@ -443,7 +460,7 @@ _public_ int sd_bus_error_set_errno(sd_bus_error *e, int error) {
         if (!e)
                 return -error;
         if (error == 0)
-                return -error;
+                return 0;
 
         assert_return(!bus_error_is_dirty(e), -EINVAL);
 
@@ -465,14 +482,13 @@ _public_ int sd_bus_error_set_errno(sd_bus_error *e, int error) {
                         *e = BUS_ERROR_FAILED;
         }
 
-        /* Now, fill in the message from strerror() if we can */
+        /* Now, fill in the message from strerror_r() if we can */
         bus_error_strerror(e, error);
         return -error;
 }
 
 _public_ int sd_bus_error_set_errnofv(sd_bus_error *e, int error, const char *format, va_list ap) {
         PROTECT_ERRNO;
-        int r;
 
         if (error < 0)
                 error = -error;
@@ -503,35 +519,31 @@ _public_ int sd_bus_error_set_errnofv(sd_bus_error *e, int error, const char *fo
         }
 
         if (format) {
-                char *m;
+                _cleanup_free_ char *m = NULL;
 
                 /* Then, let's try to fill in the supplied message */
 
                 errno = error; /* Make sure that %m resolves to the specified error */
-                r = vasprintf(&m, format, ap);
-                if (r >= 0) {
+                if (vasprintf(&m, format, ap) < 0)
+                        goto fail;
 
-                        if (e->_need_free <= 0) {
-                                char *t;
+                if (e->_need_free <= 0) {
+                        char *t;
 
-                                t = strdup(e->name);
-                                if (t) {
-                                        e->_need_free = 1;
-                                        e->name = t;
-                                        e->message = m;
-                                        return -error;
-                                }
+                        t = strdup(e->name);
+                        if (!t)
+                                goto fail;
 
-                                free(m);
-                        } else {
-                                free((char*) e->message);
-                                e->message = m;
-                                return -error;
-                        }
+                        e->_need_free = 1;
+                        e->name = t;
                 }
+
+                e->message = TAKE_PTR(m);
+                return -error;
         }
 
-        /* If that didn't work, use strerror() for the message */
+fail:
+        /* If that didn't work, use strerror_r() for the message */
         bus_error_strerror(e, error);
         return -error;
 }
@@ -562,33 +574,26 @@ _public_ int sd_bus_error_set_errnof(sd_bus_error *e, int error, const char *for
         return sd_bus_error_set_errno(e, error);
 }
 
-const char *bus_error_message(const sd_bus_error *e, int error) {
+const char* _bus_error_message(const sd_bus_error *e, int error, char buf[static ERRNO_BUF_LEN]) {
+        /* Sometimes, the D-Bus server is a little bit too verbose with
+         * its error messages, so let's override them here */
+        if (sd_bus_error_has_name(e, SD_BUS_ERROR_ACCESS_DENIED))
+                return "Access denied";
 
-        if (e) {
-                /* Sometimes, the D-Bus server is a little bit too verbose with
-                 * its error messages, so let's override them here */
-                if (sd_bus_error_has_name(e, SD_BUS_ERROR_ACCESS_DENIED))
-                        return "Access denied";
+        if (e && e->message)
+                return e->message;
 
-                if (e->message)
-                        return e->message;
-        }
-
-        if (error < 0)
-                error = -error;
-
-        return strerror(error);
+        return strerror_r(ABS(error), buf, ERRNO_BUF_LEN);
 }
 
 static bool map_ok(const sd_bus_error_map *map) {
         for (; map->code != BUS_ERROR_MAP_END_MARKER; map++)
-                if (!map->name || map->code <=0)
+                if (!map->name || map->code <= 0)
                         return false;
         return true;
 }
 
 _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
-        const sd_bus_error_map **maps = NULL;
         unsigned n = 0;
 
         assert_return(map, -EINVAL);
@@ -599,13 +604,11 @@ _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
                         if (additional_error_maps[n] == map)
                                 return 0;
 
-        maps = reallocarray(additional_error_maps, n + 2, sizeof(struct sd_bus_error_map*));
-        if (!maps)
+        if (!GREEDY_REALLOC(additional_error_maps, n + 2))
                 return -ENOMEM;
 
-        maps[n] = map;
-        maps[n+1] = NULL;
+        additional_error_maps[n] = map;
+        additional_error_maps[n+1] = NULL;
 
-        additional_error_maps = maps;
         return 1;
 }

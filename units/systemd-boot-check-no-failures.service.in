@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -12,13 +12,11 @@ Description=Check if Any System Units Failed
 Documentation=man:systemd-boot-check-no-failures.service(8)
 After=default.target graphical.target multi-user.target
 Before=boot-complete.target
-Conflicts=shutdown.target
-Before=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=@rootlibexecdir@/systemd-boot-check-no-failures
+ExecStart={{LIBEXECDIR}}/systemd-boot-check-no-failures
 
 [Install]
 RequiredBy=boot-complete.target

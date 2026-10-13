@@ -1,14 +1,13 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "sd-bus.h"
 
-#include "bus-util.h"
+#include "bus-locator.h"
 #include "fd-util.h"
-#include "macro.h"
-#include "util.h"
+#include "tests.h"
 
 static int inhibit(sd_bus *bus, const char *what) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -17,14 +16,7 @@ static int inhibit(sd_bus *bus, const char *what) {
         int fd;
         int r;
 
-        r = sd_bus_call_method(bus,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        "Inhibit",
-                        &error,
-                        &reply,
-                        "ssss", what, who, reason, mode);
+        r = bus_call_method(bus, bus_login_mgr, "Inhibit", &error, &reply, "ssss", what, who, reason, mode);
         assert_se(r >= 0);
 
         r = sd_bus_message_read_basic(reply, SD_BUS_TYPE_UNIX_FD, &fd);
@@ -42,14 +34,7 @@ static void print_inhibitors(sd_bus *bus) {
         unsigned n = 0;
         int r;
 
-        r = sd_bus_call_method(bus,
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        "ListInhibitors",
-                        &error,
-                        &reply,
-                        "");
+        r = bus_call_method(bus, bus_login_mgr, "ListInhibitors", &error, &reply, NULL);
         assert_se(r >= 0);
 
         r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(ssssuu)");
@@ -70,6 +55,8 @@ int main(int argc, char *argv[]) {
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
         int fd1, fd2;
         int r;
+
+        test_setup_logging(LOG_DEBUG);
 
         r = sd_bus_open_system(&bus);
         assert_se(r >= 0);

@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_request_name"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -27,6 +27,8 @@
   <refsynopsisdiv>
     <funcsynopsis>
       <funcsynopsisinfo>#include &lt;systemd/sd-bus.h&gt;</funcsynopsisinfo>
+
+      <xi:include href="sd_bus_add_match.xml" xpointer="sd_bus_message_handler_t"/>
 
       <funcprototype>
         <funcdef>int <function>sd_bus_request_name</function></funcdef>
@@ -76,7 +78,9 @@
         <listitem><para>After acquiring the name successfully, permit other peers to take over the name when they try
         to acquire it with the <constant>SD_BUS_NAME_REPLACE_EXISTING</constant> flag set. If
         <constant>SD_BUS_NAME_ALLOW_REPLACEMENT</constant> is not set on the original request, such a request by other
-        peers will be denied.</para></listitem>
+        peers will be denied.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -84,13 +88,17 @@
 
         <listitem><para>Take over the name if it was already acquired by another peer, and that other peer
         has permitted takeover by setting <constant>SD_BUS_NAME_ALLOW_REPLACEMENT</constant> while acquiring
-        it.</para></listitem>
+        it.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><constant>SD_BUS_NAME_QUEUE</constant></term>
 
-        <listitem><para>Queue the acquisition of the name when the name is already taken.</para></listitem>
+        <listitem><para>Queue the acquisition of the name when the name is already taken.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -98,7 +106,7 @@
     is sent to the bus broker, and the call waits until the broker responds.</para>
 
     <para><function>sd_bus_request_name_async()</function> is an asynchronous version of
-    <function>sd_bus_release_name()</function>. Instead of waiting for the request to complete, the request message is
+    <function>sd_bus_request_name()</function>. Instead of waiting for the request to complete, the request message is
     enqueued. The specified <parameter>callback</parameter> will be called when the broker's response is received. If
     the parameter is specified as <constant>NULL</constant> a default implementation is used instead which will
     terminate the connection when the name cannot be acquired. The function returns a slot object in its
@@ -192,17 +200,25 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_request_name()</function> and
+    <function>sd_bus_release_name()</function> were added in version 209.</para>
+    <para><function>sd_bus_request_name_async()</function> and
+    <function>sd_bus_release_name_async()</function> were added in version 237.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

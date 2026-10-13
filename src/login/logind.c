@@ -1,42 +1,65 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <string.h>
 #include <unistd.h>
 
+#include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-device.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
-#include "bus-error.h"
-#include "bus-util.h"
-#include "cgroup-util.h"
-#include "def.h"
+#include "bus-locator.h"
+#include "bus-log-control-api.h"
+#include "bus-object.h"
+#include "common-signal.h"
+#include "daemon-util.h"
 #include "device-util.h"
+#include "devnum-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
+#include "errno-util.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
-#include "logind-dbus.h"
-#include "logind-seat-dbus.h"
-#include "logind-session-dbus.h"
-#include "logind-user-dbus.h"
+#include "hashmap.h"
+#include "label-util.h"
+#include "logind-session.h"
 #include "logind.h"
+#include "logind-button.h"
+#include "logind-dbus.h"
+#include "logind-device.h"
+#include "logind-seat.h"
+#include "logind-session-device.h"
+#include "logind-user.h"
+#include "logind-utmp.h"
+#include "logind-varlink.h"
 #include "main-func.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "process-util.h"
-#include "selinux-util.h"
+#include "service-util.h"
 #include "signal-util.h"
+#include "stat-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "udev-util.h"
+#include "user-util.h"
+#include "verbs.h"
 
-static Manager* manager_unref(Manager *m);
-DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
+static Manager* manager_free(Manager *m);
+DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(device_hash_ops, char, string_hash_func, string_compare_func, Device, device_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(seat_hash_ops, char, string_hash_func, string_compare_func, Seat, seat_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(session_hash_ops, char, string_hash_func, string_compare_func, Session, session_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(user_hash_ops, void, trivial_hash_func, trivial_compare_func, User, user_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(inhibitor_hash_ops, char, string_hash_func, string_compare_func, Inhibitor, inhibitor_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(button_hash_ops, char, string_hash_func, string_compare_func, Button, button_free);
 
 static int manager_new(Manager **ret) {
-        _cleanup_(manager_unrefp) Manager *m = NULL;
+        _cleanup_(manager_freep) Manager *m = NULL;
         int r;
 
         assert(ret);
@@ -46,38 +69,44 @@ static int manager_new(Manager **ret) {
                 return -ENOMEM;
 
         *m = (Manager) {
-                .console_active_fd = -1,
-                .reserve_vt_fd = -1,
+                .console_active_fd = -EBADF,
+                .reserve_vt_fd = -EBADF,
                 .idle_action_not_before_usec = now(CLOCK_MONOTONIC),
+                .scheduled_shutdown_action = _HANDLE_ACTION_INVALID,
+
+                .devices = hashmap_new(&device_hash_ops),
+                .seats = hashmap_new(&seat_hash_ops),
+                .sessions = hashmap_new(&session_hash_ops),
+                .users = hashmap_new(&user_hash_ops),
+                .inhibitors = hashmap_new(&inhibitor_hash_ops),
+                .buttons = hashmap_new(&button_hash_ops),
+
+                .user_units = hashmap_new(&string_hash_ops),
+                .session_units = hashmap_new(&string_hash_ops),
         };
 
-        m->devices = hashmap_new(&string_hash_ops);
-        m->seats = hashmap_new(&string_hash_ops);
-        m->sessions = hashmap_new(&string_hash_ops);
-        m->sessions_by_leader = hashmap_new(NULL);
-        m->users = hashmap_new(NULL);
-        m->inhibitors = hashmap_new(&string_hash_ops);
-        m->buttons = hashmap_new(&string_hash_ops);
-
-        m->user_units = hashmap_new(&string_hash_ops);
-        m->session_units = hashmap_new(&string_hash_ops);
-
-        if (!m->devices || !m->seats || !m->sessions || !m->sessions_by_leader || !m->users || !m->inhibitors || !m->buttons || !m->user_units || !m->session_units)
+        if (!m->devices || !m->seats || !m->sessions || !m->users || !m->inhibitors || !m->buttons || !m->user_units || !m->session_units)
                 return -ENOMEM;
 
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
+
+        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
         (void) sd_event_set_watchdog(m->event, true);
+
+        dual_timestamp_now(&m->init_ts);
 
         manager_reset_config(m);
 
@@ -85,39 +114,18 @@ static int manager_new(Manager **ret) {
         return 0;
 }
 
-static Manager* manager_unref(Manager *m) {
-        Session *session;
-        User *u;
-        Device *d;
-        Seat *s;
-        Inhibitor *i;
-        Button *b;
-
+static Manager* manager_free(Manager *m) {
         if (!m)
                 return NULL;
-
-        while ((session = hashmap_first(m->sessions)))
-                session_free(session);
-
-        while ((u = hashmap_first(m->users)))
-                user_free(u);
-
-        while ((d = hashmap_first(m->devices)))
-                device_free(d);
-
-        while ((s = hashmap_first(m->seats)))
-                seat_free(s);
-
-        while ((i = hashmap_first(m->inhibitors)))
-                inhibitor_free(i);
-
-        while ((b = hashmap_first(m->buttons)))
-                button_free(b);
 
         hashmap_free(m->devices);
         hashmap_free(m->seats);
         hashmap_free(m->sessions);
+
+        /* All records should have been removed by session_free */
+        assert(hashmap_isempty(m->sessions_by_leader));
         hashmap_free(m->sessions_by_leader);
+
         hashmap_free(m->users);
         hashmap_free(m->inhibitors);
         hashmap_free(m->buttons);
@@ -135,6 +143,11 @@ static Manager* manager_unref(Manager *m) {
         sd_event_source_unref(m->console_active_event_source);
         sd_event_source_unref(m->lid_switch_ignore_event_source);
 
+        sd_event_source_unref(m->power_key_long_press_event_source);
+        sd_event_source_unref(m->reboot_key_long_press_event_source);
+        sd_event_source_unref(m->suspend_key_long_press_event_source);
+        sd_event_source_unref(m->hibernate_key_long_press_event_source);
+
 #if ENABLE_UTMP
         sd_event_source_unref(m->utmp_event_source);
 #endif
@@ -145,11 +158,14 @@ static Manager* manager_unref(Manager *m) {
         sd_device_monitor_unref(m->device_monitor);
         sd_device_monitor_unref(m->device_vcsa_monitor);
         sd_device_monitor_unref(m->device_button_monitor);
+        sd_device_monitor_unref(m->device_uaccess_monitor);
 
         if (m->unlink_nologin)
                 (void) unlink_or_warn("/run/nologin");
 
-        bus_verify_polkit_async_registry_free(m->polkit_registry);
+        hashmap_free(m->polkit_registry);
+
+        manager_varlink_done(m);
 
         sd_bus_flush_close_unref(m->bus);
         sd_event_unref(m->event);
@@ -159,17 +175,18 @@ static Manager* manager_unref(Manager *m) {
         strv_free(m->kill_only_users);
         strv_free(m->kill_exclude_users);
 
-        free(m->scheduled_shutdown_type);
         free(m->scheduled_shutdown_tty);
         free(m->wall_message);
         free(m->action_job);
+
+        strv_free(m->efi_boot_loader_entries);
+        free(m->efi_loader_entry_one_shot);
 
         return mfree(m);
 }
 
 static int manager_enumerate_devices(Manager *m) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        sd_device *d;
         int r;
 
         assert(m);
@@ -185,12 +202,12 @@ static int manager_enumerate_devices(Manager *m) {
         if (r < 0)
                 return r;
 
-        FOREACH_DEVICE(e, d) {
-                int k;
+        r = 0;
 
-                k = manager_process_seat_device(m, d);
-                if (k < 0)
-                        r = k;
+        FOREACH_DEVICE(e, d) {
+                if (device_is_processed(d) <= 0)
+                        continue;
+                RET_GATHER(r, manager_process_seat_device(m, d));
         }
 
         return r;
@@ -198,7 +215,6 @@ static int manager_enumerate_devices(Manager *m) {
 
 static int manager_enumerate_buttons(Manager *m) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        sd_device *d;
         int r;
 
         assert(m);
@@ -220,12 +236,12 @@ static int manager_enumerate_buttons(Manager *m) {
         if (r < 0)
                 return r;
 
-        FOREACH_DEVICE(e, d) {
-                int k;
+        r = 0;
 
-                k = manager_process_button_device(m, d);
-                if (k < 0)
-                        r = k;
+        FOREACH_DEVICE(e, d) {
+                if (device_is_processed(d) <= 0)
+                        continue;
+                RET_GATHER(r, manager_process_button_device(m, d, /* ret_button= */ NULL));
         }
 
         return r;
@@ -233,7 +249,6 @@ static int manager_enumerate_buttons(Manager *m) {
 
 static int manager_enumerate_seats(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         int r = 0;
 
         assert(m);
@@ -247,12 +262,11 @@ static int manager_enumerate_seats(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/seats: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/run/systemd/seats/");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
                 Seat *s;
-                int k;
 
                 if (!dirent_is_file(de))
                         continue;
@@ -260,14 +274,12 @@ static int manager_enumerate_seats(Manager *m) {
                 s = hashmap_get(m->seats, de->d_name);
                 if (!s) {
                         if (unlinkat(dirfd(d), de->d_name, 0) < 0)
-                                log_warning("Failed to remove /run/systemd/seats/%s: %m",
-                                            de->d_name);
+                                log_warning_errno(errno, "Failed to remove /run/systemd/seats/%s, ignoring: %m",
+                                                  de->d_name);
                         continue;
                 }
 
-                k = seat_load(s);
-                if (k < 0)
-                        r = k;
+                RET_GATHER(r, seat_load(s));
         }
 
         return r;
@@ -275,7 +287,6 @@ static int manager_enumerate_seats(Manager *m) {
 
 static int manager_enumerate_linger_users(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         int r = 0;
 
         assert(m);
@@ -285,20 +296,25 @@ static int manager_enumerate_linger_users(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /var/lib/systemd/linger/: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/var/lib/systemd/linger/");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
+                _cleanup_free_ char *n = NULL;
                 int k;
 
                 if (!dirent_is_file(de))
                         continue;
 
-                k = manager_add_user_by_name(m, de->d_name, NULL);
+                k = cunescape(de->d_name, 0, &n);
                 if (k < 0) {
-                        log_notice_errno(k, "Couldn't add lingering user %s: %m", de->d_name);
-                        r = k;
+                        RET_GATHER(r, log_warning_errno(k, "Failed to unescape username '%s', ignoring: %m", de->d_name));
+                        continue;
                 }
+
+                k = manager_add_user_by_name(m, n, NULL);
+                if (k < 0)
+                        RET_GATHER(r, log_warning_errno(k, "Couldn't add lingering user %s, ignoring: %m", de->d_name));
         }
 
         return r;
@@ -306,8 +322,7 @@ static int manager_enumerate_linger_users(Manager *m) {
 
 static int manager_enumerate_users(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
-        int r, k;
+        int r;
 
         assert(m);
 
@@ -320,146 +335,214 @@ static int manager_enumerate_users(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/users: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/run/systemd/users/");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
                 User *u;
+                uid_t uid;
+                int k;
 
                 if (!dirent_is_file(de))
                         continue;
 
-                k = manager_add_user_by_name(m, de->d_name, &u);
+                k = parse_uid(de->d_name, &uid);
                 if (k < 0) {
-                        log_error_errno(k, "Failed to add user by file name %s: %m", de->d_name);
+                        RET_GATHER(r, log_warning_errno(k, "Failed to parse filename /run/systemd/users/%s as UID, ignoring: %m", de->d_name));
+                        continue;
+                }
 
-                        r = k;
+                k = manager_add_user_by_uid(m, uid, &u);
+                if (k < 0) {
+                        RET_GATHER(r, log_warning_errno(k, "Failed to add user by filename %s, ignoring: %m", de->d_name));
                         continue;
                 }
 
                 user_add_to_gc_queue(u);
 
-                k = user_load(u);
-                if (k < 0)
-                        r = k;
+                RET_GATHER(r, user_load(u));
         }
 
         return r;
 }
 
-static int parse_fdname(const char *fdname, char **session_id, dev_t *dev) {
+static int parse_fdname(const char *fdname, char **ret_session_id, dev_t *ret_devno) {
         _cleanup_strv_free_ char **parts = NULL;
         _cleanup_free_ char *id = NULL;
-        unsigned major, minor;
         int r;
+
+        assert(ret_session_id);
+        assert(ret_devno);
 
         parts = strv_split(fdname, "-");
         if (!parts)
                 return -ENOMEM;
-        if (strv_length(parts) != 5)
-                return -EINVAL;
 
-        if (!streq(parts[0], "session"))
+        if (_unlikely_(!streq(parts[0], "session")))
                 return -EINVAL;
 
         id = strdup(parts[1]);
         if (!id)
                 return -ENOMEM;
 
-        if (!streq(parts[2], "device"))
+        if (streq(parts[2], "leader")) {
+                *ret_session_id = TAKE_PTR(id);
+                *ret_devno = 0;
+
+                return 0;
+        }
+
+        if (_unlikely_(!streq(parts[2], "device")))
                 return -EINVAL;
+
+        unsigned major, minor;
 
         r = safe_atou(parts[3], &major);
         if (r < 0)
                 return r;
+
         r = safe_atou(parts[4], &minor);
         if (r < 0)
                 return r;
 
-        *dev = makedev(major, minor);
-        *session_id = TAKE_PTR(id);
+        *ret_session_id = TAKE_PTR(id);
+        *ret_devno = makedev(major, minor);
 
         return 0;
 }
 
-static int deliver_fd(Manager *m, const char *fdname, int fd) {
-        _cleanup_free_ char *id = NULL;
+static int deliver_session_device_fd(Session *s, const char *fdname, int fd, dev_t devno) {
         SessionDevice *sd;
         struct stat st;
-        Session *s;
-        dev_t dev;
-        int r;
 
-        assert(m);
+        assert(s);
+        assert(fdname);
         assert(fd >= 0);
-
-        r = parse_fdname(fdname, &id, &dev);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse fd name %s: %m", fdname);
-
-        s = hashmap_get(m->sessions, id);
-        if (!s)
-                /* If the session doesn't exist anymore, the associated session device attached to this fd
-                 * doesn't either. Let's simply close this fd. */
-                return log_debug_errno(SYNTHETIC_ERRNO(ENXIO), "Failed to attach fd for unknown session: %s", id);
+        assert(devno > 0);
 
         if (fstat(fd, &st) < 0)
                 /* The device is allowed to go away at a random point, in which case fstat() failing is
                  * expected. */
-                return log_debug_errno(errno, "Failed to stat device fd for session %s: %m", id);
+                return log_debug_errno(errno, "Failed to stat device fd '%s' for session '%s': %m",
+                                       fdname, s->id);
 
-        if (!S_ISCHR(st.st_mode) || st.st_rdev != dev)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENODEV), "Device fd doesn't point to the expected character device node");
+        if (!S_ISCHR(st.st_mode) || st.st_rdev != devno)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENODEV),
+                                       "Device fd '%s' doesn't point to the expected character device node.",
+                                       fdname);
 
-        sd = hashmap_get(s->devices, &dev);
+        sd = hashmap_get(s->devices, &devno);
         if (!sd)
                 /* Weird, we got an fd for a session device which wasn't recorded in the session state
                  * file... */
-                return log_warning_errno(SYNTHETIC_ERRNO(ENODEV), "Got fd for missing session device [%u:%u] in session %s",
-                                         major(dev), minor(dev), s->id);
+                return log_warning_errno(SYNTHETIC_ERRNO(ENODEV),
+                                         "Got session device fd '%s' [" DEVNUM_FORMAT_STR "], but not present in session state.",
+                                         fdname, DEVNUM_FORMAT_VAL(devno));
 
-        log_debug("Attaching fd to session device [%u:%u] for session %s",
-                  major(dev), minor(dev), s->id);
+        log_debug("Attaching session device fd '%s' [" DEVNUM_FORMAT_STR "] to session '%s'.",
+                  fdname, DEVNUM_FORMAT_VAL(devno), s->id);
 
         session_device_attach_fd(sd, fd, s->was_active);
         return 0;
 }
 
-static int manager_attach_fds(Manager *m) {
-        _cleanup_strv_free_ char **fdnames = NULL;
-        int n;
+static int deliver_session_leader_fd_consume(Session *s, const char *fdname, int fd_consume) {
+        _cleanup_close_ int fd = ASSERT_FD(fd_consume);
+        _cleanup_(pidref_done) PidRef leader_fdstore = PIDREF_NULL;
+        int r;
 
-        /* Upon restart, PID1 will send us back all fds of session devices that we previously opened. Each
-         * file descriptor is associated with a given session. The session ids are passed through FDNAMES. */
+        assert(s);
+        assert(fdname);
 
-        n = sd_listen_fds_with_names(true, &fdnames);
-        if (n < 0)
-                return log_warning_errno(n, "Failed to acquire passed fd list: %m");
-        if (n == 0)
-                return 0;
+        /* Already deserialized via pidfd id? */
+        if (pidref_is_set(&s->leader)) {
+                assert(s->leader.pid == s->deserialized_pid);
+                assert(s->leader.fd >= 0);
 
-        for (int i = 0; i < n; i++) {
-                int fd = SD_LISTEN_FDS_START + i;
+                r = fd_inode_same(fd, s->leader.fd);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to compare pidfd with deserialized leader for session '%s': %m",
+                                                 s->id);
+                if (r > 0)
+                        return 0;
 
-                if (deliver_fd(m, fdnames[i], fd) >= 0)
-                        continue;
+                log_warning("Got leader pidfd for session '%s' which mismatches with the deserialized process, resetting with pidfd.",
+                            s->id);
 
-                /* Hmm, we couldn't deliver the fd to any session device object? If so, let's close the fd */
-                safe_close(fd);
-
-                /* Remove from fdstore as well */
-                (void) sd_notifyf(false,
-                                  "FDSTOREREMOVE=1\n"
-                                  "FDNAME=%s", fdnames[i]);
+        } else if (!pid_is_valid(s->deserialized_pid)) {
+                r = log_warning_errno(SYNTHETIC_ERRNO(EOWNERDEAD),
+                                      "Got leader pidfd for session '%s', but LEADER= is not set, refusing.",
+                                      s->id);
+                goto fail_close;
         }
 
+        r = pidref_set_pidfd_take(&leader_fdstore, fd);
+        if (r < 0) {
+                log_warning_errno(r,
+                                  r == -ESRCH ? "Leader of session '%s' is gone while deserializing."
+                                              : "Failed to create reference to leader of session '%s': %m",
+                                  s->id);
+                goto fail_close;
+        }
+        TAKE_FD(fd);
+
+        if (leader_fdstore.pid != s->deserialized_pid)
+                log_warning("Leader from pidfd (" PID_FMT ") doesn't match with LEADER=" PID_FMT " for session '%s', proceeding anyway.",
+                            leader_fdstore.pid, s->deserialized_pid, s->id);
+
+        r = session_set_leader_consume(s, TAKE_PIDREF(leader_fdstore));
+        if (r < 0)
+                return log_warning_errno(r, "Failed to attach leader pidfd for session '%s': %m", s->id);
+
         return 0;
+
+fail_close:
+        close_and_notify_warn(TAKE_FD(fd), fdname);
+        return r;
+}
+
+static int manager_attach_session_fd_one_consume(Manager *m, const char *fdname, int fd) {
+        _cleanup_free_ char *id = NULL;
+        dev_t devno = 0; /* Explicit initialization to appease gcc */
+        Session *s;
+        int r;
+
+        assert(m);
+        assert(fdname);
+        assert(fd >= 0);
+
+        r = parse_fdname(fdname, &id, &devno);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to parse stored fd name '%s': %m", fdname);
+                goto fail_close;
+        }
+
+        s = hashmap_get(m->sessions, id);
+        if (!s) {
+                /* If the session doesn't exist anymore, let's simply close this fd. */
+                r = log_debug_errno(SYNTHETIC_ERRNO(ENXIO),
+                                    "Cannot attach fd '%s' to unknown session '%s', ignoring.", fdname, id);
+                goto fail_close;
+        }
+
+        if (devno > 0) {
+                r = deliver_session_device_fd(s, fdname, fd, devno);
+                if (r < 0)
+                        goto fail_close;
+                return 0;
+        }
+
+        /* Takes ownership of fd on both success and failure */
+        return deliver_session_leader_fd_consume(s, fdname, fd);
+
+fail_close:
+        close_and_notify_warn(fd, fdname);
+        return r;
 }
 
 static int manager_enumerate_sessions(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
-        int r = 0, k;
+        int r = 0;
 
         assert(m);
 
@@ -469,45 +552,63 @@ static int manager_enumerate_sessions(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/sessions: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/run/systemd/sessions/");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
-                struct Session *s;
+                Session *s;
+                int k;
 
                 if (!dirent_is_file(de))
                         continue;
 
-                if (!session_id_valid(de->d_name)) {
-                        log_warning("Invalid session file name '%s', ignoring.", de->d_name);
-                        r = -EINVAL;
-                        continue;
-                }
-
                 k = manager_add_session(m, de->d_name, &s);
                 if (k < 0) {
-                        log_error_errno(k, "Failed to add session by file name %s: %m", de->d_name);
-                        r = k;
+                        RET_GATHER(r, log_warning_errno(k, "Failed to add session by filename %s, ignoring: %m", de->d_name));
                         continue;
                 }
 
                 session_add_to_gc_queue(s);
 
                 k = session_load(s);
-                if (k < 0)
-                        r = k;
+                if (k < 0 && k != -ESRCH)
+                        RET_GATHER(r, log_warning_errno(k, "Failed to deserialize session '%s', ignoring: %m", s->id));
         }
 
-        /* We might be restarted and PID1 could have sent us back the session device fds we previously
-         * saved. */
-        (void) manager_attach_fds(m);
+        return r;
+}
+
+static int manager_enumerate_fds(Manager *m, int *ret_varlink_fd) {
+        _cleanup_strv_free_ char **fdnames = NULL;
+        int varlink_fd = -EBADF, n, r = 0;
+
+        assert(m);
+        assert(ret_varlink_fd);
+
+        n = sd_listen_fds_with_names(/* unset_environment= */ true, &fdnames);
+        if (n < 0)
+                return log_error_errno(n, "Failed to acquire passed fd list: %m");
+
+        for (int i = 0; i < n; i++) {
+                int fd = SD_LISTEN_FDS_START + i;
+
+                if (streq(fdnames[i], "varlink")) {
+                        assert(varlink_fd < 0);
+                        varlink_fd = fd;
+                        continue;
+                }
+
+                RET_GATHER(r, manager_attach_session_fd_one_consume(m, fdnames[i], fd));
+        }
+
+        if (r >= 0)
+                *ret_varlink_fd = varlink_fd;
 
         return r;
 }
 
 static int manager_enumerate_inhibitors(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         int r = 0;
 
         assert(m);
@@ -517,83 +618,145 @@ static int manager_enumerate_inhibitors(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open /run/systemd/inhibit: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/run/systemd/inhibit/");
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
-                int k;
                 Inhibitor *i;
+                int k;
 
                 if (!dirent_is_file(de))
                         continue;
 
                 k = manager_add_inhibitor(m, de->d_name, &i);
                 if (k < 0) {
-                        log_notice_errno(k, "Couldn't add inhibitor %s: %m", de->d_name);
-                        r = k;
+                        RET_GATHER(r, log_warning_errno(k, "Couldn't add inhibitor %s, ignoring: %m", de->d_name));
                         continue;
                 }
 
-                k = inhibitor_load(i);
-                if (k < 0)
-                        r = k;
+                RET_GATHER(r, inhibitor_load(i));
         }
 
         return r;
 }
 
 static int manager_dispatch_seat_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
 
-        assert(m);
         assert(device);
 
-        manager_process_seat_device(m, device);
+        /* If the event is triggered by us, do not try to start the relevant seat again. Otherwise, starting
+         * the seat may trigger uevents again again again... */
+        r = manager_process_device_triggered_by_seat(m, device);
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to process seat device event triggered by us, ignoring: %m");
+        if (r != 0)
+                return 0;
+
+        r = manager_process_seat_device(m, device);
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to process seat device, ignoring: %m");
+
         return 0;
 }
 
 static int manager_dispatch_device_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
 
-        assert(m);
         assert(device);
 
-        manager_process_seat_device(m, device);
+        /* If the device currently has "master-of-seat" tag, then it has been or will be processed by
+         * manager_dispatch_seat_udev(). */
+        r = sd_device_has_current_tag(device, "master-of-seat");
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to check if the device currently has master-of-seat tag, ignoring: %m");
+        if (r != 0)
+                return 0;
+
+        /* If the event is triggered by us, do not try to start the relevant seat again. Otherwise, starting
+         * the seat may trigger uevents again again again... */
+        r = manager_process_device_triggered_by_seat(m, device);
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to process seat device event triggered by us, ignoring: %m");
+        if (r != 0)
+                return 0;
+
+        r = manager_process_seat_device(m, device);
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to process seat device, ignoring: %m");
+
+        return 0;
+}
+
+static int manager_dispatch_uaccess_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(device);
+
+        /* If the device currently has "master-of-seat" tag, then it has been or will be processed by
+         * manager_dispatch_seat_udev(). */
+        r = sd_device_has_current_tag(device, "master-of-seat");
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to check if the device currently has master-of-seat tag, ignoring: %m");
+        if (r != 0)
+                return 0;
+
+        /* If the device is in input, graphics, or drm, then the event has been or will be processed by
+         * manager_dispatch_device_udev(). */
+        r = device_in_subsystem(device, "input", "graphics", "drm");
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to check device subsystem, ignoring: %m");
+        if (r != 0)
+                return 0;
+
+        r = manager_process_device_triggered_by_seat(m, device);
+        if (r < 0)
+                log_device_warning_errno(device, r, "Failed to process seat device event triggered by us, ignoring: %m");
+
         return 0;
 }
 
 static int manager_dispatch_vcsa_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        Manager *m = userdata;
-        const char *name;
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
 
-        assert(m);
         assert(device);
 
         /* Whenever a VCSA device is removed try to reallocate our
          * VTs, to make sure our auto VTs never go away. */
 
-        if (sd_device_get_sysname(device, &name) >= 0 &&
-            startswith(name, "vcsa") &&
-            device_for_action(device, DEVICE_ACTION_REMOVE))
+        r = device_sysname_startswith(device, "vcsa");
+        if (r < 0) {
+                log_device_debug_errno(device, r, "Failed to check device sysname, ignoring: %m");
+                return 0;
+        }
+        if (r == 0)
+                return 0;
+
+        if (device_for_action(device, SD_DEVICE_REMOVE))
                 seat_preallocate_vts(m->seat0);
 
         return 0;
 }
 
 static int manager_dispatch_button_udev(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
+        Button *b;
 
-        assert(m);
         assert(device);
 
-        manager_process_button_device(m, device);
+        if (manager_process_button_device(m, device, &b) > 0)
+                (void) button_check_switches(b);
+
         return 0;
 }
 
 static int manager_dispatch_console(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
-        assert(m);
         assert(m->seat0);
         assert(m->console_active_fd == fd);
 
@@ -634,53 +797,19 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to connect to system bus: %m");
 
-        r = sd_bus_add_object_vtable(m->bus, NULL, "/org/freedesktop/login1", "org.freedesktop.login1.Manager", manager_vtable, m);
+        r = bus_add_implementation(m->bus, &manager_object, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to add manager object vtable: %m");
+                return r;
 
-        r = sd_bus_add_fallback_vtable(m->bus, NULL, "/org/freedesktop/login1/seat", "org.freedesktop.login1.Seat", seat_vtable, seat_object_find, m);
+        r = bus_log_control_api_register(m->bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to add seat object vtable: %m");
+                return r;
 
-        r = sd_bus_add_node_enumerator(m->bus, NULL, "/org/freedesktop/login1/seat", seat_node_enumerator, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add seat enumerator: %m");
-
-        r = sd_bus_add_fallback_vtable(m->bus, NULL, "/org/freedesktop/login1/session", "org.freedesktop.login1.Session", session_vtable, session_object_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add session object vtable: %m");
-
-        r = sd_bus_add_node_enumerator(m->bus, NULL, "/org/freedesktop/login1/session", session_node_enumerator, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add session enumerator: %m");
-
-        r = sd_bus_add_fallback_vtable(m->bus, NULL, "/org/freedesktop/login1/user", "org.freedesktop.login1.User", user_vtable, user_object_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add user object vtable: %m");
-
-        r = sd_bus_add_node_enumerator(m->bus, NULL, "/org/freedesktop/login1/user", user_node_enumerator, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add user enumerator: %m");
-
-        r = sd_bus_match_signal_async(
-                        m->bus,
-                        NULL,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "JobRemoved",
-                        match_job_removed, NULL, m);
+        r = bus_match_signal_async(m->bus, NULL, bus_systemd_mgr, "JobRemoved", match_job_removed, NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for JobRemoved: %m");
 
-        r = sd_bus_match_signal_async(
-                        m->bus,
-                        NULL,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "UnitRemoved",
-                        match_unit_removed, NULL, m);
+        r = bus_match_signal_async(m->bus, NULL, bus_systemd_mgr, "UnitRemoved", match_unit_removed, NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for UnitRemoved: %m");
 
@@ -695,26 +824,11 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for PropertiesChanged: %m");
 
-        r = sd_bus_match_signal_async(
-                        m->bus,
-                        NULL,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "Reloading",
-                        match_reloading, NULL, m);
+        r = bus_match_signal_async(m->bus, NULL, bus_systemd_mgr, "Reloading", match_reloading, NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for Reloading: %m");
 
-        r = sd_bus_call_method_async(
-                        m->bus,
-                        NULL,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "Subscribe",
-                        NULL, NULL,
-                        NULL);
+        r = bus_call_method_async(m->bus, NULL, bus_systemd_mgr, "Subscribe", NULL, NULL, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable subscription: %m");
 
@@ -730,8 +844,8 @@ static int manager_connect_bus(Manager *m) {
 }
 
 static int manager_vt_switch(sd_event_source *src, const struct signalfd_siginfo *si, void *data) {
-        Manager *m = data;
-        Session *active, *iter;
+        Manager *m = ASSERT_PTR(data);
+        Session *active;
 
         /*
          * We got a VT-switch signal and we have to acknowledge it immediately.
@@ -748,11 +862,12 @@ static int manager_vt_switch(sd_event_source *src, const struct signalfd_siginfo
          */
 
         assert(m->seat0);
+
         seat_read_active_vt(m->seat0);
 
         active = m->seat0->active;
         if (!active || active->vtnr < 1) {
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
                 int r;
 
                 /* We are requested to acknowledge the VT-switch signal by the kernel but
@@ -763,31 +878,28 @@ static int manager_vt_switch(sd_event_source *src, const struct signalfd_siginfo
 
                 log_warning("Received VT_PROCESS signal without a registered session, restoring VT.");
 
-                /* At this point we only have the kernel mapping for referring to the
-                 * current VT. */
+                /* At this point we only have the kernel mapping for referring to the current VT. */
                 fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
                 if (fd < 0) {
-                        log_warning_errno(fd, "Failed to open, ignoring: %m");
+                        log_warning_errno(fd, "Failed to open current VT, ignoring: %m");
                         return 0;
                 }
 
-                r = vt_release(fd, true);
+                r = vt_release(fd, /* restore= */ true);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to release VT, ignoring: %m");
+                        log_warning_errno(r, "Failed to release current VT, ignoring: %m");
 
                 return 0;
         }
 
-        if (active->vtfd >= 0) {
+        if (active->vtfd >= 0)
                 session_leave_vt(active);
-        } else {
-                LIST_FOREACH(sessions_by_seat, iter, m->seat0->sessions) {
+        else
+                LIST_FOREACH(sessions_by_seat, iter, m->seat0->sessions)
                         if (iter->vtnr == active->vtnr && iter->vtfd >= 0) {
                                 session_leave_vt(iter);
                                 break;
                         }
-                }
-        }
 
         return 0;
 }
@@ -814,7 +926,7 @@ static int manager_connect_console(Manager *m) {
                         return 0;
                 }
 
-                return log_error_errno(errno, "Failed to open /sys/class/tty/tty0/active: %m");
+                return log_error_errno(errno, "Failed to open %s: %m", "/sys/class/tty/tty0/active");
         }
 
         r = sd_event_add_io(m->event, &m->console_active_event_source, m->console_active_fd, 0, manager_dispatch_console, m);
@@ -822,7 +934,7 @@ static int manager_connect_console(Manager *m) {
                 return log_error_errno(r, "Failed to watch foreground console: %m");
 
         /*
-         * SIGRTMIN is used as global VT-release signal, SIGRTMIN + 1 is used
+         * SIGRTMIN + 0 is used as global VT-release signal, SIGRTMIN + 1 is used
          * as VT-acquire signal. We ignore any acquire-events (yes, we still
          * have to provide a valid signal-number for it!) and acknowledge all
          * release events immediately.
@@ -830,15 +942,14 @@ static int manager_connect_console(Manager *m) {
 
         if (SIGRTMIN + 1 > SIGRTMAX)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Not enough real-time signals available: %u-%u",
+                                       "Not enough real-time signals available: %i-%i",
                                        SIGRTMIN, SIGRTMAX);
 
-        assert_se(ignore_signals(SIGRTMIN + 1, -1) >= 0);
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN, -1) >= 0);
+        assert_se(ignore_signals(SIGRTMIN + 1) >= 0);
 
-        r = sd_event_add_signal(m->event, NULL, SIGRTMIN, manager_vt_switch, m);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN + 0) | SD_EVENT_SIGNAL_PROCMASK, manager_vt_switch, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to subscribe to signal: %m");
+                return log_error_errno(r, "Failed to subscribe to SIGRTMIN+0 signal: %m");
 
         return 0;
 }
@@ -849,6 +960,7 @@ static int manager_connect_udev(Manager *m) {
         assert(m);
         assert(!m->device_seat_monitor);
         assert(!m->device_monitor);
+        assert(!m->device_uaccess_monitor);
         assert(!m->device_vcsa_monitor);
         assert(!m->device_button_monitor);
 
@@ -868,23 +980,17 @@ static int manager_connect_udev(Manager *m) {
         if (r < 0)
                 return r;
 
-        (void) sd_event_source_set_description(sd_device_monitor_get_event_source(m->device_seat_monitor), "logind-seat-monitor");
+        (void) sd_device_monitor_set_description(m->device_seat_monitor, "seat");
 
         r = sd_device_monitor_new(&m->device_monitor);
         if (r < 0)
                 return r;
 
-        r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, "input", NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, "graphics", NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, "drm", NULL);
-        if (r < 0)
-                return r;
+        FOREACH_STRING(s, "input", "graphics", "drm") {
+                r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, s, /* devtype= */ NULL);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_device_monitor_attach_event(m->device_monitor, m->event);
         if (r < 0)
@@ -894,7 +1000,25 @@ static int manager_connect_udev(Manager *m) {
         if (r < 0)
                 return r;
 
-        (void) sd_event_source_set_description(sd_device_monitor_get_event_source(m->device_monitor), "logind-device-monitor");
+        (void) sd_device_monitor_set_description(m->device_monitor, "input,graphics,drm");
+
+        r = sd_device_monitor_new(&m->device_uaccess_monitor);
+        if (r < 0)
+                return r;
+
+        r = sd_device_monitor_filter_add_match_tag(m->device_uaccess_monitor, "uaccess");
+        if (r < 0)
+                return r;
+
+        r = sd_device_monitor_attach_event(m->device_uaccess_monitor, m->event);
+        if (r < 0)
+                return r;
+
+        r = sd_device_monitor_start(m->device_uaccess_monitor, manager_dispatch_uaccess_udev, m);
+        if (r < 0)
+                return r;
+
+        (void) sd_device_monitor_set_description(m->device_uaccess_monitor, "uaccess");
 
         /* Don't watch keys if nobody cares */
         if (!manager_all_buttons_ignored(m)) {
@@ -918,7 +1042,7 @@ static int manager_connect_udev(Manager *m) {
                 if (r < 0)
                         return r;
 
-                (void) sd_event_source_set_description(sd_device_monitor_get_event_source(m->device_button_monitor), "logind-button-monitor");
+                (void) sd_device_monitor_set_description(m->device_button_monitor, "button");
         }
 
         /* Don't bother watching VCSA devices, if nobody cares */
@@ -940,7 +1064,7 @@ static int manager_connect_udev(Manager *m) {
                 if (r < 0)
                         return r;
 
-                (void) sd_event_source_set_description(sd_device_monitor_get_event_source(m->device_vcsa_monitor), "logind-vcsa-monitor");
+                (void) sd_device_monitor_set_description(m->device_vcsa_monitor, "vcsa");
         }
 
         return 0;
@@ -953,36 +1077,32 @@ static void manager_gc(Manager *m, bool drop_not_started) {
 
         assert(m);
 
-        while ((seat = m->seat_gc_queue)) {
-                LIST_REMOVE(gc_queue, m->seat_gc_queue, seat);
+        while ((seat = LIST_POP(gc_queue, m->seat_gc_queue))) {
                 seat->in_gc_queue = false;
 
                 if (seat_may_gc(seat, drop_not_started)) {
-                        seat_stop(seat, false);
+                        seat_stop(seat, /* force= */ false);
                         seat_free(seat);
                 }
         }
 
-        while ((session = m->session_gc_queue)) {
-                LIST_REMOVE(gc_queue, m->session_gc_queue, session);
+        while ((session = LIST_POP(gc_queue, m->session_gc_queue))) {
                 session->in_gc_queue = false;
 
-                /* First, if we are not closing yet, initiate stopping */
+                /* First, if we are not closing yet, initiate stopping. */
                 if (session_may_gc(session, drop_not_started) &&
                     session_get_state(session) != SESSION_CLOSING)
-                        (void) session_stop(session, false);
+                        (void) session_stop(session, /* force= */ false);
 
-                /* Normally, this should make the session referenced
-                 * again, if it doesn't then let's get rid of it
-                 * immediately */
+                /* Normally, this should make the session referenced again, if it doesn't then let's get rid
+                 * of it immediately. */
                 if (session_may_gc(session, drop_not_started)) {
                         (void) session_finalize(session);
                         session_free(session);
                 }
         }
 
-        while ((user = m->user_gc_queue)) {
-                LIST_REMOVE(gc_queue, m->user_gc_queue, user);
+        while ((user = LIST_POP(gc_queue, m->user_gc_queue))) {
                 user->in_gc_queue = false;
 
                 /* First step: queue stop jobs */
@@ -998,12 +1118,11 @@ static void manager_gc(Manager *m, bool drop_not_started) {
 }
 
 static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         struct dual_timestamp since;
         usec_t n, elapse;
+        bool idle;
         int r;
-
-        assert(m);
 
         if (m->idle_action == HANDLE_IGNORE ||
             m->idle_action_usec <= 0)
@@ -1011,19 +1130,34 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
 
         n = now(CLOCK_MONOTONIC);
 
-        r = manager_get_idle_hint(m, &since);
-        if (r <= 0)
+        idle = manager_get_idle_hint(m, &since);
+        if (!idle) {
                 /* Not idle. Let's check if after a timeout it might be idle then. */
                 elapse = n + m->idle_action_usec;
-        else {
+                m->was_idle = false;
+        } else {
+
                 /* Idle! Let's see if it's time to do something, or if
                  * we shall sleep for longer. */
 
                 if (n >= since.monotonic + m->idle_action_usec &&
                     (m->idle_action_not_before_usec <= 0 || n >= m->idle_action_not_before_usec + m->idle_action_usec)) {
-                        log_info("System idle. Taking action.");
+                        bool is_edge = false;
 
-                        manager_handle_action(m, 0, m->idle_action, false, false);
+                        /* We weren't idle previously or some activity happened while we were sleeping, and now we are
+                         * idle. Let's remember that for the next time and make this an edge transition. */
+                        if (!m->was_idle || since.monotonic >= m->idle_action_not_before_usec) {
+                                is_edge = true;
+                                m->was_idle = true;
+                        }
+
+                        if (m->idle_action == HANDLE_LOCK && !is_edge)
+                                /* We are idle and we were before so we are actually not taking any action. */
+                                log_debug("System idle.");
+                        else
+                                log_info("System idle. Will %s now.", handle_action_verb_to_string(m->idle_action));
+
+                        manager_handle_action(m, /* inhibit_key= */ 0, m->idle_action, /* ignore_inhibited= */ false, is_edge, /* action_seat= */ NULL);
                         m->idle_action_not_before_usec = n;
                 }
 
@@ -1036,7 +1170,7 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
                                 m->event,
                                 &m->idle_action_event_source,
                                 CLOCK_MONOTONIC,
-                                elapse, USEC_PER_SEC*30,
+                                elapse, MIN(USEC_PER_SEC*30, m->idle_action_usec), /* accuracy of 30s, but don't have an accuracy lower than the idle action timeout */
                                 manager_dispatch_idle_action, m);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add idle event source: %m");
@@ -1061,6 +1195,8 @@ static int manager_dispatch_reload_signal(sd_event_source *s, const struct signa
         Manager *m = userdata;
         int r;
 
+        (void) notify_reloading();
+
         manager_reset_config(m);
         r = manager_parse_config_file(m);
         if (r < 0)
@@ -1068,21 +1204,22 @@ static int manager_dispatch_reload_signal(sd_event_source *s, const struct signa
         else
                 log_info("Config file reloaded.");
 
+        (void) sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
         return 0;
 }
 
 static int manager_startup(Manager *m) {
+        _cleanup_close_ int varlink_fd = -EBADF;
         int r;
         Seat *seat;
         Session *session;
         User *user;
         Button *button;
         Inhibitor *inhibitor;
-        Iterator i;
 
         assert(m);
 
-        r = sd_event_add_signal(m->event, NULL, SIGHUP, manager_dispatch_reload_signal, m);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, SIGHUP|SD_EVENT_SIGNAL_PROCMASK, manager_dispatch_reload_signal, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to register SIGHUP handler: %m");
 
@@ -1130,6 +1267,10 @@ static int manager_startup(Manager *m) {
         if (r < 0)
                 log_warning_errno(r, "Session enumeration failed: %m");
 
+        r = manager_enumerate_fds(m, &varlink_fd);
+        if (r < 0)
+                log_warning_errno(r, "File descriptor enumeration failed: %m");
+
         r = manager_enumerate_inhibitors(m);
         if (r < 0)
                 log_warning_errno(r, "Inhibitor enumeration failed: %m");
@@ -1137,6 +1278,12 @@ static int manager_startup(Manager *m) {
         r = manager_enumerate_buttons(m);
         if (r < 0)
                 log_warning_errno(r, "Button enumeration failed: %m");
+
+        r = manager_varlink_init(m, TAKE_FD(varlink_fd));
+        if (r < 0)
+                return r;
+
+        manager_load_scheduled_shutdown(m);
 
         /* Remove stale objects before we start them */
         manager_gc(m, false);
@@ -1148,19 +1295,26 @@ static int manager_startup(Manager *m) {
         manager_read_utmp(m);
 
         /* And start everything */
-        HASHMAP_FOREACH(seat, m->seats, i)
+        HASHMAP_FOREACH(seat, m->seats)
                 (void) seat_start(seat);
 
-        HASHMAP_FOREACH(user, m->users, i)
+        HASHMAP_FOREACH(user, m->users)
                 (void) user_start(user);
 
-        HASHMAP_FOREACH(session, m->sessions, i)
+        HASHMAP_FOREACH(session, m->sessions)
                 (void) session_start(session, NULL, NULL);
 
-        HASHMAP_FOREACH(inhibitor, m->inhibitors, i)
-                inhibitor_start(inhibitor);
+        HASHMAP_FOREACH(inhibitor, m->inhibitors) {
+                (void) inhibitor_start(inhibitor);
 
-        HASHMAP_FOREACH(button, m->buttons, i)
+                /* Let's see if the inhibitor is dead now, then remove it */
+                if (inhibitor_is_orphan(inhibitor)) {
+                        inhibitor_stop(inhibitor);
+                        inhibitor_free(inhibitor);
+                }
+        }
+
+        HASHMAP_FOREACH(button, m->buttons)
                 button_check_switches(button);
 
         manager_dispatch_idle_action(NULL, 0, m);
@@ -1188,38 +1342,53 @@ static int manager_run(Manager *m) {
                 if (r > 0)
                         continue;
 
-                r = sd_event_run(m->event, (uint64_t) -1);
+                r = sd_event_run(m->event, UINT64_MAX);
                 if (r < 0)
                         return r;
         }
 }
 
+COMMAND(
+        "systemd-logind\0",
+        "Manage user logins and devices and privileged operations.",
+        .man_pages = "systemd-logind.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
-        _cleanup_(manager_unrefp) Manager *m = NULL;
+        _cleanup_(manager_freep) Manager *m = NULL;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
         log_set_facility(LOG_AUTH);
-        log_setup_service();
+        log_setup();
+
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
+                                                   &log_control_object),
+                               /* runtime_scope= */ NULL,
+                               argc, argv);
+        if (r <= 0)
+                return r;
 
         umask(0022);
 
-        if (argc != 1) {
-                log_error("This program takes no arguments.");
-                return -EINVAL;
-        }
-
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
-                return log_error_errno(r, "Could not initialize labelling: %m");
+                return r;
 
-        /* Always create the directories people can create inotify watches in. Note that some applications might check
-         * for the existence of /run/systemd/seats/ to determine whether logind is available, so please always make
-         * sure these directories are created early on and unconditionally. */
+        /* Always create the directories people can create inotify watches in. Note that some applications
+         * might check for the existence of /run/systemd/seats/ to determine whether logind is available, so
+         * please always make sure these directories are created early on and unconditionally. */
         (void) mkdir_label("/run/systemd/seats", 0755);
         (void) mkdir_label("/run/systemd/users", 0755);
         (void) mkdir_label("/run/systemd/sessions", 0755);
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGHUP, SIGTERM, SIGINT, SIGCHLD, -1) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -1231,19 +1400,8 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        log_debug("systemd-logind running as pid "PID_FMT, getpid_cached());
-        (void) sd_notify(false,
-                         "READY=1\n"
-                         "STATUS=Processing requests...");
-
-        r = manager_run(m);
-
-        log_debug("systemd-logind stopped as pid "PID_FMT, getpid_cached());
-        (void) sd_notify(false,
-                         "STOPPING=1\n"
-                         "STATUS=Shutting down...");
-
-        return r;
+        notify_message = notify_start(NOTIFY_READY_MESSAGE, NOTIFY_STOPPING_MESSAGE);
+        return manager_run(m);
 }
 
 DEFINE_MAIN_FUNCTION(run);

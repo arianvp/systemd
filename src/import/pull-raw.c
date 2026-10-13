@@ -1,34 +1,27 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <curl/curl.h>
-#include <linux/fs.h>
-#include <sys/xattr.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
-#include "chattr-util.h"
 #include "copy.h"
 #include "curl-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "hostname-util.h"
 #include "import-common.h"
 #include "import-util.h"
-#include "macro.h"
+#include "install-file.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "mkdir.h"
-#include "path-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
 #include "pull-raw.h"
 #include "qcow2-util.h"
-#include "rm-rf.h"
 #include "string-util.h"
-#include "strv.h"
 #include "tmpfile-util.h"
-#include "utf8.h"
-#include "util.h"
 #include "web-util.h"
 
 typedef enum RawProgress {
@@ -39,25 +32,29 @@ typedef enum RawProgress {
         RAW_COPYING,
 } RawProgress;
 
-struct RawPull {
+typedef struct RawPull {
         sd_event *event;
         CurlGlue *glue;
 
+        ImportFlags flags;
+        ImportVerify verify;
         char *image_root;
 
+        uint64_t offset;
+
         PullJob *raw_job;
-        PullJob *roothash_job;
-        PullJob *settings_job;
         PullJob *checksum_job;
         PullJob *signature_job;
+        PullJob *settings_job;
+        PullJob *roothash_job;
+        PullJob *roothash_signature_job;
+        PullJob *verity_job;
 
         RawPullFinished on_finished;
         void *userdata;
 
-        char *local;
-        bool force_local;
-        bool settings;
-        bool roothash;
+        char *local; /* In PULL_DIRECT mode the path we are supposed to place things in, otherwise the
+                      * image name of the final copy we make */
 
         char *final_path;
         char *temp_path;
@@ -68,43 +65,43 @@ struct RawPull {
         char *roothash_path;
         char *roothash_temp_path;
 
-        ImportVerify verify;
-};
+        char *roothash_signature_path;
+        char *roothash_signature_temp_path;
 
-RawPull* raw_pull_unref(RawPull *i) {
-        if (!i)
+        char *verity_path;
+        char *verity_temp_path;
+} RawPull;
+
+RawPull* raw_pull_unref(RawPull *p) {
+        if (!p)
                 return NULL;
 
-        pull_job_unref(i->raw_job);
-        pull_job_unref(i->settings_job);
-        pull_job_unref(i->roothash_job);
-        pull_job_unref(i->checksum_job);
-        pull_job_unref(i->signature_job);
+        pull_job_unref(p->raw_job);
+        pull_job_unref(p->checksum_job);
+        pull_job_unref(p->signature_job);
+        pull_job_unref(p->settings_job);
+        pull_job_unref(p->roothash_job);
+        pull_job_unref(p->roothash_signature_job);
+        pull_job_unref(p->verity_job);
 
-        curl_glue_unref(i->glue);
-        sd_event_unref(i->event);
+        curl_glue_unref(p->glue);
+        sd_event_unref(p->event);
 
-        if (i->temp_path) {
-                (void) unlink(i->temp_path);
-                free(i->temp_path);
-        }
+        unlink_and_free(p->temp_path);
+        unlink_and_free(p->settings_temp_path);
+        unlink_and_free(p->roothash_temp_path);
+        unlink_and_free(p->roothash_signature_temp_path);
+        unlink_and_free(p->verity_temp_path);
 
-        if (i->roothash_temp_path) {
-                (void) unlink(i->roothash_temp_path);
-                free(i->roothash_temp_path);
-        }
+        free(p->final_path);
+        free(p->settings_path);
+        free(p->roothash_path);
+        free(p->roothash_signature_path);
+        free(p->verity_path);
+        free(p->image_root);
+        free(p->local);
 
-        if (i->settings_temp_path) {
-                (void) unlink(i->settings_temp_path);
-                free(i->settings_temp_path);
-        }
-
-        free(i->final_path);
-        free(i->roothash_path);
-        free(i->settings_path);
-        free(i->image_root);
-        free(i->local);
-        return mfree(i);
+        return mfree(p);
 }
 
 int raw_pull_new(
@@ -116,13 +113,14 @@ int raw_pull_new(
 
         _cleanup_(curl_glue_unrefp) CurlGlue *g = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
-        _cleanup_(raw_pull_unrefp) RawPull *i = NULL;
+        _cleanup_(raw_pull_unrefp) RawPull *p = NULL;
         _cleanup_free_ char *root = NULL;
         int r;
 
         assert(ret);
+        assert(image_root);
 
-        root = strdup(image_root ?: "/var/lib/machines");
+        root = strdup(image_root);
         if (!root)
                 return -ENOMEM;
 
@@ -138,60 +136,68 @@ int raw_pull_new(
         if (r < 0)
                 return r;
 
-        i = new(RawPull, 1);
-        if (!i)
+        p = new(RawPull, 1);
+        if (!p)
                 return -ENOMEM;
 
-        *i = (RawPull) {
+        *p = (RawPull) {
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .image_root = TAKE_PTR(root),
                 .event = TAKE_PTR(e),
                 .glue = TAKE_PTR(g),
+                .offset = UINT64_MAX,
         };
 
-        i->glue->on_finished = pull_job_curl_on_finished;
-        i->glue->userdata = i;
-
-        *ret = TAKE_PTR(i);
+        *ret = TAKE_PTR(p);
 
         return 0;
 }
 
-static void raw_pull_report_progress(RawPull *i, RawProgress p) {
+static void raw_pull_report_progress(RawPull *p, RawProgress progress) {
         unsigned percent;
 
-        assert(i);
+        assert(p);
 
-        switch (p) {
+        switch (progress) {
 
         case RAW_DOWNLOADING: {
                 unsigned remain = 80;
 
                 percent = 0;
 
-                if (i->settings_job) {
-                        percent += i->settings_job->progress_percent * 5 / 100;
+                if (p->checksum_job) {
+                        percent += p->checksum_job->progress_percent * 5 / 100;
                         remain -= 5;
                 }
 
-                if (i->roothash_job) {
-                        percent += i->roothash_job->progress_percent * 5 / 100;
+                if (p->signature_job) {
+                        percent += p->signature_job->progress_percent * 5 / 100;
                         remain -= 5;
                 }
 
-                if (i->checksum_job) {
-                        percent += i->checksum_job->progress_percent * 5 / 100;
+                if (p->settings_job) {
+                        percent += p->settings_job->progress_percent * 5 / 100;
                         remain -= 5;
                 }
 
-                if (i->signature_job) {
-                        percent += i->signature_job->progress_percent * 5 / 100;
+                if (p->roothash_job) {
+                        percent += p->roothash_job->progress_percent * 5 / 100;
                         remain -= 5;
                 }
 
-                if (i->raw_job)
-                        percent += i->raw_job->progress_percent * remain / 100;
+                if (p->roothash_signature_job) {
+                        percent += p->roothash_signature_job->progress_percent * 5 / 100;
+                        remain -= 5;
+                }
+
+                if (p->verity_job) {
+                        percent += p->verity_job->progress_percent * 10 / 100;
+                        remain -= 10;
+                }
+
+                if (p->raw_job)
+                        percent += p->raw_job->progress_percent * remain / 100;
                 break;
         }
 
@@ -212,69 +218,76 @@ static void raw_pull_report_progress(RawPull *i, RawProgress p) {
                 break;
 
         default:
-                assert_not_reached("Unknown progress state");
+                assert_not_reached();
         }
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
         log_debug("Combined progress %u%%", percent);
 }
 
-static int raw_pull_maybe_convert_qcow2(RawPull *i) {
-        _cleanup_close_ int converted_fd = -1;
-        _cleanup_free_ char *t = NULL;
+static int raw_pull_maybe_convert_qcow2(RawPull *p) {
+        _cleanup_(unlink_and_freep) char *t = NULL;
+        _cleanup_close_ int converted_fd = -EBADF;
+        _cleanup_free_ char *f = NULL;
         int r;
 
-        assert(i);
-        assert(i->raw_job);
+        assert(p);
+        assert(p->raw_job);
+        assert(!FLAGS_SET(p->flags, IMPORT_DIRECT));
 
-        r = qcow2_detect(i->raw_job->disk_fd);
+        if (!FLAGS_SET(p->flags, IMPORT_CONVERT_QCOW2))
+                return 0;
+
+        assert(p->final_path);
+        assert(p->raw_job->close_disk_fd);
+
+        r = qcow2_detect(p->raw_job->disk_fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to detect whether this is a QCOW2 image: %m");
         if (r == 0)
                 return 0;
 
         /* This is a QCOW2 image, let's convert it */
-        r = tempfn_random(i->final_path, NULL, &t);
+        r = tempfn_random(p->final_path, NULL, &f);
         if (r < 0)
                 return log_oom();
 
-        converted_fd = open(t, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+        converted_fd = open(f, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
         if (converted_fd < 0)
-                return log_error_errno(errno, "Failed to create %s: %m", t);
+                return log_error_errno(errno, "Failed to create %s: %m", f);
 
-        r = chattr_fd(converted_fd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s: %m", t);
+        t = TAKE_PTR(f);
+
+        (void) import_set_nocow_and_log(converted_fd, t);
 
         log_info("Unpacking QCOW2 file.");
 
-        r = qcow2_convert(i->raw_job->disk_fd, converted_fd);
-        if (r < 0) {
-                (void) unlink(t);
+        r = qcow2_convert(p->raw_job->disk_fd, converted_fd);
+        if (r < 0)
                 return log_error_errno(r, "Failed to convert qcow2 image: %m");
-        }
 
-        (void) unlink(i->temp_path);
-        free_and_replace(i->temp_path, t);
-
-        safe_close(i->raw_job->disk_fd);
-        i->raw_job->disk_fd = TAKE_FD(converted_fd);
+        unlink_and_free(p->temp_path);
+        p->temp_path = TAKE_PTR(t);
+        close_and_replace(p->raw_job->disk_fd, converted_fd);
 
         return 1;
 }
 
-static int raw_pull_determine_path(RawPull *i, const char *suffix, char **field) {
+static int raw_pull_determine_path(
+                RawPull *p,
+                const char *suffix,
+                char **field /* input + output (!) */) {
         int r;
 
-        assert(i);
+        assert(p);
         assert(field);
 
         if (*field)
                 return 0;
 
-        assert(i->raw_job);
+        assert(p->raw_job);
 
-        r = pull_make_path(i->raw_job->url, i->raw_job->etag, i->image_root, ".raw-", suffix, field);
+        r = pull_make_path(p->raw_job->url, p->raw_job->etag, p->image_root, ".raw-", suffix, field);
         if (r < 0)
                 return log_oom();
 
@@ -282,114 +295,147 @@ static int raw_pull_determine_path(RawPull *i, const char *suffix, char **field)
 }
 
 static int raw_pull_copy_auxiliary_file(
-                RawPull *i,
+                RawPull *p,
                 const char *suffix,
-                char **path) {
+                char **path /* input + output (!) */) {
 
-        const char *local;
+        _cleanup_free_ char *local = NULL;
         int r;
 
-        assert(i);
+        assert(p);
         assert(suffix);
         assert(path);
 
-        r = raw_pull_determine_path(i, suffix, path);
+        r = raw_pull_determine_path(p, suffix, path);
         if (r < 0)
                 return r;
 
-        local = strjoina(i->image_root, "/", i->local, suffix);
+        local = strjoin(p->image_root, "/", p->local, suffix);
+        if (!local)
+                return log_oom();
 
-        r = copy_file_atomic(*path, local, 0644, 0, 0, COPY_REFLINK | (i->force_local ? COPY_REPLACE : 0));
+        if (FLAGS_SET(p->flags, IMPORT_PULL_KEEP_DOWNLOAD))
+                r = copy_file_atomic(
+                                *path,
+                                local,
+                                0644,
+                                (FLAGS_SET(p->flags, IMPORT_FORCE) ? COPY_REPLACE : 0) |
+                                (FLAGS_SET(p->flags, IMPORT_SYNC) ? COPY_FSYNC_FULL : 0));
+        else
+                r = install_file(AT_FDCWD, *path,
+                                 AT_FDCWD, local,
+                                 (p->flags & IMPORT_FORCE ? INSTALL_REPLACE : 0) |
+                                 (p->flags & IMPORT_SYNC ? INSTALL_SYNCFS : 0));
         if (r == -EEXIST)
                 log_warning_errno(r, "File %s already exists, not replacing.", local);
         else if (r == -ENOENT)
                 log_debug_errno(r, "Skipping creation of auxiliary file, since none was found.");
         else if (r < 0)
-                log_warning_errno(r, "Failed to copy file %s, ignoring: %m", local);
+                log_warning_errno(r, "Failed to install file %s, ignoring: %m", local);
         else
                 log_info("Created new file %s.", local);
 
         return 0;
 }
 
-static int raw_pull_make_local_copy(RawPull *i) {
-        _cleanup_free_ char *tp = NULL;
-        _cleanup_close_ int dfd = -1;
-        const char *p;
+static int raw_pull_make_local_copy(RawPull *p) {
+        _cleanup_(unlink_and_freep) char *tp = NULL;
+        _cleanup_free_ char *path = NULL;
         int r;
 
-        assert(i);
-        assert(i->raw_job);
+        assert(p);
+        assert(p->raw_job);
+        assert(!FLAGS_SET(p->flags, IMPORT_DIRECT));
 
-        if (!i->local)
+        if (!p->local)
                 return 0;
 
-        if (i->raw_job->etag_exists) {
+        if (p->raw_job->etag_exists) {
                 /* We have downloaded this one previously, reopen it */
 
-                assert(i->raw_job->disk_fd < 0);
+                assert(p->raw_job->disk_fd < 0);
 
-                i->raw_job->disk_fd = open(i->final_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
-                if (i->raw_job->disk_fd < 0)
+                p->raw_job->disk_fd = open(p->final_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
+                if (p->raw_job->disk_fd < 0)
                         return log_error_errno(errno, "Failed to open vendor image: %m");
         } else {
                 /* We freshly downloaded the image, use it */
 
-                assert(i->raw_job->disk_fd >= 0);
+                assert(p->raw_job->disk_fd >= 0);
+                assert(p->offset == UINT64_MAX);
 
-                if (lseek(i->raw_job->disk_fd, SEEK_SET, 0) == (off_t) -1)
+                if (lseek(p->raw_job->disk_fd, 0, SEEK_SET) < 0)
                         return log_error_errno(errno, "Failed to seek to beginning of vendor image: %m");
         }
 
-        p = strjoina(i->image_root, "/", i->local, ".raw");
-
-        if (i->force_local)
-                (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
-
-        r = tempfn_random(p, NULL, &tp);
-        if (r < 0)
+        path = strjoin(p->image_root, "/", p->local, ".raw");
+        if (!path)
                 return log_oom();
 
-        dfd = open(tp, O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
-        if (dfd < 0)
-                return log_error_errno(errno, "Failed to create writable copy of image: %m");
+        const char *source;
+        if (FLAGS_SET(p->flags, IMPORT_PULL_KEEP_DOWNLOAD)) {
+                _cleanup_close_ int dfd = -EBADF;
+                _cleanup_free_ char *f = NULL;
 
-        /* Turn off COW writing. This should greatly improve
-         * performance on COW file systems like btrfs, since it
-         * reduces fragmentation caused by not allowing in-place
-         * writes. */
-        r = chattr_fd(dfd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
+                r = tempfn_random(path, NULL, &f);
+                if (r < 0)
+                        return log_oom();
+
+                dfd = open(f, O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+                if (dfd < 0)
+                        return log_error_errno(errno, "Failed to create writable copy of image: %m");
+
+                tp = TAKE_PTR(f);
+
+                /* Turn off COW writing. This should greatly improve performance on COW file systems like btrfs,
+                 * since it reduces fragmentation caused by not allowing in-place writes. */
+                (void) import_set_nocow_and_log(dfd, tp);
+
+                r = copy_bytes(p->raw_job->disk_fd, dfd, UINT64_MAX, /* copy_flags= */ 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make writable copy of image: %m");
+
+                (void) copy_times(p->raw_job->disk_fd, dfd, COPY_CRTIME);
+                (void) copy_xattr(p->raw_job->disk_fd, NULL, dfd, NULL, 0);
+
+                dfd = safe_close(dfd);
+
+                source = tp;
+        } else
+                source = p->final_path;
+
+        r = install_file(AT_FDCWD, source,
+                         AT_FDCWD, path,
+                         (p->flags & IMPORT_FORCE ? INSTALL_REPLACE : 0) |
+                         (p->flags & IMPORT_READ_ONLY ? INSTALL_READ_ONLY : 0) |
+                         (p->flags & IMPORT_SYNC ? INSTALL_FSYNC_FULL : 0));
         if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s: %m", tp);
+                return log_error_errno(r, "Failed to move local image into place '%s': %m", path);
 
-        r = copy_bytes(i->raw_job->disk_fd, dfd, (uint64_t) -1, COPY_REFLINK);
-        if (r < 0) {
-                (void) unlink(tp);
-                return log_error_errno(r, "Failed to make writable copy of image: %m");
-        }
+        tp = mfree(tp);
 
-        (void) copy_times(i->raw_job->disk_fd, dfd, COPY_CRTIME);
-        (void) copy_xattr(i->raw_job->disk_fd, dfd);
+        log_info("Created new local image '%s'.", p->local);
 
-        dfd = safe_close(dfd);
-
-        r = rename(tp, p);
-        if (r < 0)  {
-                r = log_error_errno(errno, "Failed to move writable image into place: %m");
-                (void) unlink(tp);
-                return r;
-        }
-
-        log_info("Created new local image '%s'.", i->local);
-
-        if (i->roothash) {
-                r = raw_pull_copy_auxiliary_file(i, ".roothash", &i->roothash_path);
+        if (FLAGS_SET(p->flags, IMPORT_PULL_SETTINGS)) {
+                r = raw_pull_copy_auxiliary_file(p, ".nspawn", &p->settings_path);
                 if (r < 0)
                         return r;
         }
 
-        if (i->settings) {
-                r = raw_pull_copy_auxiliary_file(i, ".nspawn", &i->settings_path);
+        if (FLAGS_SET(p->flags, IMPORT_PULL_ROOTHASH)) {
+                r = raw_pull_copy_auxiliary_file(p, ".roothash", &p->roothash_path);
+                if (r < 0)
+                        return r;
+        }
+
+        if (FLAGS_SET(p->flags, IMPORT_PULL_ROOTHASH_SIGNATURE)) {
+                r = raw_pull_copy_auxiliary_file(p, ".roothash.p7s", &p->roothash_signature_path);
+                if (r < 0)
+                        return r;
+        }
+
+        if (FLAGS_SET(p->flags, IMPORT_PULL_VERITY)) {
+                r = raw_pull_copy_auxiliary_file(p, ".verity", &p->verity_path);
                 if (r < 0)
                         return r;
         }
@@ -397,182 +443,242 @@ static int raw_pull_make_local_copy(RawPull *i) {
         return 0;
 }
 
-static bool raw_pull_is_done(RawPull *i) {
-        assert(i);
-        assert(i->raw_job);
+static bool raw_pull_is_done(RawPull *p) {
+        assert(p);
+        assert(p->raw_job);
 
-        if (!PULL_JOB_IS_COMPLETE(i->raw_job))
+        if (!PULL_JOB_IS_COMPLETE(p->raw_job))
                 return false;
-        if (i->roothash_job && !PULL_JOB_IS_COMPLETE(i->roothash_job))
+        if (p->checksum_job && !PULL_JOB_IS_COMPLETE(p->checksum_job))
                 return false;
-        if (i->settings_job && !PULL_JOB_IS_COMPLETE(i->settings_job))
+        if (p->signature_job && !PULL_JOB_IS_COMPLETE(p->signature_job))
                 return false;
-        if (i->checksum_job && !PULL_JOB_IS_COMPLETE(i->checksum_job))
+        if (p->settings_job && !PULL_JOB_IS_COMPLETE(p->settings_job))
                 return false;
-        if (i->signature_job && !PULL_JOB_IS_COMPLETE(i->signature_job))
+        if (p->roothash_job && !PULL_JOB_IS_COMPLETE(p->roothash_job))
+                return false;
+        if (p->roothash_signature_job && !PULL_JOB_IS_COMPLETE(p->roothash_signature_job))
+                return false;
+        if (p->verity_job && !PULL_JOB_IS_COMPLETE(p->verity_job))
                 return false;
 
         return true;
 }
 
 static int raw_pull_rename_auxiliary_file(
-                RawPull *i,
+                RawPull *p,
                 const char *suffix,
                 char **temp_path,
                 char **path) {
 
         int r;
 
-        assert(i);
-        assert(temp_path);
-        assert(suffix);
+        assert(p);
         assert(path);
+        assert(temp_path);
+        assert(*temp_path);
+        assert(suffix);
 
         /* Regenerate final name for this auxiliary file, we might know the etag of the file now, and we should
          * incorporate it in the file name if we can */
         *path = mfree(*path);
-        r = raw_pull_determine_path(i, suffix, path);
+        r = raw_pull_determine_path(p, suffix, path);
         if (r < 0)
                 return r;
 
-        r = import_make_read_only(*temp_path);
+        r = install_file(
+                        AT_FDCWD, *temp_path,
+                        AT_FDCWD, *path,
+                        INSTALL_READ_ONLY|
+                        (p->flags & IMPORT_SYNC ? INSTALL_FSYNC_FULL : 0));
         if (r < 0)
-                return r;
-
-        r = rename_noreplace(AT_FDCWD, *temp_path, AT_FDCWD, *path);
-        if (r < 0)
-                return log_error_errno(r, "Failed to rename file %s to %s: %m", *temp_path, *path);
+                return log_error_errno(r, "Failed to move '%s' into place: %m", *path);
 
         *temp_path = mfree(*temp_path);
-
         return 1;
 }
 
 static void raw_pull_job_on_finished(PullJob *j) {
-        RawPull *i;
         int r;
 
         assert(j);
-        assert(j->userdata);
+        RawPull *p = ASSERT_PTR(j->userdata);
 
-        i = j->userdata;
-        if (j == i->roothash_job) {
-                if (j->error != 0)
-                        log_info_errno(j->error, "Root hash file could not be retrieved, proceeding without.");
-        } else if (j == i->settings_job) {
-                if (j->error != 0)
+        if (j->error != 0) {
+                /* Only the main job and the checksum job are fatal if they fail. The other fails are just
+                 * "decoration", that we'll download if we can. The signature job isn't fatal here because we
+                 * might not actually need it in case Suse style signatures are used, that are inline in the
+                 * checksum file. */
+
+                if (j == p->raw_job) {
+                        if (j->error == -ENOMEDIUM) /* HTTP 404 */
+                                r = log_error_errno(j->error, "Failed to retrieve image file. (Wrong URL?)");
+                        else
+                                r = log_error_errno(j->error, "Failed to retrieve image file.");
+                        goto finish;
+                } else if (j == p->checksum_job) {
+                        r = log_error_errno(j->error, "Failed to retrieve SHA256 checksum, cannot verify. (Try --verify=no?)");
+                        goto finish;
+                } else if (j == p->signature_job)
+                        log_debug_errno(j->error, "Signature job for %s failed, proceeding for now.", j->url);
+                else if (j == p->settings_job)
                         log_info_errno(j->error, "Settings file could not be retrieved, proceeding without.");
-        } else if (j->error != 0 && j != i->signature_job) {
-                if (j == i->checksum_job)
-                        log_error_errno(j->error, "Failed to retrieve SHA256 checksum, cannot verify. (Try --verify=no?)");
+                else if (j == p->roothash_job)
+                        log_info_errno(j->error, "Root hash file could not be retrieved, proceeding without.");
+                else if (j == p->roothash_signature_job)
+                        log_info_errno(j->error, "Root hash signature file could not be retrieved, proceeding without.");
+                else if (j == p->verity_job)
+                        log_info_errno(j->error, "Verity integrity file could not be retrieved, proceeding without.");
                 else
-                        log_error_errno(j->error, "Failed to retrieve image file. (Wrong URL?)");
-
-                r = j->error;
-                goto finish;
+                        assert_not_reached();
         }
 
-        /* This is invoked if either the download completed
-         * successfully, or the download was skipped because we
-         * already have the etag. In this case ->etag_exists is
-         * true.
+        /* This is invoked if either the download completed successfully, or the download was skipped because
+         * we already have the etag. In this case ->etag_exists is true.
          *
-         * We only do something when we got all three files */
+         * We only do something when we got all files */
 
-        if (!raw_pull_is_done(i))
+        if (!raw_pull_is_done(p))
                 return;
 
-        if (i->signature_job && i->checksum_job->style == VERIFICATION_PER_DIRECTORY && i->signature_job->error != 0) {
-                log_error_errno(j->error, "Failed to retrieve signature file, cannot verify. (Try --verify=no?)");
+        if (p->signature_job && p->signature_job->error != 0) {
+                assert(p->checksum_job || p->raw_job);
 
-                r = i->signature_job->error;
+                r = log_error_errno(p->signature_job->error,
+                                    "Failed to retrieve signature file, cannot verify. (Try --verify=no?)");
                 goto finish;
         }
 
-        if (i->roothash_job)
-                i->roothash_job->disk_fd = safe_close(i->roothash_job->disk_fd);
-        if (i->settings_job)
-                i->settings_job->disk_fd = safe_close(i->settings_job->disk_fd);
+        PullJob *jj;
+        /* Let's close these auxiliary files now, we don't need access to them anymore. */
+        FOREACH_ARGUMENT(jj, p->settings_job, p->roothash_job, p->roothash_signature_job, p->verity_job)
+                pull_job_close_disk_fd(jj);
 
-        r = raw_pull_determine_path(i, ".raw", &i->final_path);
-        if (r < 0)
-                goto finish;
+        if (!p->raw_job->etag_exists) {
+                raw_pull_report_progress(p, RAW_VERIFYING);
 
-        if (!i->raw_job->etag_exists) {
-                /* This is a new download, verify it, and move it into place */
-                assert(i->raw_job->disk_fd >= 0);
-
-                raw_pull_report_progress(i, RAW_VERIFYING);
-
-                r = pull_verify(i->raw_job, i->roothash_job, i->settings_job, i->checksum_job, i->signature_job);
+                r = pull_verify(p->verify,
+                                p->raw_job,
+                                p->checksum_job,
+                                p->signature_job,
+                                p->settings_job,
+                                p->roothash_job,
+                                p->roothash_signature_job,
+                                p->verity_job);
                 if (r < 0)
                         goto finish;
-
-                raw_pull_report_progress(i, RAW_UNPACKING);
-
-                r = raw_pull_maybe_convert_qcow2(i);
-                if (r < 0)
-                        goto finish;
-
-                raw_pull_report_progress(i, RAW_FINALIZING);
-
-                r = import_make_read_only_fd(i->raw_job->disk_fd);
-                if (r < 0)
-                        goto finish;
-
-                r = rename_noreplace(AT_FDCWD, i->temp_path, AT_FDCWD, i->final_path);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to rename raw file to %s: %m", i->final_path);
-                        goto finish;
-                }
-
-                i->temp_path = mfree(i->temp_path);
-
-                if (i->roothash_job &&
-                    i->roothash_job->error == 0) {
-                        r = raw_pull_rename_auxiliary_file(i, ".roothash", &i->roothash_temp_path, &i->roothash_path);
-                        if (r < 0)
-                                goto finish;
-                }
-
-                if (i->settings_job &&
-                    i->settings_job->error == 0) {
-                        r = raw_pull_rename_auxiliary_file(i, ".nspawn", &i->settings_temp_path, &i->settings_path);
-                        if (r < 0)
-                                goto finish;
-                }
         }
 
-        raw_pull_report_progress(i, RAW_COPYING);
+        if (p->flags & IMPORT_DIRECT) {
+                assert(!p->settings_job);
+                assert(!p->roothash_job);
+                assert(!p->roothash_signature_job);
+                assert(!p->verity_job);
 
-        r = raw_pull_make_local_copy(i);
-        if (r < 0)
-                goto finish;
+                raw_pull_report_progress(p, RAW_FINALIZING);
+
+                if (p->local) {
+                        r = install_file(AT_FDCWD, p->local,
+                                         AT_FDCWD, NULL,
+                                         ((p->flags & IMPORT_READ_ONLY) && p->offset == UINT64_MAX ? INSTALL_READ_ONLY : 0) |
+                                         (p->flags & IMPORT_SYNC ? INSTALL_FSYNC_FULL : 0));
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to finalize raw file to '%s': %m", p->local);
+                                goto finish;
+                        }
+                }
+        } else {
+                r = raw_pull_determine_path(p, ".raw", &p->final_path);
+                if (r < 0)
+                        goto finish;
+
+                if (!p->raw_job->etag_exists) {
+                        /* This is a new download, verify it, and move it into place */
+
+                        assert(p->temp_path);
+                        assert(p->final_path);
+
+                        raw_pull_report_progress(p, RAW_UNPACKING);
+
+                        r = raw_pull_maybe_convert_qcow2(p);
+                        if (r < 0)
+                                goto finish;
+
+                        raw_pull_report_progress(p, RAW_FINALIZING);
+
+                        r = install_file(AT_FDCWD, p->temp_path,
+                                         AT_FDCWD, p->final_path,
+                                         (p->flags & IMPORT_PULL_KEEP_DOWNLOAD ? INSTALL_READ_ONLY : 0) |
+                                         (p->flags & IMPORT_SYNC ? INSTALL_FSYNC_FULL : 0));
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to move raw file to '%s': %m", p->final_path);
+                                goto finish;
+                        }
+
+                        p->temp_path = mfree(p->temp_path);
+
+                        if (p->settings_job &&
+                            p->settings_job->error == 0) {
+                                r = raw_pull_rename_auxiliary_file(p, ".nspawn", &p->settings_temp_path, &p->settings_path);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        if (p->roothash_job &&
+                            p->roothash_job->error == 0) {
+                                r = raw_pull_rename_auxiliary_file(p, ".roothash", &p->roothash_temp_path, &p->roothash_path);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        if (p->roothash_signature_job &&
+                            p->roothash_signature_job->error == 0) {
+                                r = raw_pull_rename_auxiliary_file(p, ".roothash.p7s", &p->roothash_signature_temp_path, &p->roothash_signature_path);
+                                if (r < 0)
+                                        goto finish;
+                        }
+
+                        if (p->verity_job &&
+                            p->verity_job->error == 0) {
+                                r = raw_pull_rename_auxiliary_file(p, ".verity", &p->verity_temp_path, &p->verity_path);
+                                if (r < 0)
+                                        goto finish;
+                        }
+                }
+
+                raw_pull_report_progress(p, RAW_COPYING);
+
+                r = raw_pull_make_local_copy(p);
+                if (r < 0)
+                        goto finish;
+        }
 
         r = 0;
 
 finish:
-        if (i->on_finished)
-                i->on_finished(i, r, i->userdata);
+        if (p->on_finished)
+                p->on_finished(p, r, p->userdata);
         else
-                sd_event_exit(i->event, r);
+                sd_event_exit(p->event, r);
 }
 
 static int raw_pull_job_on_open_disk_generic(
-                RawPull *i,
+                RawPull *p,
                 PullJob *j,
                 const char *extra,
-                char **temp_path) {
+                char **temp_path /* input + output */) {
 
         int r;
 
-        assert(i);
+        assert(p);
         assert(j);
         assert(extra);
         assert(temp_path);
 
+        assert(!FLAGS_SET(p->flags, IMPORT_DIRECT));
+
         if (!*temp_path) {
-                r = tempfn_random_child(i->image_root, extra, temp_path);
+                r = tempfn_random_child(p->image_root, extra, temp_path);
                 if (r < 0)
                         return log_oom();
         }
@@ -587,161 +693,267 @@ static int raw_pull_job_on_open_disk_generic(
 }
 
 static int raw_pull_job_on_open_disk_raw(PullJob *j) {
-        RawPull *i;
+        RawPull *p;
         int r;
 
         assert(j);
         assert(j->userdata);
 
-        i = j->userdata;
-        assert(i->raw_job == j);
+        p = j->userdata;
+        assert(p->raw_job == j);
+        assert(j->disk_fd < 0);
 
-        r = raw_pull_job_on_open_disk_generic(i, j, "raw", &i->temp_path);
-        if (r < 0)
-                return r;
+        if (p->flags & IMPORT_DIRECT) {
 
-        r = chattr_fd(j->disk_fd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s, ignoring: %m", i->temp_path);
+                if (!p->local) { /* If no local name specified, the pull job will write its data to stdout */
+                        j->disk_fd = STDOUT_FILENO;
+                        j->close_disk_fd = false;
+                        return 0;
+                }
+
+                (void) mkdir_parents_label(p->local, 0700);
+
+                j->disk_fd = open(p->local, O_RDWR|O_NOCTTY|O_CLOEXEC|(p->offset == UINT64_MAX ? O_TRUNC|O_CREAT : 0), 0664);
+                if (j->disk_fd < 0)
+                        return log_error_errno(errno, "Failed to open destination '%s': %m", p->local);
+
+                if (p->offset == UINT64_MAX)
+                        (void) import_set_nocow_and_log(j->disk_fd, p->local);
+
+        } else {
+                r = raw_pull_job_on_open_disk_generic(p, j, "raw", &p->temp_path);
+                if (r < 0)
+                        return r;
+
+                assert(p->offset == UINT64_MAX);
+                (void) import_set_nocow_and_log(j->disk_fd, p->temp_path);
+        }
 
         return 0;
 }
 
-static int raw_pull_job_on_open_disk_roothash(PullJob *j) {
-        RawPull *i;
+static int raw_pull_job_on_open_disk_settings(PullJob *j) {
+        RawPull *p;
 
         assert(j);
         assert(j->userdata);
 
-        i = j->userdata;
-        assert(i->roothash_job == j);
+        p = j->userdata;
+        assert(p->settings_job == j);
 
-        return raw_pull_job_on_open_disk_generic(i, j, "roothash", &i->roothash_temp_path);
+        return raw_pull_job_on_open_disk_generic(p, j, "settings", &p->settings_temp_path);
 }
 
-static int raw_pull_job_on_open_disk_settings(PullJob *j) {
-        RawPull *i;
+static int raw_pull_job_on_open_disk_roothash(PullJob *j) {
+        RawPull *p;
 
         assert(j);
         assert(j->userdata);
 
-        i = j->userdata;
-        assert(i->settings_job == j);
+        p = j->userdata;
+        assert(p->roothash_job == j);
 
-        return raw_pull_job_on_open_disk_generic(i, j, "settings", &i->settings_temp_path);
+        return raw_pull_job_on_open_disk_generic(p, j, "roothash", &p->roothash_temp_path);
+}
+
+static int raw_pull_job_on_open_disk_roothash_signature(PullJob *j) {
+        RawPull *p;
+
+        assert(j);
+        assert(j->userdata);
+
+        p = j->userdata;
+        assert(p->roothash_signature_job == j);
+
+        return raw_pull_job_on_open_disk_generic(p, j, "roothash.p7s", &p->roothash_signature_temp_path);
+}
+
+static int raw_pull_job_on_open_disk_verity(PullJob *j) {
+        RawPull *p;
+
+        assert(j);
+        assert(j->userdata);
+
+        p = j->userdata;
+        assert(p->verity_job == j);
+
+        return raw_pull_job_on_open_disk_generic(p, j, "verity", &p->verity_temp_path);
 }
 
 static void raw_pull_job_on_progress(PullJob *j) {
-        RawPull *i;
+        RawPull *p;
 
         assert(j);
         assert(j->userdata);
 
-        i = j->userdata;
+        p = j->userdata;
 
-        raw_pull_report_progress(i, RAW_DOWNLOADING);
+        raw_pull_report_progress(p, RAW_DOWNLOADING);
 }
 
 int raw_pull_start(
-                RawPull *i,
+                RawPull *p,
                 const char *url,
                 const char *local,
-                bool force_local,
+                uint64_t offset,
+                uint64_t size_max,
+                ImportFlags flags,
                 ImportVerify verify,
-                bool settings,
-                bool roothash) {
+                const struct iovec *checksum) {
 
         int r;
 
-        assert(i);
-        assert(verify < _IMPORT_VERIFY_MAX);
-        assert(verify >= 0);
+        assert(p);
+        assert(url);
+        assert(verify == _IMPORT_VERIFY_INVALID || verify < _IMPORT_VERIFY_MAX);
+        assert(verify == _IMPORT_VERIFY_INVALID || verify >= 0);
+        assert((verify < 0) || !iovec_is_set(checksum));
+        assert(!(flags & ~IMPORT_PULL_FLAGS_MASK_RAW));
+        assert(offset == UINT64_MAX || FLAGS_SET(flags, IMPORT_DIRECT));
+        assert(!(flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) || !(flags & IMPORT_DIRECT));
+        assert(!(flags & (IMPORT_PULL_SETTINGS|IMPORT_PULL_ROOTHASH|IMPORT_PULL_ROOTHASH_SIGNATURE|IMPORT_PULL_VERITY)) || !iovec_is_set(checksum));
 
-        if (!http_url_is_valid(url))
+        if (!http_url_is_valid(url) && !file_url_is_valid(url))
                 return -EINVAL;
 
-        if (local && !machine_name_is_valid(local))
+        if (local && !pull_validate_local(local, flags))
                 return -EINVAL;
 
-        if (i->raw_job)
+        if (p->raw_job)
                 return -EBUSY;
 
-        r = free_and_strdup(&i->local, local);
+        r = free_and_strdup(&p->local, local);
         if (r < 0)
                 return r;
 
-        i->force_local = force_local;
-        i->verify = verify;
-        i->settings = settings;
-        i->roothash = roothash;
+        p->flags = flags;
+        p->verify = verify;
 
         /* Queue job for the image itself */
-        r = pull_job_new(&i->raw_job, url, i->glue, i);
+        r = pull_job_new(&p->raw_job, url, p->glue, p);
         if (r < 0)
                 return r;
 
-        i->raw_job->on_finished = raw_pull_job_on_finished;
-        i->raw_job->on_open_disk = raw_pull_job_on_open_disk_raw;
-        i->raw_job->on_progress = raw_pull_job_on_progress;
-        i->raw_job->calc_checksum = verify != IMPORT_VERIFY_NO;
+        p->raw_job->on_finished = raw_pull_job_on_finished;
+        p->raw_job->on_open_disk = raw_pull_job_on_open_disk_raw;
 
-        r = pull_find_old_etags(url, i->image_root, DT_REG, ".raw-", ".raw", &i->raw_job->old_etags);
+        if (iovec_is_set(checksum)) {
+                if (!iovec_memdup(checksum, &p->raw_job->expected_checksum))
+                        return -ENOMEM;
+
+                p->raw_job->calc_checksum = true;
+        } else if (verify != IMPORT_VERIFY_NO) {
+                /* Calculate checksum of the main download unless the users asks for a SHA256SUM file or its
+                 * signature, which we let gpg verify instead. */
+
+                r = pull_url_needs_checksum(url);
+                if (r < 0)
+                        return r;
+
+                p->raw_job->calc_checksum = r;
+                p->raw_job->force_memory = !r; /* make sure this is both written to disk if that's
+                                                * requested and into memory, since we need to verify it */
+        }
+
+        if (size_max != UINT64_MAX)
+                p->raw_job->uncompressed_max = size_max;
+        if (offset != UINT64_MAX)
+                p->raw_job->offset = p->offset = offset;
+
+        if (!FLAGS_SET(flags, IMPORT_DIRECT)) {
+                r = pull_find_old_etags(url, p->image_root, DT_REG, ".raw-", ".raw", &p->raw_job->old_etags);
+                if (r < 0)
+                        return r;
+        }
+
+        r = pull_make_verification_jobs(
+                        &p->checksum_job,
+                        &p->signature_job,
+                        verify,
+                        url,
+                        p->glue,
+                        raw_pull_job_on_finished,
+                        p);
         if (r < 0)
                 return r;
 
-        if (roothash) {
-                r = pull_make_auxiliary_job(&i->roothash_job, url, raw_strip_suffixes, ".roothash", i->glue, raw_pull_job_on_finished, i);
-                if (r < 0)
-                        return r;
-
-                i->roothash_job->on_open_disk = raw_pull_job_on_open_disk_roothash;
-                i->roothash_job->on_progress = raw_pull_job_on_progress;
-                i->roothash_job->calc_checksum = verify != IMPORT_VERIFY_NO;
-        }
-
-        if (settings) {
-                r = pull_make_auxiliary_job(&i->settings_job, url, raw_strip_suffixes, ".nspawn", i->glue, raw_pull_job_on_finished, i);
-                if (r < 0)
-                        return r;
-
-                i->settings_job->on_open_disk = raw_pull_job_on_open_disk_settings;
-                i->settings_job->on_progress = raw_pull_job_on_progress;
-                i->settings_job->calc_checksum = verify != IMPORT_VERIFY_NO;
-        }
-
-        r = pull_make_verification_jobs(&i->checksum_job, &i->signature_job, verify, url, i->glue, raw_pull_job_on_finished, i);
-        if (r < 0)
-                return r;
-
-        r = pull_job_begin(i->raw_job);
-        if (r < 0)
-                return r;
-
-        if (i->roothash_job) {
-                r = pull_job_begin(i->roothash_job);
+        if (FLAGS_SET(flags, IMPORT_PULL_SETTINGS)) {
+                r = pull_make_auxiliary_job(
+                                &p->settings_job,
+                                url,
+                                raw_strip_suffixes,
+                                ".nspawn",
+                                verify,
+                                p->glue,
+                                raw_pull_job_on_open_disk_settings,
+                                raw_pull_job_on_finished,
+                                p);
                 if (r < 0)
                         return r;
         }
 
-        if (i->settings_job) {
-                r = pull_job_begin(i->settings_job);
+        if (FLAGS_SET(flags, IMPORT_PULL_ROOTHASH)) {
+                r = pull_make_auxiliary_job(
+                                &p->roothash_job,
+                                url,
+                                raw_strip_suffixes,
+                                ".roothash",
+                                verify,
+                                p->glue,
+                                raw_pull_job_on_open_disk_roothash,
+                                raw_pull_job_on_finished,
+                                p);
                 if (r < 0)
                         return r;
         }
 
-        if (i->checksum_job) {
-                i->checksum_job->on_progress = raw_pull_job_on_progress;
-                i->checksum_job->style = VERIFICATION_PER_FILE;
-
-                r = pull_job_begin(i->checksum_job);
+        if (FLAGS_SET(flags, IMPORT_PULL_ROOTHASH_SIGNATURE)) {
+                r = pull_make_auxiliary_job(
+                                &p->roothash_signature_job,
+                                url,
+                                raw_strip_suffixes,
+                                ".roothash.p7s",
+                                verify,
+                                p->glue,
+                                raw_pull_job_on_open_disk_roothash_signature,
+                                raw_pull_job_on_finished,
+                                p);
                 if (r < 0)
                         return r;
         }
 
-        if (i->signature_job) {
-                i->signature_job->on_progress = raw_pull_job_on_progress;
+        if (FLAGS_SET(flags, IMPORT_PULL_VERITY)) {
+                r = pull_make_auxiliary_job(
+                                &p->verity_job,
+                                url,
+                                raw_strip_suffixes,
+                                ".verity",
+                                verify,
+                                p->glue,
+                                raw_pull_job_on_open_disk_verity,
+                                raw_pull_job_on_finished,
+                                p);
+                if (r < 0)
+                        return r;
+        }
 
-                r = pull_job_begin(i->signature_job);
+        PullJob *j;
+        FOREACH_ARGUMENT(j,
+                         p->raw_job,
+                         p->checksum_job,
+                         p->signature_job,
+                         p->settings_job,
+                         p->roothash_job,
+                         p->roothash_signature_job,
+                         p->verity_job) {
+
+                if (!j)
+                        continue;
+
+                j->on_progress = raw_pull_job_on_progress;
+                j->sync = FLAGS_SET(flags, IMPORT_SYNC);
+
+                r = pull_job_begin(j);
                 if (r < 0)
                         return r;
         }

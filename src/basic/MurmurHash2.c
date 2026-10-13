@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LicenseRef-murmurhash2-public-domain */
 //-----------------------------------------------------------------------------
 // MurmurHash2 was written by Austin Appleby, and is placed in the public
 // domain. The author hereby disclaims copyright to this source code.
@@ -15,9 +16,7 @@
 
 #include "MurmurHash2.h"
 
-#if __GNUC__ >= 7
 _Pragma("GCC diagnostic ignored \"-Wimplicit-fallthrough\"")
-#endif
 
 //-----------------------------------------------------------------------------
 // Platform-specific functions and macros

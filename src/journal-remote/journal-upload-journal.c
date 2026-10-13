@@ -1,16 +1,15 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <curl/curl.h>
-#include <stdbool.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-daemon.h"
+#include "sd-event.h"
+#include "sd-journal.h"
 
 #include "alloc-util.h"
 #include "journal-upload.h"
 #include "log.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "utf8.h"
-#include "util.h"
 
 /**
  * Write up to size bytes to buf. Return negative on error, and number of
@@ -24,11 +23,16 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
         for (;;) {
 
-                switch(u->entry_state) {
+                switch (u->entry_state) {
                 case ENTRY_CURSOR: {
                         u->current_cursor = mfree(u->current_cursor);
 
                         r = sd_journal_get_cursor(u->journal, &u->current_cursor);
+                        if (r == -EBADMSG) {
+                                log_debug("Encountered bad or partially written entry while acquiring cursor, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to get cursor: %m");
 
@@ -54,6 +58,11 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         usec_t realtime;
 
                         r = sd_journal_get_realtime_usec(u->journal, &realtime);
+                        if (r == -EBADMSG) {
+                                log_debug("Encountered bad or partially written realtime timestamp, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to get realtime timestamp: %m");
 
@@ -80,6 +89,11 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         sd_id128_t boot_id;
 
                         r = sd_journal_get_monotonic_usec(u->journal, &monotonic, &boot_id);
+                        if (r == -EBADMSG) {
+                                log_debug("Encountered bad or partially written monotonic timestamp, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
@@ -103,14 +117,18 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         _fallthrough_;
                 case ENTRY_BOOT_ID: {
                         sd_id128_t boot_id;
-                        char sid[33];
 
-                        r = sd_journal_get_monotonic_usec(u->journal, NULL, &boot_id);
+                        r = sd_journal_get_monotonic_usec(u->journal, /* ret_monotonic= */ NULL, &boot_id);
+                        if (r == -EBADMSG) {
+                                log_debug("Encountered bad or partially written boot ID, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
                         r = snprintf(buf + pos, size - pos,
-                                     "_BOOT_ID=%s\n", sd_id128_to_string(boot_id, sid));
+                                     "_BOOT_ID=%s\n", SD_ID128_TO_STRING(boot_id));
                         assert(r >= 0);
                         if ((size_t) r > size - pos)
                                 /* not enough space */
@@ -133,9 +151,14 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         r = sd_journal_enumerate_data(u->journal,
                                                       &u->field_data,
                                                       &u->field_length);
+                        if (r == -EBADMSG) {
+                                log_debug("Encountered bad or partially written data field, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
                         if (r < 0)
                                 return log_error_errno(r, "Failed to move to next field in entry: %m");
-                        else if (r == 0) {
+                        if (r == 0) {
                                 u->entry_state = ENTRY_OUTRO;
                                 continue;
                         }
@@ -173,10 +196,10 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                                 pos += tocopy + 1;
                                 u->entry_state = ENTRY_NEW_FIELD;
                                 continue;
-                        } else {
-                                u->field_pos += tocopy;
-                                return size;
                         }
+
+                        u->field_pos += tocopy;
+                        return size;
                 }
 
                 case ENTRY_BINARY_FIELD_START: {
@@ -184,9 +207,11 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         size_t len;
 
                         c = memchr(u->field_data, '=', u->field_length);
-                        if (!c || c == u->field_data)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Invalid field.");
+                        if (!c || c == u->field_data) {
+                                log_debug("Encountered field without '='. Assuming field is still being written, leaving.");
+                                u->entry_state = ENTRY_OUTRO;
+                                continue;
+                        }
 
                         len = c - (const char*)u->field_data;
 
@@ -200,8 +225,9 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         u->field_pos = len + 1;
                         u->entry_state++;
-                }
+
                         _fallthrough_;
+                }
                 case ENTRY_BINARY_FIELD_SIZE: {
                         uint64_t le64;
 
@@ -229,10 +255,10 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         return pos;
 
                 default:
-                        assert_not_reached("WTF?");
+                        assert_not_reached();
                 }
         }
-        assert_not_reached("WTF?");
+        assert_not_reached();
 }
 
 static void check_update_watchdog(Uploader *u) {
@@ -252,26 +278,31 @@ static void check_update_watchdog(Uploader *u) {
 }
 
 static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void *userp) {
-        Uploader *u = userp;
+        Uploader *u = ASSERT_PTR(userp);
+        _cleanup_free_ char *compression_buffer = NULL;
         int r;
         sd_journal *j;
         size_t filled = 0;
         ssize_t w;
 
-        assert(u);
         assert(nmemb <= SSIZE_MAX / size);
 
         check_update_watchdog(u);
 
         j = u->journal;
 
+        if (u->compression) {
+                compression_buffer = malloc_multiply(nmemb, size);
+                if (!compression_buffer) {
+                        log_oom();
+                        return CURL_READFUNC_ABORT;
+                }
+        }
+
         while (j && filled < size * nmemb) {
                 if (u->entry_state == ENTRY_DONE) {
                         r = sd_journal_next(j);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to move to next entry in journal: %m");
-                                return CURL_READFUNC_ABORT;
-                        } else if (r == 0) {
+                        if (r == 0) {
                                 if (u->input_event)
                                         log_debug("No more entries, waiting for journal.");
                                 else {
@@ -280,14 +311,27 @@ static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void 
                                 }
 
                                 u->uploading = false;
-
                                 break;
                         }
+                        if (r == -EBADMSG) {
+                                if (u->input_event)
+                                        log_debug("Read bad or partially written entry, waiting for journal.");
+                                else {
+                                        log_info("Read bad or partially written entry, waiting for journal.");
+                                        close_journal_input(u);
+                                }
 
+                                u->uploading = false;
+                                break;
+                        }
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to move to next entry in journal: %m");
+                                return CURL_READFUNC_ABORT;
+                        }
                         u->entry_state = ENTRY_CURSOR;
                 }
 
-                w = write_entry((char*)buf + filled, size * nmemb - filled, u);
+                w = write_entry((compression_buffer ?: (char*) buf) + filled, size * nmemb - filled, u);
                 if (w < 0)
                         return CURL_READFUNC_ABORT;
                 filled += w;
@@ -301,6 +345,19 @@ static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void 
 
                 log_debug("Entry %zu (%s) has been uploaded.",
                           u->entries_sent, u->current_cursor);
+        }
+
+        if (filled > 0 && u->compression) {
+                size_t compressed_size;
+                r = compress_blob(u->compression->algorithm, compression_buffer, filled, buf, size * nmemb, &compressed_size, u->compression->level);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to compress %zu bytes by %s with level %i: %m",
+                                        filled, compression_to_string(u->compression->algorithm), u->compression->level);
+                        return CURL_READFUNC_ABORT;
+                }
+
+                assert(compressed_size <= size * nmemb);
+                return compressed_size;
         }
 
         return filled;
@@ -357,9 +414,7 @@ static int dispatch_journal_input(sd_event_source *event,
                                   int fd,
                                   uint32_t revents,
                                   void *userp) {
-        Uploader *u = userp;
-
-        assert(u);
+        Uploader *u = ASSERT_PTR(userp);
 
         if (u->uploading)
                 return 0;
@@ -393,13 +448,13 @@ int open_journal_for_upload(Uploader *u,
                 else
                         u->timeout = JOURNAL_UPLOAD_POLL_TIMEOUT;
 
-                r = sd_event_add_io(u->events, &u->input_event,
+                r = sd_event_add_io(u->event, &u->input_event,
                                     fd, events, dispatch_journal_input, u);
                 if (r < 0)
                         return log_error_errno(r, "Failed to register input event: %m");
 
                 log_debug("Listening for journal events on fd:%d, timeout %d",
-                          fd, u->timeout == (uint64_t) -1 ? -1 : (int) u->timeout);
+                          fd, u->timeout == UINT64_MAX ? -1 : (int) u->timeout);
         } else
                 log_debug("Not listening for journal events.");
 
@@ -410,5 +465,5 @@ int open_journal_for_upload(Uploader *u,
                                                cursor);
         }
 
-        return process_journal_input(u, 1 + !!after_cursor);
+        return process_journal_input(u, !!after_cursor);
 }

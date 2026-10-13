@@ -1,25 +1,24 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-netlink.h"
 
+#include "af-list.h"
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "firewall-util.h"
 #include "in-addr-util.h"
 #include "local-addresses.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "nspawn-expose-ports.h"
 #include "parse-util.h"
 #include "socket-util.h"
 #include "string-util.h"
-#include "util.h"
 
 int expose_port_parse(ExposePort **l, const char *s) {
-
         const char *split, *e;
         uint16_t container_port, host_port;
+        ExposePort *port;
         int protocol;
-        ExposePort *p;
         int r;
 
         assert(l);
@@ -52,75 +51,72 @@ int expose_port_parse(ExposePort **l, const char *s) {
         }
 
         if (r < 0)
-                return -EINVAL;
+                return r;
 
         LIST_FOREACH(ports, p, *l)
                 if (p->protocol == protocol && p->host_port == host_port)
                         return -EEXIST;
 
-        p = new(ExposePort, 1);
-        if (!p)
+        port = new(ExposePort, 1);
+        if (!port)
                 return -ENOMEM;
 
-        p->protocol = protocol;
-        p->host_port = host_port;
-        p->container_port = container_port;
+        *port = (ExposePort) {
+                .protocol = protocol,
+                .host_port = host_port,
+                .container_port = container_port,
+        };
 
-        LIST_PREPEND(ports, *l, p);
+        LIST_PREPEND(ports, *l, port);
 
         return 0;
 }
 
 void expose_port_free_all(ExposePort *p) {
-
-        while (p) {
-                ExposePort *q = p;
-                LIST_REMOVE(ports, p, q);
-                free(q);
-        }
+        LIST_CLEAR(ports, p, free);
 }
 
-int expose_port_flush(ExposePort* l, union in_addr_union *exposed) {
-        ExposePort *p;
-        int r, af = AF_INET;
+int expose_port_flush(sd_netlink *nfnl, ExposePort* l, int af, union in_addr_union *exposed) {
+        int r;
 
+        assert(IN_SET(af, AF_INET, AF_INET6));
         assert(exposed);
 
-        if (!l)
+        if (!nfnl || !l)
                 return 0;
 
-        if (in_addr_is_null(af, exposed))
+        if (!in_addr_is_set(af, exposed))
                 return 0;
 
         log_debug("Lost IP address.");
 
         LIST_FOREACH(ports, p, l) {
-                r = fw_add_local_dnat(false,
-                                      af,
-                                      p->protocol,
-                                      NULL,
-                                      NULL, 0,
-                                      NULL, 0,
-                                      p->host_port,
-                                      exposed,
-                                      p->container_port,
-                                      NULL);
+                r = fw_nftables_add_local_dnat(
+                                nfnl,
+                                /* add= */ false,
+                                af,
+                                p->protocol,
+                                p->host_port,
+                                exposed,
+                                p->container_port,
+                                /* previous_remote= */ NULL);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to modify firewall: %m");
+                        log_warning_errno(r, "Failed to modify %s firewall: %m", af_to_name(af));
         }
 
         *exposed = IN_ADDR_NULL;
         return 0;
 }
 
-int expose_port_execute(sd_netlink *rtnl, ExposePort *l, union in_addr_union *exposed) {
+int expose_port_execute(sd_netlink *rtnl, sd_netlink *nfnl, ExposePort *l, int af, union in_addr_union *exposed) {
         _cleanup_free_ struct local_address *addresses = NULL;
-        _cleanup_free_ char *pretty = NULL;
         union in_addr_union new_exposed;
-        ExposePort *p;
         bool add;
-        int af = AF_INET, r;
+        int r;
 
+        assert(rtnl);
+        assert(nfnl);
+        assert(IN_SET(af, AF_INET, AF_INET6));
         assert(exposed);
 
         /* Invoked each time an address is added or removed inside the
@@ -138,29 +134,26 @@ int expose_port_execute(sd_netlink *rtnl, ExposePort *l, union in_addr_union *ex
                 addresses[0].scope < RT_SCOPE_LINK;
 
         if (!add)
-                return expose_port_flush(l, exposed);
+                return expose_port_flush(nfnl, l, af, exposed);
 
         new_exposed = addresses[0].address;
         if (in_addr_equal(af, exposed, &new_exposed))
                 return 0;
 
-        in_addr_to_string(af, &new_exposed, &pretty);
-        log_debug("New container IP is %s.", strna(pretty));
+        log_debug("New container IP is %s.", IN_ADDR_TO_STRING(af, &new_exposed));
 
         LIST_FOREACH(ports, p, l) {
-
-                r = fw_add_local_dnat(true,
-                                      af,
-                                      p->protocol,
-                                      NULL,
-                                      NULL, 0,
-                                      NULL, 0,
-                                      p->host_port,
-                                      &new_exposed,
-                                      p->container_port,
-                                      in_addr_is_null(af, exposed) ? NULL : exposed);
+                r = fw_nftables_add_local_dnat(
+                                nfnl,
+                                /* add= */ true,
+                                af,
+                                p->protocol,
+                                p->host_port,
+                                &new_exposed,
+                                p->container_port,
+                                in_addr_is_set(af, exposed) ? exposed : NULL);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to modify firewall: %m");
+                        log_warning_errno(r, "Failed to modify %s firewall: %m", af_to_name(af));
         }
 
         *exposed = new_exposed;
@@ -168,12 +161,12 @@ int expose_port_execute(sd_netlink *rtnl, ExposePort *l, union in_addr_union *ex
 }
 
 int expose_port_send_rtnl(int send_fd) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(send_fd >= 0);
 
-        fd = socket(PF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_ROUTE);
+        fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_ROUTE);
         if (fd < 0)
                 return log_error_errno(errno, "Failed to allocate container netlink: %m");
 
@@ -190,7 +183,7 @@ int expose_port_watch_rtnl(
                 sd_event *event,
                 int recv_fd,
                 sd_netlink_message_handler_t handler,
-                union in_addr_union *exposed,
+                void *userdata,
                 sd_netlink **ret) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         int fd, r;
@@ -209,11 +202,11 @@ int expose_port_watch_rtnl(
                 return log_error_errno(r, "Failed to create rtnl object: %m");
         }
 
-        r = sd_netlink_add_match(rtnl, NULL, RTM_NEWADDR, handler, NULL, exposed, "nspawn-NEWADDR");
+        r = sd_netlink_add_match(rtnl, NULL, RTM_NEWADDR, handler, NULL, userdata, "nspawn-NEWADDR");
         if (r < 0)
                 return log_error_errno(r, "Failed to subscribe to RTM_NEWADDR messages: %m");
 
-        r = sd_netlink_add_match(rtnl, NULL, RTM_DELADDR, handler, NULL, exposed, "nspawn-DELADDR");
+        r = sd_netlink_add_match(rtnl, NULL, RTM_DELADDR, handler, NULL, userdata, "nspawn-DELADDR");
         if (r < 0)
                 return log_error_errno(r, "Failed to subscribe to RTM_DELADDR messages: %m");
 

@@ -1,109 +1,233 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
+#include <stdlib.h>
 
 #include "alloc-util.h"
 #include "extract-word.h"
 #include "fileio.h"
-#include "macro.h"
+#include "initrd-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "proc-cmdline.h"
 #include "process-util.h"
-#include "special.h"
 #include "string-util.h"
-#include "util.h"
+#include "strv.h"
 #include "virt.h"
 
-int proc_cmdline(char **ret) {
-        const char *e;
+typedef enum ArgType {
+        no_argument,
+        required_argument,
+        optional_argument,
+} ArgType;
+
+int proc_cmdline_filter_pid1_args(char **argv, char ***ret) {
+        const struct {
+                const char *name;
+                ArgType has_arg;
+        } options[] = {
+                { "log-level",                required_argument },
+                { "log-target",               required_argument },
+                { "log-color",                optional_argument },
+                { "log-location",             optional_argument },
+                { "log-time",                 optional_argument },
+                { "unit",                     required_argument },
+                { "system",                   no_argument,      },
+                { "user",                     no_argument,      },
+                { "test",                     no_argument,      },
+                { "no-pager",                 no_argument,      },
+                { "help",                     no_argument,      },
+                { "version",                  no_argument,      },
+                { "introspect-cli",           no_argument,      },
+                { "dump-configuration-items", no_argument,      },
+                { "dump-bus-properties",      no_argument,      },
+                { "bus-introspect",           required_argument },
+                { "dump-core",                optional_argument },
+                { "crash-chvt",               required_argument },
+                { "crash-vt",                 required_argument },
+                { "crash-shell",              optional_argument },
+                { "crash-reboot",             optional_argument },
+                { "crash-action",             required_argument },
+                { "confirm-spawn",            optional_argument },
+                { "show-status",              optional_argument },
+                { "deserialize",              required_argument },
+                { "switched-root",            no_argument,      },
+                { "default-standard-output",  required_argument },
+                { "default-standard-error",   required_argument },
+                { "machine-id",               required_argument },
+                { "service-watchdogs",        required_argument },
+                { "exit-code",                required_argument },
+                { "timeout",                  required_argument },
+        };
+        const char *short_options = "hDbsz:";
+
+        _cleanup_strv_free_ char **filtered = NULL;
+        int state, r;
+
+        assert(argv);
         assert(ret);
 
-        /* For testing purposes it is sometimes useful to be able to override what we consider /proc/cmdline to be */
-        e = secure_getenv("SYSTEMD_PROC_CMDLINE");
-        if (e) {
-                char *m;
+        /* Currently, we do not support '-', '+', and ':' at the beginning. */
+        assert(!IN_SET(short_options[0], '-', '+', ':'));
 
-                m = strdup(e);
-                if (!m)
-                        return -ENOMEM;
+        /* Filter out all known options. */
+        state = no_argument;
+        STRV_FOREACH(p, strv_skip(argv, 1)) {
+                int prev_state = state;
+                const char *a = *p;
 
-                *ret = m;
-                return 0;
-        }
+                /* Reset the state for the next step. */
+                state = no_argument;
 
-        if (detect_container() > 0)
-                return get_process_cmdline(1, SIZE_MAX, 0, ret);
-        else
-                return read_one_line_file("/proc/cmdline", ret);
-}
+                if (prev_state == required_argument ||
+                    (prev_state == optional_argument && a[0] != '-'))
+                        /* Handled as an argument of the previous option, filtering out the string. */
+                        continue;
 
-static int proc_cmdline_extract_first(const char **p, char **ret_word, ProcCmdlineFlags flags) {
-        const char *q = *p;
-        int r;
+                if (a[0] != '-') {
+                        /* Not an option, accepting the string. */
+                        r = strv_extend(&filtered, a);
+                        if (r < 0)
+                                return r;
+                        continue;
+                }
 
-        for (;;) {
-                _cleanup_free_ char *word = NULL;
-                const char *c;
-
-                r = extract_first_word(&q, &word, NULL, EXTRACT_QUOTES|EXTRACT_RELAX);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                /* Filter out arguments that are intended only for the initrd */
-                c = startswith(word, "rd.");
-                if (c) {
-                        if (!in_initrd())
-                                continue;
-
-                        if (FLAGS_SET(flags, PROC_CMDLINE_STRIP_RD_PREFIX)) {
-                                r = free_and_strdup(&word, c);
+                if (a[1] == '-') {
+                        if (a[2] == '\0') {
+                                /* "--" is specified, accepting remaining strings. */
+                                r = strv_extend_strv(&filtered, strv_skip(p, 1), /* filter_duplicates= */ false);
                                 if (r < 0)
                                         return r;
+                                break;
                         }
 
-                } else if (FLAGS_SET(flags, PROC_CMDLINE_RD_STRICT) && in_initrd())
-                        continue; /* And optionally filter out arguments that are intended only for the host */
+                        /* long option, e.g. --foo */
+                        FOREACH_ELEMENT(option, options) {
+                                const char *q = startswith(a + 2, option->name);
+                                if (!q || !IN_SET(q[0], '=', '\0'))
+                                        continue;
 
-                *p = q;
-                *ret_word = TAKE_PTR(word);
-                return 1;
+                                /* Found matching option, updating the state if necessary. */
+                                if (q[0] == '\0' && option->has_arg == required_argument)
+                                        state = required_argument;
+
+                                break;
+                        }
+                        continue;
+                }
+
+                /* short option(s), e.g. -x or -xyz */
+                while (a && *++a != '\0')
+                        for (const char *q = short_options; *q != '\0'; q++) {
+                                if (*q != *a)
+                                        continue;
+
+                                /* Found matching short option. */
+
+                                if (q[1] == ':') {
+                                        /* An argument is required or optional, and remaining part
+                                         * is handled as argument if exists. */
+                                        state = a[1] != '\0' ? no_argument :
+                                                q[2] == ':' ? optional_argument : required_argument;
+
+                                        a = NULL; /* Not necessary to parse remaining part. */
+                                }
+                                break;
+                        }
         }
 
-        *p = q;
-        *ret_word = NULL;
+        *ret = TAKE_PTR(filtered);
         return 0;
 }
 
-int proc_cmdline_parse_given(const char *line, proc_cmdline_parse_t parse_item, void *data, ProcCmdlineFlags flags) {
-        const char *p;
+int proc_cmdline(char **ret) {
+        assert(ret);
+
+        /* For testing purposes it is sometimes useful to be able to override what we consider /proc/cmdline to be */
+        const char *e = secure_getenv("SYSTEMD_PROC_CMDLINE");
+        if (e)
+                return strdup_to(ret, e);
+
+        if (detect_container() > 0)
+                return pid_get_cmdline(1, SIZE_MAX, 0, ret);
+
+        return read_full_file("/proc/cmdline", ret, /* ret_size= */  NULL);
+}
+
+static int proc_cmdline_strv_internal(char ***ret, bool filter_pid1_args) {
+        int r;
+
+        assert(ret);
+
+        /* For testing purposes it is sometimes useful to be able to override what we consider /proc/cmdline to be */
+        const char *e = secure_getenv("SYSTEMD_PROC_CMDLINE");
+        if (e)
+                return strv_split_full(ret, e, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX|EXTRACT_RETAIN_ESCAPE);
+
+        if (detect_container() > 0) {
+                _cleanup_strv_free_ char **args = NULL;
+
+                r = pid_get_cmdline_strv(1, /* flags= */ 0, &args);
+                if (r < 0)
+                        return r;
+
+                if (filter_pid1_args)
+                        return proc_cmdline_filter_pid1_args(args, ret);
+
+                *ret = TAKE_PTR(args);
+                return 0;
+
+        } else {
+                _cleanup_free_ char *s = NULL;
+
+                r = read_full_file("/proc/cmdline", &s, NULL);
+                if (r < 0)
+                        return r;
+
+                return strv_split_full(ret, s, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX|EXTRACT_RETAIN_ESCAPE);
+        }
+}
+
+int proc_cmdline_strv(char ***ret) {
+        return proc_cmdline_strv_internal(ret, /* filter_pid1_args= */ false);
+}
+
+static char *mangle_word(const char *word, ProcCmdlineFlags flags) {
+        char *c = (char*) startswith(word, "rd.");
+        if (c) {
+                /* Filter out arguments that are intended only for the initrd */
+
+                if (!in_initrd())
+                        return NULL;
+
+                if (FLAGS_SET(flags, PROC_CMDLINE_STRIP_RD_PREFIX))
+                        return c;
+
+        } else if (FLAGS_SET(flags, PROC_CMDLINE_RD_STRICT) && in_initrd())
+                /* And optionally filter out arguments that are intended only for the host */
+                return NULL;
+
+        return (char*) word;
+}
+
+#define mangle_word(word, flags) const_generic(word, mangle_word(word, flags))
+
+static int proc_cmdline_parse_strv(char **args, proc_cmdline_parse_t parse_item, void *data, ProcCmdlineFlags flags) {
         int r;
 
         assert(parse_item);
 
-        /* The PROC_CMDLINE_VALUE_OPTIONAL flag doesn't really make sense for proc_cmdline_parse(), let's make this
-         * clear. */
-        assert(!FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL));
+        STRV_FOREACH(word, args) {
+                char *key, *value;
 
-        p = line;
-        for (;;) {
-                _cleanup_free_ char *word = NULL;
-                char *value;
+                key = mangle_word(*word, flags);
+                if (!key)
+                        continue;
 
-                r = proc_cmdline_extract_first(&p, &word, flags);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                value = strchr(word, '=');
+                value = strchr(key, '=');
                 if (value)
-                        *(value++) = 0;
+                        *(value++) = '\0';
 
-                r = parse_item(word, value, data);
+                r = parse_item(key, value, data);
                 if (r < 0)
                         return r;
         }
@@ -112,16 +236,20 @@ int proc_cmdline_parse_given(const char *line, proc_cmdline_parse_t parse_item, 
 }
 
 int proc_cmdline_parse(proc_cmdline_parse_t parse_item, void *data, ProcCmdlineFlags flags) {
-        _cleanup_free_ char *line = NULL;
+        _cleanup_strv_free_ char **args = NULL;
         int r;
 
         assert(parse_item);
 
-        r = proc_cmdline(&line);
+        /* The PROC_CMDLINE_VALUE_OPTIONAL and PROC_CMDLINE_TRUE_WHEN_MISSING flags don't really make sense
+         * for proc_cmdline_parse(), let's make this clear. */
+        assert(!(flags & (PROC_CMDLINE_VALUE_OPTIONAL|PROC_CMDLINE_TRUE_WHEN_MISSING)));
+
+        r = proc_cmdline_strv_internal(&args, /* filter_pid1_args= */ true);
         if (r < 0)
                 return r;
 
-        return proc_cmdline_parse_given(line, parse_item, data, flags);
+        return proc_cmdline_parse_strv(args, parse_item, data, flags);
 }
 
 static bool relaxed_equal_char(char a, char b) {
@@ -130,7 +258,7 @@ static bool relaxed_equal_char(char a, char b) {
                 (a == '-' && b == '_');
 }
 
-char *proc_cmdline_key_startswith(const char *s, const char *prefix) {
+char* proc_cmdline_key_startswith(const char *s, const char *prefix) {
         assert(s);
         assert(prefix);
 
@@ -156,10 +284,53 @@ bool proc_cmdline_key_streq(const char *x, const char *y) {
         return true;
 }
 
-int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_value) {
-        _cleanup_free_ char *line = NULL, *ret = NULL;
+static int cmdline_get_key(char **args, const char *key, ProcCmdlineFlags flags, char **ret_value) {
+        _cleanup_free_ char *v = NULL;
         bool found = false;
-        const char *p;
+        int r;
+
+        assert(key);
+
+        STRV_FOREACH(p, args) {
+                const char *word;
+
+                word = mangle_word(*p, flags);
+                if (!word)
+                        continue;
+
+                if (ret_value) {
+                        const char *e;
+
+                        e = proc_cmdline_key_startswith(word, key);
+                        if (!e)
+                                continue;
+
+                        if (*e == '=') {
+                                r = free_and_strdup(&v, e+1);
+                                if (r < 0)
+                                        return r;
+
+                                found = true;
+
+                        } else if (*e == 0 && FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL))
+                                found = true;
+
+                } else {
+                        if (proc_cmdline_key_streq(word, key)) {
+                                found = true;
+                                break; /* we found what we were looking for */
+                        }
+                }
+        }
+
+        if (ret_value)
+                *ret_value = TAKE_PTR(v);
+
+        return found;
+}
+
+int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_value) {
+        _cleanup_strv_free_ char **args = NULL;
         int r;
 
         /* Looks for a specific key on the kernel command line. Supports three modes:
@@ -175,189 +346,110 @@ int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_val
          *
          * In all three cases, > 0 is returned if the key is found, 0 if not. */
 
+        /* PROC_CMDLINE_TRUE_WHEN_MISSING doesn't really make sense for proc_cmdline_get_key(). */
+        assert(!FLAGS_SET(flags, PROC_CMDLINE_TRUE_WHEN_MISSING));
+
         if (isempty(key))
                 return -EINVAL;
 
         if (FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL) && !ret_value)
                 return -EINVAL;
 
-        r = proc_cmdline(&line);
+        r = proc_cmdline_strv_internal(&args, /* filter_pid1_args= */ true);
         if (r < 0)
                 return r;
 
-        p = line;
-        for (;;) {
-                _cleanup_free_ char *word = NULL;
-
-                r = proc_cmdline_extract_first(&p, &word, flags);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                if (ret_value) {
-                        const char *e;
-
-                        e = proc_cmdline_key_startswith(word, key);
-                        if (!e)
-                                continue;
-
-                        if (*e == '=') {
-                                r = free_and_strdup(&ret, e+1);
-                                if (r < 0)
-                                        return r;
-
-                                found = true;
-
-                        } else if (*e == 0 && FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL))
-                                found = true;
-
-                } else {
-                        if (streq(word, key)) {
-                                found = true;
-                                break; /* we found what we were looking for */
-                        }
-                }
-        }
-
-        if (ret_value)
-                *ret_value = TAKE_PTR(ret);
-
-        return found;
+        return cmdline_get_key(args, key, flags, ret_value);
 }
 
-int proc_cmdline_get_bool(const char *key, bool *ret) {
+int proc_cmdline_get_bool(const char *key, ProcCmdlineFlags flags, bool *ret) {
         _cleanup_free_ char *v = NULL;
         int r;
 
         assert(ret);
 
-        r = proc_cmdline_get_key(key, PROC_CMDLINE_VALUE_OPTIONAL, &v);
+        r = proc_cmdline_get_key(key, (flags & ~PROC_CMDLINE_TRUE_WHEN_MISSING) | PROC_CMDLINE_VALUE_OPTIONAL, &v);
         if (r < 0)
                 return r;
-        if (r == 0) {
-                *ret = false;
+        if (r == 0) { /* key not specified at all */
+                *ret = FLAGS_SET(flags, PROC_CMDLINE_TRUE_WHEN_MISSING);
                 return 0;
         }
 
-        if (v) { /* parameter passed */
+        if (v) { /* key with parameter passed */
                 r = parse_boolean(v);
                 if (r < 0)
                         return r;
                 *ret = r;
-        } else /* no parameter passed */
+        } else /* key without parameter passed */
                 *ret = true;
 
         return 1;
 }
 
-int proc_cmdline_get_key_many_internal(ProcCmdlineFlags flags, ...) {
-        _cleanup_free_ char *line = NULL;
-        const char *p;
-        va_list ap;
+static int cmdline_get_key_ap(ProcCmdlineFlags flags, char* const* args, va_list ap) {
         int r, ret = 0;
 
-        /* The PROC_CMDLINE_VALUE_OPTIONAL flag doesn't really make sense for proc_cmdline_get_key_many(), let's make
-         * this clear. */
-        assert(!FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL));
-
-        /* This call may clobber arguments on failure! */
-
-        r = proc_cmdline(&line);
-        if (r < 0)
-                return r;
-
-        p = line;
         for (;;) {
-                _cleanup_free_ char *word = NULL;
+                char **v;
+                const char *k, *e;
 
-                r = proc_cmdline_extract_first(&p, &word, flags);
-                if (r < 0)
-                        return r;
-                if (r == 0)
+                k = va_arg(ap, const char*);
+                if (!k)
                         break;
 
-                va_start(ap, flags);
+                assert_se(v = va_arg(ap, char**));
 
-                for (;;) {
-                        char **v;
-                        const char *k, *e;
+                STRV_FOREACH(p, args) {
+                        const char *word;
 
-                        k = va_arg(ap, const char*);
-                        if (!k)
-                                break;
-
-                        assert_se(v = va_arg(ap, char**));
+                        word = mangle_word(*p, flags);
+                        if (!word)
+                                continue;
 
                         e = proc_cmdline_key_startswith(word, k);
                         if (e && *e == '=') {
                                 r = free_and_strdup(v, e + 1);
-                                if (r < 0) {
-                                        va_end(ap);
+                                if (r < 0)
                                         return r;
-                                }
 
                                 ret++;
                         }
                 }
-
-                va_end(ap);
         }
 
         return ret;
 }
 
-int shall_restore_state(void) {
-        bool ret;
+int proc_cmdline_get_key_many_internal(ProcCmdlineFlags flags, ...) {
+        _cleanup_strv_free_ char **args = NULL;
         int r;
+        va_list ap;
 
-        r = proc_cmdline_get_bool("systemd.restore_state", &ret);
+        /* The PROC_CMDLINE_VALUE_OPTIONAL and PROC_CMDLINE_TRUE_WHEN_MISSING flags don't really make sense
+         * for proc_cmdline_get_key_many, let's make this clear. */
+        assert(!(flags & (PROC_CMDLINE_VALUE_OPTIONAL|PROC_CMDLINE_TRUE_WHEN_MISSING)));
+
+        /* This call may clobber arguments on failure! */
+
+        r = proc_cmdline_strv(&args);
         if (r < 0)
                 return r;
 
-        return r > 0 ? ret : true;
+        va_start(ap, flags);
+        r = cmdline_get_key_ap(flags, args, ap);
+        va_end(ap);
+
+        return r;
 }
 
-static const char * const rlmap[] = {
-        "emergency", SPECIAL_EMERGENCY_TARGET,
-        "-b",        SPECIAL_EMERGENCY_TARGET,
-        "rescue",    SPECIAL_RESCUE_TARGET,
-        "single",    SPECIAL_RESCUE_TARGET,
-        "-s",        SPECIAL_RESCUE_TARGET,
-        "s",         SPECIAL_RESCUE_TARGET,
-        "S",         SPECIAL_RESCUE_TARGET,
-        "1",         SPECIAL_RESCUE_TARGET,
-        "2",         SPECIAL_MULTI_USER_TARGET,
-        "3",         SPECIAL_MULTI_USER_TARGET,
-        "4",         SPECIAL_MULTI_USER_TARGET,
-        "5",         SPECIAL_GRAPHICAL_TARGET,
-        NULL
-};
+bool proc_cmdline_value_missing(const char *key, const char *value) {
+        assert(key);
 
-static const char * const rlmap_initrd[] = {
-        "emergency", SPECIAL_EMERGENCY_TARGET,
-        "rescue",    SPECIAL_RESCUE_TARGET,
-        NULL
-};
-
-const char* runlevel_to_target(const char *word) {
-        const char * const *rlmap_ptr;
-        size_t i;
-
-        if (!word)
-                return NULL;
-
-        if (in_initrd()) {
-                word = startswith(word, "rd.");
-                if (!word)
-                        return NULL;
+        if (!value) {
+                log_warning("Missing argument for %s= kernel command line switch, ignoring.", key);
+                return true;
         }
 
-        rlmap_ptr = in_initrd() ? rlmap_initrd : rlmap;
-
-        for (i = 0; rlmap_ptr[i]; i += 2)
-                if (streq(word, rlmap_ptr[i]))
-                        return rlmap_ptr[i+1];
-
-        return NULL;
+        return false;
 }

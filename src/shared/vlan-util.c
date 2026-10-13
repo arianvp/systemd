@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "conf-parser.h"
+#include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
 #include "vlan-util.h"
@@ -22,6 +22,25 @@ int parse_vlanid(const char *p, uint16_t *ret) {
         return 0;
 }
 
+int parse_vid_range(const char *p, uint16_t *vid, uint16_t *vid_end) {
+        unsigned lower, upper;
+        int r;
+
+        assert(vid);
+        assert(vid_end);
+
+        r = parse_range(p, &lower, &upper);
+        if (r < 0)
+                return r;
+
+        if (lower > VLANID_MAX || upper > VLANID_MAX || lower > upper)
+                return -EINVAL;
+
+        *vid = lower;
+        *vid_end = upper;
+        return 0;
+}
+
 int config_parse_default_port_vlanid(
                 const char *unit,
                 const char *filename,
@@ -33,11 +52,10 @@ int config_parse_default_port_vlanid(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-        uint16_t *id = data;
+        uint16_t *id = ASSERT_PTR(data);
 
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         if (streq(rvalue, "none")) {
                 *id = 0;
@@ -60,21 +78,22 @@ int config_parse_vlanid(
                 void *data,
                 void *userdata) {
 
-        uint16_t *id = data;
+        uint16_t *id = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = parse_vlanid(rvalue, id);
         if (r == -ERANGE) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "VLAN identifier outside of valid range 0…4094, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "VLAN identifier outside of valid range 0…4094, ignoring: %s", rvalue);
                 return 0;
         }
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse VLAN identifier value, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse VLAN identifier value, ignoring: %s", rvalue);
                 return 0;
         }
 

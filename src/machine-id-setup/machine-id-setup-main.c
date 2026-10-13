@@ -1,140 +1,166 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <getopt.h>
 #include <stdio.h>
-#include <stdlib.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
+#include "build.h"
+#include "dissect-image.h"
+#include "dlopen-note.h"
 #include "id128-util.h"
+#include "image-policy.h"
 #include "log.h"
+#include "loop-util.h"
 #include "machine-id-setup.h"
 #include "main-func.h"
-#include "path-util.h"
-#include "pretty-print.h"
-#include "util.h"
+#include "mount-util.h"
+#include "parse-argument.h"
+#include "verbs.h"
 
 static char *arg_root = NULL;
+static char *arg_image = NULL;
 static bool arg_commit = false;
 static bool arg_print = false;
+static ImagePolicy *arg_image_policy = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-machine-id-setup", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...]\n\n"
-               "Initialize /etc/machine-id from a random source.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "     --root=ROOT        Filesystem root\n"
-               "     --commit           Commit transient ID\n"
-               "     --print            Print used machine ID\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
-
-        return 0;
-}
+COMMAND(
+        "systemd-machine-id-setup\0",
+        "Initialize /etc/machine-id from a random source.",
+        .man_pages = "systemd-machine-id-setup(1)\0",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_ROOT,
-                ARG_COMMIT,
-                ARG_PRINT,
-        };
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                { "root",      required_argument, NULL, ARG_ROOT      },
-                { "commit",    no_argument,       NULL, ARG_COMMIT    },
-                { "print",     no_argument,       NULL, ARG_PRINT     },
-                {}
-        };
-
-        int c, r;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hqcv", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_GROUP("Commands"): {}
 
-                case ARG_VERSION:
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_ROOT:
-                        r = parse_path_argument_and_warn(optarg, true, &arg_root);
+                OPTION_LONG("commit", NULL, "Commit transient ID"):
+                        arg_commit = true;
+                        break;
+
+                OPTION_GROUP("Options"): {}
+
+                OPTION_LONG("root", "PATH", "Operate on an alternate filesystem root"):
+                        r = parse_path_argument(opts.arg, true, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_COMMIT:
-                        arg_commit = true;
+                OPTION_LONG("image", "PATH", "Operate on disk image as filesystem root"):
+                        r = parse_path_argument(opts.arg, false, &arg_image);
+                        if (r < 0)
+                                return r;
                         break;
 
-                case ARG_PRINT:
+                OPTION_LONG("image-policy", "POLICY", "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("print", NULL, "Print used machine ID"):
                         arg_print = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached("Unhandled option");
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Extraneous arguments");
+
+        if (arg_image && arg_root)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
 
         return 1;
 }
 
 static int run(int argc, char *argv[]) {
-        char buf[SD_ID128_STRING_MAX];
-        sd_id128_t id;
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
 
-        log_parse_environment();
-        log_open();
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                arg_image_policy,
+                                DISSECT_IMAGE_REQUIRE_ROOT |
+                                DISSECT_IMAGE_VALIDATE_OS |
+                                DISSECT_IMAGE_RELAX_VAR_CHECK |
+                                DISSECT_IMAGE_FSCK |
+                                DISSECT_IMAGE_GROWFS |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
+                                &mounted_dir,
+                                /* ret_dir_fd= */ NULL,
+                                &loop_device);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(mounted_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
+
         if (arg_commit) {
-                const char *etc_machine_id;
+                sd_id128_t id;
 
                 r = machine_id_commit(arg_root);
                 if (r < 0)
                         return r;
 
-                etc_machine_id = prefix_roota(arg_root, "/etc/machine-id");
-                r = id128_read(etc_machine_id, ID128_PLAIN, &id);
+                r = id128_get_machine(arg_root, &id);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read machine ID back: %m");
+
+                if (arg_print)
+                        puts(SD_ID128_TO_STRING(id));
+
+        } else if (id128_get_machine(arg_root, NULL) == -ENOPKG) {
+                if (arg_print)
+                        puts("uninitialized");
         } else {
-                r = machine_id_setup(arg_root, SD_ID128_NULL, &id);
+                sd_id128_t id;
+
+                r = machine_id_setup(arg_root, SD_ID128_NULL, /* flags= */ 0, &id);
                 if (r < 0)
                         return r;
-        }
 
-        if (arg_print)
-                puts(sd_id128_to_string(id, buf));
+                if (arg_print)
+                        puts(SD_ID128_TO_STRING(id));
+        }
 
         return 0;
 }

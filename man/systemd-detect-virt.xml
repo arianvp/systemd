@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-detect-virt"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -62,14 +62,19 @@
         </thead>
         <tbody>
           <row>
-            <entry valign="top" morerows="12">VM</entry>
+            <entry valign="top" morerows="17">VM</entry>
             <entry><varname>qemu</varname></entry>
             <entry>QEMU software virtualization, without KVM</entry>
           </row>
 
           <row>
             <entry><varname>kvm</varname></entry>
-            <entry>Linux KVM kernel virtual machine, with whatever software, except Oracle Virtualbox</entry>
+            <entry>Linux KVM kernel virtual machine, in combination with QEMU. Not used for other virtualizers using the KVM interfaces, such as Oracle VirtualBox or Amazon EC2 Nitro, see below.</entry>
+          </row>
+
+          <row>
+            <entry><varname>amazon</varname></entry>
+            <entry>Amazon EC2 Nitro using Linux KVM</entry>
           </row>
 
           <row>
@@ -90,6 +95,11 @@
           <row>
             <entry><varname>oracle</varname></entry>
             <entry>Oracle VM VirtualBox (historically marketed by innotek and Sun Microsystems), for legacy and KVM hypervisor</entry>
+          </row>
+
+          <row>
+            <entry><varname>powervm</varname></entry>
+            <entry>IBM PowerVM hypervisor — comes as firmware with some IBM POWER servers</entry>
           </row>
 
           <row>
@@ -128,7 +138,22 @@
           </row>
 
           <row>
-            <entry valign="top" morerows="7">Container</entry>
+            <entry><varname>apple</varname></entry>
+            <entry><ulink url="https://developer.apple.com/documentation/virtualization">Apple virtualization framework</ulink></entry>
+          </row>
+
+          <row>
+            <entry><varname>sre</varname></entry>
+            <entry><ulink url="https://www.lockheedmartin.com/en-us/products/Hardened-Security-for-Intel-Processors.html">LMHS SRE hypervisor</ulink></entry>
+          </row>
+
+          <row>
+            <entry><varname>google</varname></entry>
+            <entry><ulink url="https://cloud.google.com/compute">Google Compute Engine</ulink></entry>
+          </row>
+
+          <row>
+            <entry valign="top" morerows="9">Container</entry>
             <entry><varname>openvz</varname></entry>
             <entry>OpenVZ/Virtuozzo</entry>
           </row>
@@ -167,6 +192,16 @@
             <entry><varname>wsl</varname></entry>
             <entry><ulink url="https://docs.microsoft.com/en-us/windows/wsl/about">Windows Subsystem for Linux</ulink></entry>
           </row>
+
+          <row>
+            <entry><varname>proot</varname></entry>
+            <entry><ulink url="https://proot-me.github.io/">proot</ulink> userspace chroot/bind mount emulation</entry>
+          </row>
+
+          <row>
+            <entry><varname>pouch</varname></entry>
+            <entry><ulink url="https://github.com/alibaba/pouch">Pouch</ulink> Container Engine</entry>
+          </row>
         </tbody>
       </tgroup>
     </table>
@@ -182,6 +217,55 @@
     WSL is categorized as a container for practical purposes.
     Multiple WSL environments share the same kernel and services
     should generally behave like when being run in a container.</para>
+
+    <para>When executed with <option>--cvm</option>, instead of
+    printing the virtualization technology, it will display the
+    confidential virtual machine technology, if any. The
+    following technologies are currently identified:</para>
+
+    <table>
+      <title>Known confidential virtualization technologies</title>
+      <tgroup cols='2' align='left' colsep='1' rowsep='1'>
+        <colspec colname="id" />
+        <colspec colname="product" />
+        <thead>
+          <row>
+            <entry>Arch</entry>
+            <entry>ID</entry>
+            <entry>Technology</entry>
+          </row>
+        </thead>
+        <tbody>
+          <row>
+            <entry valign="top" morerows="3">x86_64</entry>
+            <entry><varname>sev</varname></entry>
+            <entry>AMD Secure Encrypted Virtualization</entry>
+          </row>
+          <row>
+            <entry><varname>sev-es</varname></entry>
+            <entry>AMD Secure Encrypted Virtualization - Encrypted State</entry>
+          </row>
+          <row>
+            <entry><varname>sev-snp</varname></entry>
+            <entry>AMD Secure Encrypted Virtualization - Secure Nested Paging</entry>
+          </row>
+          <row>
+            <entry><varname>tdx</varname></entry>
+            <entry>Intel Trust Domain Extensions</entry>
+          </row>
+          <row>
+            <entry>s390x</entry>
+            <entry><varname>protvirt</varname></entry>
+            <entry>IBM Protected Virtualization (Secure Execution)</entry>
+          </row>
+          <row>
+            <entry>arm64</entry>
+            <entry><varname>cca</varname></entry>
+            <entry>Arm Confidential Compute Architecture</entry>
+          </row>
+        </tbody>
+      </tgroup>
+    </table>
   </refsect1>
 
   <refsect1>
@@ -214,7 +298,9 @@
         environment. In this mode, no output is written, but the return
         value indicates whether the process was invoked in a
         <function>chroot()</function>
-        environment or not.</para></listitem>
+        environment or not.</para>
+
+        <xi:include href="version-info.xml" xpointer="v228"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -224,7 +310,21 @@
         output is written, but the return value indicates whether the process was invoked
         inside of a user namespace or not. See
         <citerefentry project='man-pages'><refentrytitle>user_namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-        for more information.</para></listitem>
+        for more information.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--cvm</option></term>
+
+        <listitem><para>Detect whether invoked in a confidential virtual machine.
+        The result of this detection may be used to disable features that should
+        not be used in confidential VMs. It must not be used to release security
+        sensitive information. The latter must only be released after attestation
+        of the confidential environment.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -238,7 +338,17 @@
       <varlistentry>
         <term><option>--list</option></term>
 
-        <listitem><para>Output all currently known and detectable container and VM environments.</para></listitem>
+        <listitem><para>Output all currently known and detectable container and VM environments.</para>
+
+        <xi:include href="version-info.xml" xpointer="v239"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--list-cvm</option></term>
+
+        <listitem><para>Output all currently known and detectable confidential virtualization technologies.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -256,12 +366,12 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>chroot</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>namespaces</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

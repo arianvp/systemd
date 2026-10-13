@@ -1,9 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <in-addr-util.h>
-#include <stdbool.h>
-#include <sys/types.h>
+#include "forward.h"
 
 typedef enum ExecutionMode {
         MODE_RESOLVE_HOST,
@@ -18,12 +16,19 @@ typedef enum ExecutionMode {
         MODE_STATUS,
         MODE_SET_LINK,
         MODE_REVERT_LINK,
-        _MODE_INVALID = -1,
+        _MODE_INVALID = -EINVAL,
 } ExecutionMode;
 
 extern ExecutionMode arg_mode;
 extern char **arg_set_dns;
 extern char **arg_set_domain;
+extern bool arg_disable_default_route;
 extern bool arg_ifindex_permissive;
 
-int ifname_mangle(const char *s);
+int ifname_mangle_full(const char *s, bool drop_protocol_specifier);
+static inline int ifname_mangle(const char *s) {
+        return ifname_mangle_full(s, false);
+}
+static inline int ifname_resolvconf_mangle(const char *s) {
+        return ifname_mangle_full(s, true);
+}

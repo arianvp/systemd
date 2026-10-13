@@ -1,8 +1,11 @@
 ---
-title: Using /tmp/ And /var/tmp/ Safely
+title: Using /tmp/ and /var/tmp/ Safely
+category: Interfaces
+layout: default
+SPDX-License-Identifier: LGPL-2.1-or-later
 ---
 
-# Using `/tmp/` And `/var/tmp/` Safely
+# Using `/tmp/` and `/var/tmp/` Safely
 
 `/tmp/` and `/var/tmp/` are two world-writable directories Linux systems
 provide for temporary files. The former is typically on `tmpfs` and thus
@@ -19,7 +22,7 @@ If the `$TMPDIR` environment variable is set, use that path, and neither use
 `/tmp/` nor `/var/tmp/` directly.
 
 See
-[file-hierarchy(7)](https://www.freedesktop.org/software/systemd/man/file-hierarchy.html)
+[file-hierarchy(7)](https://www.freedesktop.org/software/systemd/man/latest/file-hierarchy.html)
 for details about these two (and most other) directories of a Linux system.
 
 ## Common Namespace
@@ -41,15 +44,15 @@ installation during runtime is permitted.)
 To protect yourself against these kinds of attacks Linux provides a couple of
 APIs that help you avoiding guessable names. Specifically:
 
-1. Use [`mkstemp()`](http://man7.org/linux/man-pages/man3/mkstemp.3.html)
+1. Use [`mkstemp()`](https://man7.org/linux/man-pages/man3/mkstemp.3.html)
    (POSIX), `mkostemp()` (glibc),
-   [`mkdtemp()`](http://man7.org/linux/man-pages/man3/mkdtemp.3.html) (POSIX),
-   [`tmpfile()`](http://man7.org/linux/man-pages/man3/tmpfile.3.html) (C89)
+   [`mkdtemp()`](https://man7.org/linux/man-pages/man3/mkdtemp.3.html) (POSIX),
+   [`tmpfile()`](https://man7.org/linux/man-pages/man3/tmpfile.3.html) (C89)
 
-2. Use [`open()`](http://man7.org/linux/man-pages/man2/open.2.html) with
+2. Use [`open()`](https://man7.org/linux/man-pages/man2/open.2.html) with
    `O_TMPFILE` (Linux)
 
-3. [`memfd_create()`](http://man7.org/linux/man-pages/man2/memfd_create.2.html)
+3. [`memfd_create()`](https://man7.org/linux/man-pages/man2/memfd_create.2.html)
    (Linux; this doesn't bother with `/tmp/` or `/var/tmp/` at all, but uses the
    same RAM/swap backing as `tmpfs` uses, hence is very similar to `/tmp/`
    semantics.)
@@ -81,7 +84,7 @@ By default, `systemd-tmpfiles` will apply a concept of ⚠️ "ageing" to all fi
 and directories stored in `/tmp/` and `/var/tmp/`. This means that files that
 have neither been changed nor read within a specific time frame are
 automatically removed in regular intervals. (This concept is not new to
-`systemd-tmpfiles` btw, it's inherited from previous subsystems such as
+`systemd-tmpfiles`, it's inherited from previous subsystems such as
 `tmpwatch`.) By default files in `/tmp/` are cleaned up after 10 days, and
 those in `/var/tmp` after 30 days.
 
@@ -108,14 +111,13 @@ strategies to avoid these issues:
    towards unexpected program termination as there are never files on disk that
    need to be explicitly deleted.
 
-3. 🥇 Operate below a sub-directory of `/tmp/` and `/var/tmp/` you created, and
-   take a BSD file lock ([`flock(dir_fd,
-   LOCK_SH)`](http://man7.org/linux/man-pages/man2/flock.2.html)) on that
-   sub-directory. This is particularly interesting when operating on more than
-   a single file, or on file nodes that are not plain regular files, for
-   example when extracting a tarball to a temporary directory. The ageing
-   algorithm will skip all directories (and everything below them) that are
-   locked through a BSD file lock. As BSD file locks are automatically released
+3. 🥇 Take an exclusive or shared BSD file lock ([`flock()`](
+   https://man7.org/linux/man-pages/man2/flock.2.html)) on files and directories
+   you don't want to be removed. This is particularly interesting when operating
+   on more than a single file, or on file nodes that are not plain regular files,
+   for example when extracting a tarball to a temporary directory. The ageing
+   algorithm will skip all directories (and everything below them) and files that
+   are locked through a BSD file lock. As BSD file locks are automatically released
    when the file descriptor they are taken on is closed, and all file
    descriptors opened by a process are implicitly closed when it exits, this is
    a robust mechanism that ensures all temporary files are subject to ageing
@@ -123,10 +125,8 @@ strategies to avoid these issues:
    this when decompressing tarballs that contain files with old
    modification/access times, as extracted files are otherwise immediately
    candidates for deletion by the ageing algorithm. The
-   [`flock`](http://man7.org/linux/man-pages/man1/flock.1.html) tool of the
-   `util-linux` packages makes this concept available to shell scripts. Note
-   that `systemd-tmpfiles` only checks for BSD file locks on directories, locks
-   on other types of file nodes (including regular files) are not considered.
+   [`flock`](https://man7.org/linux/man-pages/man1/flock.1.html) tool of the
+   `util-linux` packages makes this concept available to shell scripts.
 
 4. Keep the access time of all temporary files created current. In regular
    intervals, use `utimensat()` or a related call to update the access time
@@ -143,7 +143,7 @@ strategies to avoid these issues:
    the sticky bit has a different meaning for them.
 
 6. Don't use `/tmp/` or `/var/tmp/`, but use your own sub-directory under
-   `/run/` or `$XDG_RUNTIME_DIRECTORY` (the former if privileged, the latter if
+   `/run/` or `$XDG_RUNTIME_DIR` (the former if privileged, the latter if
    unprivileged), or `/var/lib/` and `~/.config/` (similar, but with
    persistency and suitable for larger data). The two temporary directories
    `/tmp/` and `/var/tmp/` come with the implicit clean-up semantics described
@@ -214,7 +214,7 @@ packages instead use `/dev/shm/` for temporary files during early boot; this is
 not advisable however, as it offers no benefits over a private directory in
 `/run/` as both are backed by the same concept: `tmpfs`. The directory
 `/dev/shm/` exists to back POSIX shared memory (see
-[`shm_open()`](http://man7.org/linux/man-pages/man3/shm_open.3.html) and
+[`shm_open()`](https://man7.org/linux/man-pages/man3/shm_open.3.html) and
 related calls), and not as a place for temporary files. `/dev/shm` is
 problematic as it is world-writable and there's no automatic clean-up logic in
 place.)

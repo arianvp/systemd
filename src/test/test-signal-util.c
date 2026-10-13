@@ -1,23 +1,21 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <signal.h>
-#include <unistd.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "log.h"
-#include "macro.h"
+#include "process-util.h"
 #include "signal-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "process-util.h"
+#include "tests.h"
 
 #define info(sig) log_info(#sig " = " STRINGIFY(sig) " = %d", sig)
 
-static void test_rt_signals(void) {
+TEST(rt_signals) {
         info(SIGRTMIN);
         info(SIGRTMAX);
 
-        /* We use signals SIGRTMIN+0 to SIGRTMIN+24 unconditionally */
-        assert(SIGRTMAX - SIGRTMIN >= 24);
+        /* We use signals SIGRTMIN+0 to SIGRTMIN+29 unconditionally. SIGRTMIN+30 can be used only when
+         * built with glibc. */
+        assert_se(SIGRTMAX - SIGRTMIN >= 29);
 }
 
 static void test_signal_to_string_one(int val) {
@@ -49,7 +47,7 @@ static void test_signal_from_string_number(const char *s, int val) {
         assert_se(signal_from_string(p) == -EINVAL);
 }
 
-static void test_signal_from_string(void) {
+TEST(signal_from_string) {
         char buf[STRLEN("RTMIN+") + DECIMAL_STR_MAX(int) + 1];
 
         test_signal_to_string_one(SIGHUP);
@@ -105,47 +103,82 @@ static void test_signal_from_string(void) {
         test_signal_from_string_number("-2", -ERANGE);
 }
 
-static void test_block_signals(void) {
-        sigset_t ss;
+TEST(signal_code_to_string) {
+        assert_se(streq_ptr(signal_code_to_string(SIGSEGV, SEGV_MAPERR), "SEGV_MAPERR"));
+        assert_se(streq_ptr(signal_code_to_string(SIGILL, ILL_ILLOPC), "ILL_ILLOPC"));
+        assert_se(streq_ptr(signal_code_to_string(SIGCHLD, CLD_CONTINUED), "CLD_CONTINUED"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_TKILL), "SI_TKILL"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_USER), "SI_USER"));
+        assert_se(streq_ptr(signal_code_to_string(SIGABRT, SI_KERNEL), "SI_KERNEL"));
+        assert_se(streq_ptr(signal_code_to_string(SIGSYS, SYS_SECCOMP), "SYS_SECCOMP"));
+        assert_se(signal_code_to_string(SIGABRT, 99) == NULL);
+}
 
-        assert_se(sigprocmask(0, NULL, &ss) >= 0);
-
-        assert_se(sigismember(&ss, SIGUSR1) == 0);
-        assert_se(sigismember(&ss, SIGALRM) == 0);
-        assert_se(sigismember(&ss, SIGVTALRM) == 0);
+TEST(block_signals) {
+        assert_se(signal_is_blocked(SIGUSR1) == 0);
+        assert_se(signal_is_blocked(SIGALRM) == 0);
+        assert_se(signal_is_blocked(SIGVTALRM) == 0);
 
         {
                 BLOCK_SIGNALS(SIGUSR1, SIGVTALRM);
 
-                assert_se(sigprocmask(0, NULL, &ss) >= 0);
-                assert_se(sigismember(&ss, SIGUSR1) == 1);
-                assert_se(sigismember(&ss, SIGALRM) == 0);
-                assert_se(sigismember(&ss, SIGVTALRM) == 1);
-
+                assert_se(signal_is_blocked(SIGUSR1) > 0);
+                assert_se(signal_is_blocked(SIGALRM) == 0);
+                assert_se(signal_is_blocked(SIGVTALRM) > 0);
         }
 
-        assert_se(sigprocmask(0, NULL, &ss) >= 0);
-        assert_se(sigismember(&ss, SIGUSR1) == 0);
-        assert_se(sigismember(&ss, SIGALRM) == 0);
-        assert_se(sigismember(&ss, SIGVTALRM) == 0);
+        assert_se(signal_is_blocked(SIGUSR1) == 0);
+        assert_se(signal_is_blocked(SIGALRM) == 0);
+        assert_se(signal_is_blocked(SIGVTALRM) == 0);
 }
 
-static void test_ignore_signals(void) {
-        assert_se(ignore_signals(SIGINT, -1) >= 0);
+TEST(ignore_signals) {
+        assert_se(ignore_signals(SIGINT) >= 0);
         assert_se(kill(getpid_cached(), SIGINT) >= 0);
-        assert_se(ignore_signals(SIGUSR1, SIGUSR2, SIGTERM, SIGPIPE, -1) >= 0);
+        assert_se(ignore_signals(SIGUSR1, SIGUSR2, SIGTERM, SIGPIPE) >= 0);
         assert_se(kill(getpid_cached(), SIGUSR1) >= 0);
         assert_se(kill(getpid_cached(), SIGUSR2) >= 0);
         assert_se(kill(getpid_cached(), SIGTERM) >= 0);
         assert_se(kill(getpid_cached(), SIGPIPE) >= 0);
-        assert_se(default_signals(SIGINT, SIGUSR1, SIGUSR2, SIGTERM, SIGPIPE, -1) >= 0);
+        assert_se(default_signals(SIGINT, SIGUSR1, SIGUSR2, SIGTERM, SIGPIPE) >= 0);
 }
 
-int main(int argc, char *argv[]) {
-        test_rt_signals();
-        test_signal_from_string();
-        test_block_signals();
-        test_ignore_signals();
+TEST(pop_pending_signal) {
 
-        return 0;
+        assert_se(signal_is_blocked(SIGUSR1) == 0);
+        assert_se(signal_is_blocked(SIGUSR2) == 0);
+        assert_se(pop_pending_signal(SIGUSR1) == 0);
+        assert_se(pop_pending_signal(SIGUSR2) == 0);
+
+        {
+                BLOCK_SIGNALS(SIGUSR1, SIGUSR2);
+
+                assert_se(signal_is_blocked(SIGUSR1) > 0);
+                assert_se(signal_is_blocked(SIGUSR2) > 0);
+
+                assert_se(pop_pending_signal(SIGUSR1) == 0);
+                assert_se(pop_pending_signal(SIGUSR2) == 0);
+
+                assert_se(raise(SIGUSR1) >= 0);
+
+                assert_se(pop_pending_signal(SIGUSR2) == 0);
+                assert_se(pop_pending_signal(SIGUSR1) == SIGUSR1);
+                assert_se(pop_pending_signal(SIGUSR1) == 0);
+
+                assert_se(raise(SIGUSR1) >= 0);
+                assert_se(raise(SIGUSR2) >= 0);
+
+                assert_cc(SIGUSR1 < SIGUSR2);
+
+                assert_se(pop_pending_signal(SIGUSR1, SIGUSR2) == SIGUSR1);
+                assert_se(pop_pending_signal(SIGUSR1, SIGUSR2) == SIGUSR2);
+                assert_se(pop_pending_signal(SIGUSR1, SIGUSR2) == 0);
+        }
+
+        assert_se(signal_is_blocked(SIGUSR1) == 0);
+        assert_se(signal_is_blocked(SIGUSR2) == 0);
+        assert_se(pop_pending_signal(SIGUSR1) == 0);
+        assert_se(pop_pending_signal(SIGUSR2) == 0);
 }
+
+DEFINE_TEST_MAIN(LOG_INFO);

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=Test for DeferReactivation=yes (timer)
+
+[Timer]
+OnCalendar=*:*:0/5
+AccuracySec=1us
+DeferReactivation=yes

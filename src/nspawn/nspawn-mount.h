@@ -1,9 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "cgroup-util.h"
+#include "forward.h"
 #include "volatile-util.h"
 
 typedef enum MountSettingsMask {
@@ -14,6 +12,15 @@ typedef enum MountSettingsMask {
         MOUNT_APPLY_APIVFS_NETNS = 1 << 4, /* if set, /proc/sys/net will be mounted read-write.
                                                Works only if MOUNT_APPLY_APIVFS_RO is also set. */
         MOUNT_APPLY_TMPFS_TMP    = 1 << 5, /* if set, /tmp will be mounted as tmpfs */
+        MOUNT_ROOT_ONLY          = 1 << 6, /* if set, only root mounts are mounted */
+        MOUNT_NON_ROOT_ONLY      = 1 << 7, /* if set, only non-root mounts are mounted */
+        MOUNT_MKDIR              = 1 << 8, /* if set, make directory to mount over first */
+        MOUNT_TOUCH              = 1 << 9, /* if set, touch file to mount over first */
+        MOUNT_PREFIX_ROOT        = 1 << 10,/* if set, prefix the source path with the container's root directory */
+        MOUNT_FOLLOW_SYMLINKS    = 1 << 11,/* if set, we'll follow symlinks for the mount target */
+        MOUNT_UNMANAGED          = 1 << 12,/* if set, we'll only mount this in the outer child if we are running in privileged mode */
+        MOUNT_PRIVILEGED         = 1 << 13,/* if set, we'll only mount this if we have full privileges */
+        MOUNT_USRQUOTA_GRACEFUL  = 1 << 14,/* if set, append "usrquota" to mount options if kernel tmpfs supports that */
 } MountSettingsMask;
 
 typedef enum CustomMountType {
@@ -23,7 +30,7 @@ typedef enum CustomMountType {
         CUSTOM_MOUNT_INACCESSIBLE,
         CUSTOM_MOUNT_ARBITRARY,
         _CUSTOM_MOUNT_TYPE_MAX,
-        _CUSTOM_MOUNT_TYPE_INVALID = -1
+        _CUSTOM_MOUNT_TYPE_INVALID = -EINVAL,
 } CustomMountType;
 
 typedef struct CustomMount {
@@ -31,6 +38,7 @@ typedef struct CustomMount {
         bool read_only;
         char *source; /* for overlayfs this is the upper directory */
         char *destination;
+        uid_t destination_uid;
         char *options;
         char *work_dir;
         char **lower;
@@ -52,11 +60,20 @@ int inaccessible_mount_parse(CustomMount **l, size_t *n, const char *s);
 int mount_all(const char *dest, MountSettingsMask mount_settings, uid_t uid_shift, const char *selinux_apifs_context);
 int mount_sysfs(const char *dest, MountSettingsMask mount_settings);
 
-int mount_custom(const char *dest, CustomMount *mounts, size_t n, bool userns, uid_t uid_shift, uid_t uid_range, const char *selinux_apifs_context, bool in_userns);
+int mount_custom(const char *dest, CustomMount *mounts, size_t n, uid_t uid_shift, uid_t uid_range, const char *selinux_apifs_context, MountSettingsMask mount_settings);
+bool has_custom_root_mount(const CustomMount *mounts, size_t n);
 
-int setup_volatile_mode(const char *directory, VolatileMode mode, bool userns, uid_t uid_shift, uid_t uid_range, const char *selinux_apifs_context);
+int setup_volatile_mode(const char *directory, VolatileMode mode, uid_t uid_shift, const char *selinux_apifs_context);
+int setup_volatile_mode_after_remount_idmap(
+                const char *directory,
+                VolatileMode mode,
+                uid_t uid_shift,
+                const char *selinux_apifs_context);
 
 int pivot_root_parse(char **pivot_root_new, char **pivot_root_old, const char *s);
 int setup_pivot_root(const char *directory, const char *pivot_root_new, const char *pivot_root_old);
 
 int tmpfs_patch_options(const char *options,uid_t uid_shift, const char *selinux_apifs_context, char **ret);
+
+int pin_fully_visible_api_fs(void);
+int wipe_fully_visible_api_fs(int mntns_fd);

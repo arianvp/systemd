@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
 
@@ -7,6 +7,7 @@
 #include "set.h"
 #include "siphash24.h"
 #include "sort-util.h"
+#include "tests.h"
 
 #define SET_SIZE 1024*4
 
@@ -14,17 +15,17 @@ static int unsigned_compare(const unsigned *a, const unsigned *b) {
         return CMP(*a, *b);
 }
 
-static void test_unsigned(void) {
+TEST(unsigned) {
         _cleanup_(prioq_freep) Prioq *q = NULL;
-        unsigned buffer[SET_SIZE], i, u, n;
+        unsigned buffer[SET_SIZE], u, n;
 
         srand(0);
 
         assert_se(q = prioq_new(trivial_compare_func));
 
-        for (i = 0; i < ELEMENTSOF(buffer); i++) {
+        FOREACH_ELEMENT(i, buffer) {
                 u = (unsigned) rand();
-                buffer[i] = u;
+                *i = u;
                 assert_se(prioq_put(q, UINT_TO_PTR(u), NULL) >= 0);
 
                 n = prioq_size(q);
@@ -33,7 +34,7 @@ static void test_unsigned(void) {
 
         typesafe_qsort(buffer, ELEMENTSOF(buffer), unsigned_compare);
 
-        for (i = 0; i < ELEMENTSOF(buffer); i++) {
+        for (unsigned i = 0; i < ELEMENTSOF(buffer); i++) {
                 assert_se(prioq_size(q) == ELEMENTSOF(buffer) - i);
 
                 u = PTR_TO_UINT(prioq_pop(q));
@@ -53,14 +54,14 @@ static int test_compare(const struct test *x, const struct test *y) {
 }
 
 static void test_hash(const struct test *x, struct siphash *state) {
-        siphash24_compress(&x->value, sizeof(x->value), state);
+        siphash24_compress_typesafe(x->value, state);
 }
 
 DEFINE_PRIVATE_HASH_OPS(test_hash_ops, struct test, test_hash, test_compare);
 
-static void test_struct(void) {
+TEST(struct) {
         _cleanup_(prioq_freep) Prioq *q = NULL;
-        _cleanup_(set_freep) Set *s = NULL;
+        _cleanup_set_free_ Set *s = NULL;
         unsigned previous = 0, i;
         struct test *t;
 
@@ -69,10 +70,10 @@ static void test_struct(void) {
         assert_se(q = prioq_new((compare_func_t) test_compare));
         assert_se(s = set_new(&test_hash_ops));
 
-        assert_se(prioq_peek(q) == NULL);
-        assert_se(prioq_peek_by_index(q, 0) == NULL);
-        assert_se(prioq_peek_by_index(q, 1) == NULL);
-        assert_se(prioq_peek_by_index(q, (unsigned) -1) == NULL);
+        ASSERT_NULL(prioq_peek(q));
+        ASSERT_NULL(prioq_peek_by_index(q, 0));
+        ASSERT_NULL(prioq_peek_by_index(q, 1));
+        ASSERT_NULL(prioq_peek_by_index(q, UINT_MAX));
 
         for (i = 0; i < SET_SIZE; i++) {
                 assert_se(t = new0(struct test, 1));
@@ -86,7 +87,7 @@ static void test_struct(void) {
 
         for (i = 0; i < SET_SIZE; i++)
                 assert_se(prioq_peek_by_index(q, i));
-        assert_se(prioq_peek_by_index(q, SET_SIZE) == NULL);
+        ASSERT_NULL(prioq_peek_by_index(q, SET_SIZE));
 
         unsigned count = 0;
         PRIOQ_FOREACH_ITEM(q, t) {
@@ -119,10 +120,4 @@ static void test_struct(void) {
         assert_se(set_isempty(s));
 }
 
-int main(int argc, char* argv[]) {
-
-        test_unsigned();
-        test_struct();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

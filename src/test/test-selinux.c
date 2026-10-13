@@ -1,15 +1,13 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/stat.h>
+#include <sys/socket.h>
 
-#include "alloc-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "selinux-util.h"
 #include "string-util.h"
 #include "tests.h"
 #include "time-util.h"
-#include "util.h"
 
 static void test_testing(void) {
         bool b;
@@ -55,9 +53,9 @@ static void test_cleanup(void) {
 }
 
 static void test_misc(const char* fname) {
-        _cleanup_(mac_selinux_freep) char *label = NULL, *label2 = NULL, *label3 = NULL;
+        _cleanup_freecon_ char *label = NULL, *label2 = NULL, *label3 = NULL, *label4 = NULL;
         int r;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         log_info("============ %s ==========", __func__);
 
@@ -75,6 +73,10 @@ static void test_misc(const char* fname) {
         r = mac_selinux_get_child_mls_label(fd, fname, label2, &label3);
         log_info_errno(r, "mac_selinux_get_child_mls_label → %d, \"%s\" (%m)",
                        r, strnull(label3));
+
+        r = mac_selinux_get_peer_label(fd, &label4);
+        log_info_errno(r, "mac_selinux_get_peer_label → %d, \"%s\" (%m)",
+                       r, strnull(label4));
 }
 
 static void test_create_file_prepare(const char* fname) {
@@ -82,7 +84,7 @@ static void test_create_file_prepare(const char* fname) {
 
         log_info("============ %s ==========", __func__);
 
-        r = mac_selinux_create_file_prepare(fname, S_IRWXU);
+        r = mac_selinux_create_file_prepare(fname, S_IRWXU, /* label_context= */ NULL);
         log_info_errno(r, "mac_selinux_create_file_prepare → %d (%m)", r);
 
         mac_selinux_create_file_clear();

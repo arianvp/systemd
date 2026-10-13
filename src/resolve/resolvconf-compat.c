@@ -1,55 +1,42 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-#include <net/if.h>
+#include <stdlib.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
-#include "def.h"
-#include "dns-domain.h"
+#include "build.h"
 #include "extract-word.h"
 #include "fileio.h"
-#include "parse-util.h"
-#include "pretty-print.h"
+#include "log.h"
 #include "resolvconf-compat.h"
 #include "resolvectl.h"
-#include "resolved-def.h"
 #include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
+#include "verbs.h"
 
-static int resolvconf_help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+typedef enum LookupType  {
+        LOOKUP_TYPE_REGULAR,
+        LOOKUP_TYPE_PRIVATE,
+        LOOKUP_TYPE_EXCLUSIVE, /* -x */
+} LookupType;
 
-        r = terminal_urlify_man("resolvectl", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s -a INTERFACE < FILE\n"
-               "%1$s -d INTERFACE\n"
-               "\n"
-               "Register DNS server and domain configuration with systemd-resolved.\n\n"
-               "  -h --help     Show this help\n"
-               "     --version  Show package version\n"
-               "  -a            Register per-interface DNS server and domain data\n"
-               "  -d            Unregister per-interface DNS server and domain data\n"
-               "  -f            Ignore if specified interface does not exist\n"
-               "  -x            Send DNS traffic preferably over this interface\n"
-               "\n"
-               "This is a compatibility alias for the resolvectl(1) tool, providing native\n"
-               "command line compatibility with the resolvconf(8) tool of various Linux\n"
-               "distributions and BSD systems. Some options supported by other implementations\n"
-               "are not supported and are ignored: -m, -p. Various options supported by other\n"
-               "implementations are not supported and will cause the invocation to fail: -u,\n"
-               "-I, -i, -l, -R, -r, -v, -V, --enable-updates, --disable-updates,\n"
-               "--updates-are-enabled.\n"
-               "\nSee the %2$s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
-
-        return 0;
-}
+COMMAND(
+        "resolvconf\0",
+        "Register DNS server and domain configuration with systemd-resolved.",
+        .man_pages = "resolvectl(1)\0",
+        .argspec = "-a INTERFACE <FILE\0"
+                   "-d INTERFACE\0",
+        .footer =
+               "This is a compatibility alias for the resolvectl(1) tool, providing native "
+               "command line compatibility with the resolvconf(8) tool of various Linux "
+               "distributions and BSD systems. Some options supported by other implementations "
+               "are not supported and are ignored: -m, -u. Various options supported by other "
+               "implementations are not supported and will cause the invocation to fail: "
+               "-I, -i, -l, -R, -r, -v, -V, --enable-updates, --disable-updates, "
+               "--updates-are-enabled.",
+        .option_namespace = "resolvconf",
+);
 
 static int parse_nameserver(const char *string) {
         int r;
@@ -82,7 +69,7 @@ static int parse_search_domain(const char *string) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&string, &word, NULL, EXTRACT_QUOTES);
+                r = extract_first_word(&string, &word, NULL, EXTRACT_UNQUOTE);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -97,178 +84,183 @@ static int parse_search_domain(const char *string) {
         return 0;
 }
 
+static int parse_stdin(LookupType lookup_type) {
+        int r;
+
+        for (unsigned n = 0;;) {
+                _cleanup_free_ char *line = NULL;
+                const char *a;
+
+                r = read_stripped_line(stdin, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read from stdin: %m");
+                if (r == 0)
+                        break;
+                n++;
+
+                if (IN_SET(*line, '#', ';', 0))
+                        continue;
+
+                a = first_word(line, "nameserver");
+                if (a) {
+                        r = parse_nameserver(a);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse resolv.conf nameserver line: %m");
+                        continue;
+                }
+
+                a = first_word(line, "domain");
+                if (!a)
+                        a = first_word(line, "search");
+                if (a) {
+                        r = parse_search_domain(a);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse resolv.conf domain/search line: %m");
+                        continue;
+                }
+
+                log_syntax(NULL, LOG_DEBUG, "stdin", n, 0, "Ignoring resolv.conf line: %s", line);
+        }
+
+        switch (lookup_type) {
+        case LOOKUP_TYPE_REGULAR:
+                break;
+
+        case LOOKUP_TYPE_PRIVATE:
+                arg_disable_default_route = true;
+                break;
+
+        case LOOKUP_TYPE_EXCLUSIVE:
+                /* If -x mode is selected, let's preferably route non-suffixed lookups to this interface.
+                 * This somewhat matches the original -x behaviour */
+
+                r = strv_extend(&arg_set_domain, "~.");
+                if (r < 0)
+                        return log_oom();
+                break;
+
+        default:
+                assert_not_reached();
+        }
+
+        if (strv_isempty(arg_set_dns))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "No DNS servers specified, refusing operation.");
+
+        if (strv_isempty(arg_set_domain)) {
+                /* When no domain/search is set, clear the current domains. */
+                r = strv_extend(&arg_set_domain, "");
+                if (r < 0)
+                        return log_oom();
+        }
+
+        return 0;
+}
+
 int resolvconf_parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_ENABLE_UPDATES,
-                ARG_DISABLE_UPDATES,
-                ARG_UPDATES_ARE_ENABLED,
-        };
-
-        static const struct option options[] = {
-                { "help",                no_argument, NULL, 'h'                     },
-                { "version",             no_argument, NULL, ARG_VERSION             },
-
-                /* The following are specific to Debian's original resolvconf */
-                { "enable-updates",      no_argument, NULL, ARG_ENABLE_UPDATES      },
-                { "disable-updates",     no_argument, NULL, ARG_DISABLE_UPDATES     },
-                { "updates-are-enabled", no_argument, NULL, ARG_UPDATES_ARE_ENABLED },
-                {}
-        };
-
-        enum {
-                TYPE_REGULAR,
-                TYPE_PRIVATE,   /* -p: Not supported, treated identically to TYPE_REGULAR */
-                TYPE_EXCLUSIVE, /* -x */
-        } type = TYPE_REGULAR;
-
-        int c, r;
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
         /* openresolv checks these environment variables */
+        LookupType lookup_type = LOOKUP_TYPE_REGULAR;
+
         if (getenv("IF_EXCLUSIVE"))
-                type = TYPE_EXCLUSIVE;
+                lookup_type = LOOKUP_TYPE_EXCLUSIVE;
         if (getenv("IF_PRIVATE"))
-                type = TYPE_PRIVATE; /* not actually supported */
+                lookup_type = LOOKUP_TYPE_PRIVATE;
 
         arg_mode = _MODE_INVALID;
 
-        while ((c = getopt_long(argc, argv, "hadxpfm:uIi:l:Rr:vV", options, NULL)) >= 0)
-                switch(c) {
+        OptionParser opts = { argc, argv, .namespace = "resolvconf" };
 
-                case 'h':
-                        return resolvconf_help();
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
 
-                case ARG_VERSION:
+                OPTION_NAMESPACE("resolvconf"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_help_name("resolvconf");
+
+                OPTION_COMMON_VERSION:
                         return version();
 
                 /* -a and -d is what everybody can agree on */
-                case 'a':
+                OPTION_SHORT('a', NULL, "Register per-interface DNS server and domain data"):
                         arg_mode = MODE_SET_LINK;
                         break;
 
-                case 'd':
+                OPTION_SHORT('d', NULL, "Unregister per-interface DNS server and domain data"):
                         arg_mode = MODE_REVERT_LINK;
                         break;
 
-                /* The exclusive/private/force stuff is an openresolv invention, we support in some skewed way */
-                case 'x':
-                        type = TYPE_EXCLUSIVE;
+                OPTION_SHORT('p', NULL, "Do not use this interface as default route"):
+                        lookup_type = LOOKUP_TYPE_PRIVATE;
                         break;
 
-                case 'p':
-                        type = TYPE_PRIVATE; /* not actually supported */
-                        break;
-
-                case 'f':
+                OPTION_SHORT('f', NULL, "Ignore if specified interface does not exist"):
                         arg_ifindex_permissive = true;
                         break;
 
-                /* The metrics stuff is an openresolv invention we ignore (and don't really need) */
-                case 'm':
-                        log_debug("Switch -%c ignored.", c);
+                /* The exclusive/private/force stuff is an openresolv invention, we support in some skewed way */
+                OPTION_SHORT('x', NULL, "Send DNS traffic preferably over this interface"):
+                        lookup_type = LOOKUP_TYPE_EXCLUSIVE;
                         break;
 
-                /* Everybody else can agree on the existence of -u but we don't support it. */
-                case 'u':
+                /* The metrics stuff is an openresolv invention we ignore (and don't really need) */
+                OPTION_SHORT('m', "ARG", /* help= */ NULL):
+                        log_debug("Switch -%c ignored.", opts.opt->short_code);
+                        break;
+
+                /* -u supposedly should "update all subscribers". We have no subscribers, hence let's make
+                    this a NOP, and exit immediately, cleanly. */
+                OPTION_SHORT('u', NULL, /* help= */ NULL):
+                        log_info("Switch -%c ignored.", opts.opt->short_code);
+                        return 0;
 
                 /* The following options are openresolv inventions we don't support. */
-                case 'I':
-                case 'i':
-                case 'l':
-                case 'R':
-                case 'r':
-                case 'v':
-                case 'V':
+                OPTION_SHORT('I', NULL,  /* help= */ NULL): {}
+                OPTION_SHORT('i', "ARG", /* help= */ NULL): {}
+                OPTION_SHORT('l', "ARG", /* help= */ NULL): {}
+                OPTION_SHORT('R', NULL,  /* help= */ NULL): {}
+                OPTION_SHORT('r', "ARG", /* help= */ NULL): {}
+                OPTION_SHORT('v', NULL,  /* help= */ NULL): {}
+                OPTION_SHORT('V', NULL,  /* help= */ NULL):
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Switch -%c not supported.", c);
+                                               "Switch -%c not supported.", opts.opt->short_code);
 
                 /* The Debian resolvconf commands we don't support. */
-                case ARG_ENABLE_UPDATES:
+                OPTION_LONG("enable-updates", NULL, /* help= */ NULL):
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Switch --enable-updates not supported.");
-                case ARG_DISABLE_UPDATES:
+                OPTION_LONG("disable-updates", NULL, /* help= */ NULL):
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Switch --disable-updates not supported.");
-                case ARG_UPDATES_ARE_ENABLED:
+                OPTION_LONG("updates-are-enabled", NULL, /* help= */ NULL):
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Switch --updates-are-enabled not supported.");
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached("Unhandled option");
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (arg_mode == _MODE_INVALID)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Expected either -a or -d on the command line.");
 
-        if (optind+1 != argc)
+        if (option_parser_get_n_args(&opts) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Expected interface name as argument.");
 
-        r = ifname_mangle(argv[optind]);
+        r = ifname_resolvconf_mangle(option_parser_get_arg(&opts, 0));
         if (r <= 0)
                 return r;
 
-        optind++;
-
         if (arg_mode == MODE_SET_LINK) {
-                unsigned n = 0;
-
-                for (;;) {
-                        _cleanup_free_ char *line = NULL;
-                        const char *a, *l;
-
-                        r = read_line(stdin, LONG_LINE_MAX, &line);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to read from stdin: %m");
-                        if (r == 0)
-                                break;
-
-                        n++;
-
-                        l = strstrip(line);
-                        if (IN_SET(*l, '#', ';', 0))
-                                continue;
-
-                        a = first_word(l, "nameserver");
-                        if (a) {
-                                (void) parse_nameserver(a);
-                                continue;
-                        }
-
-                        a = first_word(l, "domain");
-                        if (!a)
-                                a = first_word(l, "search");
-                        if (a) {
-                                (void) parse_search_domain(a);
-                                continue;
-                        }
-
-                        log_syntax(NULL, LOG_DEBUG, "stdin", n, 0, "Ignoring resolv.conf line: %s", l);
-                }
-
-                if (type == TYPE_EXCLUSIVE) {
-
-                        /* If -x mode is selected, let's preferably route non-suffixed lookups to this interface. This
-                         * somewhat matches the original -x behaviour */
-
-                        r = strv_extend(&arg_set_domain, "~.");
-                        if (r < 0)
-                                return log_oom();
-
-                } else if (type == TYPE_PRIVATE)
-                        log_debug("Private DNS server data not supported, ignoring.");
-
-                if (!arg_set_dns)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "No DNS servers specified, refusing operation.");
+                r = parse_stdin(lookup_type);
+                if (r < 0)
+                        return r;
         }
 
         return 1; /* work to do */

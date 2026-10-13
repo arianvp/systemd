@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # systemd-nspawn(1) completion                  -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word() {
     local w word=$1; shift
@@ -25,27 +26,31 @@ __contains_word() {
 
 __get_users() {
     local a b
-    loginctl list-users --no-legend --no-pager | { while read a b; do echo " $b"; done; };
+    loginctl list-users --no-legend --no-pager 2>/dev/null |
+        { while read -r a b; do echo " $b"; done; }
 }
 
 __get_slices() {
     local a b
-    systemctl list-units -t slice --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    systemctl list-units -t slice --no-legend --no-pager --plain 2>/dev/null |
+        { while read -r a b; do echo " $a"; done; }
 }
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 __get_env() {
     local a
-    env | { while read a; do echo " ${a%%=*}"; done; };
+    env | { while read -r a; do [[ $a =~ ^[A-Za-z0-9_]+= ]] && echo " ${a%%=*}"; done; }
 }
 
 __get_interfaces(){
     local name
-    for name in $(cd /sys/class/net && ls); do
+    for name in $(cd /sys/class/net && command ls); do
         [[ "$name" != "lo" ]] && echo "$name"
     done
 }
@@ -58,31 +63,35 @@ __get_rlimit() {
 }
 
 _systemd_nspawn() {
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local i verb comps
 
     local -A OPTS=(
         [STANDALONE]='-h --help --version --private-network -b --boot --read-only -q --quiet --share-system
-                      --keep-unit -n --network-veth -j -x --ephemeral -a --as-pid2 --private-users-chown -U'
-        [ARG]='-D --directory -u --user --uuid --capability --drop-capability --link-journal --bind --bind-ro
+                      --keep-unit -n --network-veth -j -x --ephemeral -a --as-pid2 -U --suppress-sync=yes
+                      --cleanup --user --system'
+        [ARG]='-D --directory -u --uid --uuid --capability --drop-capability --link-journal --bind --bind-ro
                       -M --machine -S --slice -E --setenv -Z --selinux-context -L --selinux-apifs-context
-                      --register --network-interface --network-bridge --personality -i --image --tmpfs
+                      --register --network-interface --network-bridge --personality -i --image --image-policy --tmpfs
                       --volatile --network-macvlan --kill-signal --template --notify-ready --root-hash --chdir
-                      --pivot-root --property --private-users --network-namespace-path --network-ipvlan
-                      --network-veth-extra --network-zone -p --port --system-call-filter --overlay --overlay-ro
-                      --settings --rlimit --hostname --no-new-privileges --oom-score-adjust --cpu-affinity
-                      --resolv-conf --timezone'
+                      --pivot-root --property --private-users --private-users-ownership --network-namespace-path
+                      --network-ipvlan --network-veth-extra --network-zone -p --port --system-call-filter --overlay
+                      --overlay-ro --settings --rlimit --hostname --no-new-privileges --oom-score-adjust --cpu-affinity
+                      --resolv-conf --timezone --root-hash-sig --background --oci-bundle --verity-data
+                      --restrict-address-families
+                      --forward-journal --forward-journal-max-use --forward-journal-keep-free
+                      --forward-journal-max-file-size --forward-journal-max-files'
     )
 
     _init_completion || return
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
         case $prev in
-            --directory|-D|--template)
+            --directory|-D|--template|--oci-bundle)
                 compopt -o nospace
                 comps=$(compgen -S/ -A directory -- "$cur" )
                 ;;
-            --user|-u)
+            --uid|-u)
                 comps=$( __get_users )
                 ;;
             --uuid|--root-hash)
@@ -125,7 +134,7 @@ _systemd_nspawn() {
                 comps=''
                 ;;
             --register)
-                comps='yes no'
+                comps='yes no auto'
                 ;;
             --network-interface)
                 comps=$(__get_interfaces)
@@ -154,7 +163,7 @@ _systemd_nspawn() {
                 comps='yes no'
                 ;;
             --private-users)
-                comps='yes no pick'
+                comps='yes no pick identity managed'
                 ;;
             --network-namespace-path)
                 comps=$( compgen -A file -- "$cur" )
@@ -182,6 +191,10 @@ _systemd_nspawn() {
                 ;;
             --timezone)
                 comps=$( systemd-nspawn --timezone=help 2>/dev/null )
+                ;;
+            --root-hash-sig)
+                compopt -o nospace
+                comps=$( compgen -A file -- "$cur" )
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

@@ -1,91 +1,63 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "macro.h"
+#include "forward.h"
 
-enum {
-        NETLINK_TYPE_UNSPEC,
+typedef enum NLAType {
+        NETLINK_TYPE_UNSPEC,                    /* NLA_UNSPEC */
+        NETLINK_TYPE_BINARY,                    /* NLA_BINARY */
+        NETLINK_TYPE_FLAG,                      /* NLA_FLAG */
         NETLINK_TYPE_U8,                        /* NLA_U8 */
         NETLINK_TYPE_U16,                       /* NLA_U16 */
         NETLINK_TYPE_U32,                       /* NLA_U32 */
         NETLINK_TYPE_U64,                       /* NLA_U64 */
+        NETLINK_TYPE_S8,                        /* NLA_S8 */
+        NETLINK_TYPE_S16,                       /* NLA_S16 */
+        NETLINK_TYPE_S32,                       /* NLA_S32 */
+        NETLINK_TYPE_S64,                       /* NLA_S64 */
         NETLINK_TYPE_STRING,                    /* NLA_STRING */
-        NETLINK_TYPE_FLAG,                      /* NLA_FLAG */
+        NETLINK_TYPE_BITFIELD32,                /* NLA_BITFIELD32 */
+        NETLINK_TYPE_REJECT,                    /* NLA_REJECT */
         NETLINK_TYPE_IN_ADDR,
         NETLINK_TYPE_ETHER_ADDR,
         NETLINK_TYPE_CACHE_INFO,
-        NETLINK_TYPE_NESTED,                    /* NLA_NESTED */
-        NETLINK_TYPE_UNION,
         NETLINK_TYPE_SOCKADDR,
-};
+        NETLINK_TYPE_NESTED,                    /* NLA_NESTED */
+        NETLINK_TYPE_NESTED_UNION_BY_STRING,
+        NETLINK_TYPE_NESTED_UNION_BY_FAMILY,
+        _NETLINK_TYPE_MAX,
+        _NETLINK_TYPE_INVALID = -EINVAL,
+} NLAType;
 
-typedef enum NLMatchType {
-        NL_MATCH_SIBLING,
-        NL_MATCH_PROTOCOL,
-} NLMatchType;
+typedef struct NLAPolicy NLAPolicy;
+typedef struct NLAPolicySet NLAPolicySet;
+typedef struct NLAPolicySetUnion NLAPolicySetUnion;
 
-typedef struct NLTypeSystemUnion NLTypeSystemUnion;
-typedef struct NLTypeSystem NLTypeSystem;
-typedef struct NLType NLType;
+const NLAPolicy *rtnl_get_policy(uint16_t nlmsg_type);
+const NLAPolicy *nfnl_get_policy(uint16_t nlmsg_type);
+const NLAPolicy *sdnl_get_policy(uint16_t nlmsg_type, uint16_t nlmsg_flags);
+const NLAPolicySet *genl_get_policy_set_by_name(const char *name);
+int genl_get_policy_set_and_header_size(
+                sd_netlink *nl,
+                uint16_t id,
+                const NLAPolicySet **ret_policy_set,
+                size_t *ret_header_size);
 
-struct NLTypeSystemUnion {
-        int num;
-        NLMatchType match_type;
-        uint16_t match;
-        int (*lookup)(const char *);
-        const NLTypeSystem *type_systems;
-};
+NLAType policy_get_type(const NLAPolicy *policy);
+size_t policy_get_size(const NLAPolicy *policy);
+const NLAPolicySet *policy_get_policy_set(const NLAPolicy *policy);
+const NLAPolicySetUnion *policy_get_policy_set_union(const NLAPolicy *policy);
 
-extern const NLTypeSystem rtnl_type_system_root;
-extern const NLTypeSystem genl_type_system_root;
-extern const NLTypeSystem genl_family_type_system_root;
+int netlink_get_policy_set_and_header_size(
+                sd_netlink *nl,
+                uint16_t type,
+                uint16_t flags,
+                const NLAPolicySet **ret_policy_set,
+                size_t *ret_header_size);
 
-uint16_t type_get_type(const NLType *type);
-size_t type_get_size(const NLType *type);
-void type_get_type_system(const NLType *type, const NLTypeSystem **ret);
-void type_get_type_system_union(const NLType *type, const NLTypeSystemUnion **ret);
-
-const NLTypeSystem* type_system_get_root(int protocol);
-uint16_t type_system_get_count(const NLTypeSystem *type_system);
-int type_system_get_type(const NLTypeSystem *type_system, const NLType **ret, uint16_t type);
-int type_system_get_type_system(const NLTypeSystem *type_system, const NLTypeSystem **ret, uint16_t type);
-int type_system_get_type_system_union(const NLTypeSystem *type_system, const NLTypeSystemUnion **ret, uint16_t type);
-int type_system_union_get_type_system(const NLTypeSystemUnion *type_system_union, const NLTypeSystem **ret, const char *key);
-int type_system_union_protocol_get_type_system(const NLTypeSystemUnion *type_system_union, const NLTypeSystem **ret, uint16_t protocol);
-
-typedef enum NLUnionLinkInfoData {
-        NL_UNION_LINK_INFO_DATA_BOND,
-        NL_UNION_LINK_INFO_DATA_BRIDGE,
-        NL_UNION_LINK_INFO_DATA_VLAN,
-        NL_UNION_LINK_INFO_DATA_VETH,
-        NL_UNION_LINK_INFO_DATA_DUMMY,
-        NL_UNION_LINK_INFO_DATA_MACVLAN,
-        NL_UNION_LINK_INFO_DATA_MACVTAP,
-        NL_UNION_LINK_INFO_DATA_IPVLAN,
-        NL_UNION_LINK_INFO_DATA_IPVTAP,
-        NL_UNION_LINK_INFO_DATA_VXLAN,
-        NL_UNION_LINK_INFO_DATA_IPIP_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_IPGRE_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_ERSPAN,
-        NL_UNION_LINK_INFO_DATA_IPGRETAP_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_IP6GRE_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_IP6GRETAP_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_SIT_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_VTI_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_VTI6_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_IP6TNL_TUNNEL,
-        NL_UNION_LINK_INFO_DATA_VRF,
-        NL_UNION_LINK_INFO_DATA_VCAN,
-        NL_UNION_LINK_INFO_DATA_GENEVE,
-        NL_UNION_LINK_INFO_DATA_VXCAN,
-        NL_UNION_LINK_INFO_DATA_WIREGUARD,
-        NL_UNION_LINK_INFO_DATA_NETDEVSIM,
-        NL_UNION_LINK_INFO_DATA_CAN,
-        NL_UNION_LINK_INFO_DATA_MACSEC,
-        NL_UNION_LINK_INFO_DATA_NLMON,
-        _NL_UNION_LINK_INFO_DATA_MAX,
-        _NL_UNION_LINK_INFO_DATA_INVALID = -1
-} NLUnionLinkInfoData;
-
-const char *nl_union_link_info_data_to_string(NLUnionLinkInfoData p) _const_;
-NLUnionLinkInfoData nl_union_link_info_data_from_string(const char *p) _pure_;
+const NLAPolicy *policy_set_get_policy(const NLAPolicySet *policy_set, uint16_t attr_type);
+const NLAPolicySet *policy_set_get_policy_set(const NLAPolicySet *policy_set, uint16_t attr_type);
+const NLAPolicySetUnion *policy_set_get_policy_set_union(const NLAPolicySet *policy_set, uint16_t attr_type);
+uint16_t policy_set_union_get_match_attribute(const NLAPolicySetUnion *policy_set_union);
+const NLAPolicySet *policy_set_union_get_policy_set_by_string(const NLAPolicySetUnion *policy_set_union, const char *string);
+const NLAPolicySet *policy_set_union_get_policy_set_by_family(const NLAPolicySetUnion *policy_set_union, int family);

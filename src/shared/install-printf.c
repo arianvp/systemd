@@ -1,25 +1,18 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-
-#include "format-util.h"
-#include "install-printf.h"
+#include "alloc-util.h"
 #include "install.h"
-#include "macro.h"
+#include "install-printf.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
-#include "user-util.h"
 
-static int specifier_prefix_and_instance(char specifier, const void *data, const void *userdata, char **ret) {
-        const UnitFileInstallInfo *i = userdata;
+static int specifier_prefix_and_instance(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
+        const InstallInfo *i = ASSERT_PTR(userdata);
         _cleanup_free_ char *prefix = NULL;
         int r;
 
-        assert(i);
+        assert(ret);
 
         r = unit_name_to_prefix_and_instance(i->name, &prefix);
         if (r < 0)
@@ -38,36 +31,27 @@ static int specifier_prefix_and_instance(char specifier, const void *data, const
         return 0;
 }
 
-static int specifier_name(char specifier, const void *data, const void *userdata, char **ret) {
-        const UnitFileInstallInfo *i = userdata;
-        char *ans;
-
-        assert(i);
+static int specifier_name(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
+        const InstallInfo *i = ASSERT_PTR(userdata);
 
         if (unit_name_is_valid(i->name, UNIT_NAME_TEMPLATE) && i->default_instance)
                 return unit_name_replace_instance(i->name, i->default_instance, ret);
 
-        ans = strdup(i->name);
-        if (!ans)
-                return -ENOMEM;
-        *ret = ans;
-        return 0;
+        return strdup_to(ret, i->name);
 }
 
-static int specifier_prefix(char specifier, const void *data, const void *userdata, char **ret) {
-        const UnitFileInstallInfo *i = userdata;
-
-        assert(i);
+static int specifier_prefix(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
+        const InstallInfo *i = ASSERT_PTR(userdata);
 
         return unit_name_to_prefix(i->name, ret);
 }
 
-static int specifier_instance(char specifier, const void *data, const void *userdata, char **ret) {
-        const UnitFileInstallInfo *i = userdata;
+static int specifier_instance(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
+        const InstallInfo *i = ASSERT_PTR(userdata);
         char *instance;
         int r;
 
-        assert(i);
+        assert(ret);
 
         r = unit_name_to_instance(i->name, &instance);
         if (r < 0)
@@ -83,66 +67,48 @@ static int specifier_instance(char specifier, const void *data, const void *user
         return 0;
 }
 
-static int specifier_last_component(char specifier, const void *data, const void *userdata, char **ret) {
+static int specifier_last_component(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         _cleanup_free_ char *prefix = NULL;
         char *dash;
         int r;
 
-        r = specifier_prefix(specifier, data, userdata, &prefix);
+        assert(ret);
+
+        r = specifier_prefix(specifier, data, root, userdata, &prefix);
         if (r < 0)
                 return r;
 
         dash = strrchr(prefix, '-');
-        if (dash) {
-                dash = strdup(dash + 1);
-                if (!dash)
-                        return -ENOMEM;
-                *ret = dash;
-        } else
-                *ret = TAKE_PTR(prefix);
+        if (dash)
+                return strdup_to(ret, dash + 1);
 
+        *ret = TAKE_PTR(prefix);
         return 0;
 }
 
-int install_full_printf(const UnitFileInstallInfo *i, const char *format, char **ret) {
-        /* This is similar to unit_full_printf() but does not support
-         * anything path-related.
-         *
-         * %n: the full id of the unit                 (foo@bar.waldo)
-         * %N: the id of the unit without the suffix   (foo@bar)
-         * %p: the prefix                              (foo)
-         * %i: the instance                            (bar)
-
-         * %U the UID of the running user
-         * %u the username of running user
-         * %m the machine ID of the running system
-         * %H the host name of the running system
-         * %b the boot ID of the running system
-         * %v `uname -r` of the running system
-         */
+int install_name_printf(
+                RuntimeScope scope,
+                const InstallInfo *info,
+                const char *format,
+                char **ret) {
+        /* This is similar to unit_name_printf() */
 
         const Specifier table[] = {
+                { 'i', specifier_instance,            NULL },
+                { 'j', specifier_last_component,      NULL },
                 { 'n', specifier_name,                NULL },
                 { 'N', specifier_prefix_and_instance, NULL },
                 { 'p', specifier_prefix,              NULL },
-                { 'i', specifier_instance,            NULL },
-                { 'j', specifier_last_component,      NULL },
 
-                { 'g', specifier_group_name,          NULL },
-                { 'G', specifier_group_id,            NULL },
-                { 'U', specifier_user_id,             NULL },
-                { 'u', specifier_user_name,           NULL },
+                COMMON_SYSTEM_SPECIFIERS,
 
-                { 'm', specifier_machine_id,          NULL },
-                { 'H', specifier_host_name,           NULL },
-                { 'b', specifier_boot_id,             NULL },
-                { 'v', specifier_kernel_release,      NULL },
+                COMMON_CREDS_SPECIFIERS(scope),
                 {}
         };
 
-        assert(i);
+        assert(info);
         assert(format);
         assert(ret);
 
-        return specifier_printf(format, table, i, ret);
+        return specifier_printf(format, UNIT_NAME_MAX, table, info->root, info, ret);
 }

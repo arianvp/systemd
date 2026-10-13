@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-escape"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -25,7 +25,12 @@
     <cmdsynopsis>
       <command>systemd-escape</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
-      <arg choice="opt" rep="repeat">STRING</arg>
+      <arg choice="plain" rep="repeat">STRING</arg>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-escape</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain"><option>--stdin</option></arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -38,7 +43,9 @@
 
     <para>The command takes any number of strings on the command line,
     and will process them individually, one after another. It will
-    output them separated by spaces to stdout.</para>
+    output them separated by spaces to stdout. If <option>--stdin</option> is specified, strings are
+    instead read from standard input, one per line, and the result for each input line is written on a
+    separate output line.</para>
 
     <para>By default, this command will escape the strings passed,
     unless <option>--unescape</option> is passed which results in the
@@ -65,7 +72,9 @@
         systemd, such as <literal>service</literal> or
         <literal>mount</literal>. May not be used in conjunction with
         <option>--template=</option>, <option>--unescape</option> or
-        <option>--mangle</option>.</para></listitem>
+        <option>--mangle</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v216"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -79,19 +88,37 @@
         part. May not be used in conjunction with
         <option>--suffix=</option>,
         <option>--instance</option> or
-        <option>--mangle</option>.</para></listitem>
+        <option>--mangle</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v216"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--stdin</option></term>
+
+        <listitem><para>Read strings from standard input, one per line, instead of from the command line.
+        The line ending is not included in the string to escape or unescape, and the result for each line
+        is written on a separate output line. This option may not be combined with command line strings.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--path</option></term>
         <term><option>-p</option></term>
 
-        <listitem><para>When escaping or unescaping a string, assume it refers to a file system path. This eliminates
-        leading, trailing or duplicate <literal>/</literal> characters and rejects <literal>.</literal> and
-        <literal>..</literal> path components. This is particularly useful for generating strings suitable for
-        unescaping with the <literal>%f</literal> specifier in unit files, see
+        <listitem><para>When escaping or unescaping a string, assume it refers to a file system path. This
+        simplifies the path (leading, trailing, and duplicate <literal>/</literal> characters are removed,
+        no-op path <literal>.</literal> components are removed, and for absolute paths, leading
+        <literal>..</literal> components are removed). After the simplification, the path must not contain
+        <literal>..</literal>.</para>
+
+        <para>This is particularly useful for generating strings suitable for unescaping with the
+        <literal>%f</literal> specifier in unit files, see
         <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v216"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -101,7 +128,9 @@
         <listitem><para>Instead of escaping the specified strings,
         undo the escaping, reversing the operation. May not be used in
         conjunction with <option>--suffix=</option> or
-        <option>--mangle</option>.</para></listitem>
+        <option>--mangle</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v216"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -113,7 +142,9 @@
         possibly automatically append an appropriate unit type suffix
         to the string. May not be used in conjunction with
         <option>--suffix=</option>, <option>--template=</option> or
-        <option>--unescape</option>.</para></listitem>
+        <option>--unescape</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v216"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -126,7 +157,9 @@
         like <filename>ssh.service</filename>.
         Must be used in conjunction with <option>--unescape</option>
         and may not be used in conjunction with
-        <option>--template</option>.</para></listitem>
+        <option>--template</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v240"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -154,6 +187,11 @@ tmp-waldi-foobar.mount</programlisting>
     <programlisting>$ systemd-escape --template=systemd-nspawn@.service 'My Container 1' 'containerb' 'container/III'
 systemd-nspawn@My\x20Container\x201.service systemd-nspawn@containerb.service systemd-nspawn@container-III.service</programlisting>
 
+    <para>To generate instance names from standard input:</para>
+    <programlisting>$ printf '%s\n' 'My Container 1' 'container/III' | systemd-escape --stdin --template=systemd-nspawn@.service
+systemd-nspawn@My\x20Container\x201.service
+systemd-nspawn@container-III.service</programlisting>
+
     <para>To extract the instance part of an instantiated unit:</para>
     <programlisting>$ systemd-escape -u --instance 'systemd-nspawn@My\x20Container\x201.service'
 My Container 1</programlisting>
@@ -172,11 +210,11 @@ My Container 1</programlisting>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

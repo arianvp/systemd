@@ -1,18 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <sys/eventfd.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "barrier.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "macro.h"
+#include "io-util.h"
 
 /**
  * Barriers
@@ -90,8 +86,7 @@
  * Returns: 0 on success, negative error code on failure.
  */
 int barrier_create(Barrier *b) {
-        _cleanup_(barrier_destroyp) Barrier *staging = b;
-        int r;
+        _unused_ _cleanup_(barrier_destroyp) Barrier *staging = b;
 
         assert(b);
 
@@ -103,8 +98,7 @@ int barrier_create(Barrier *b) {
         if (b->them < 0)
                 return -errno;
 
-        r = pipe2(b->pipe, O_CLOEXEC | O_NONBLOCK);
-        if (r < 0)
+        if (pipe2(b->pipe, O_CLOEXEC | O_NONBLOCK) < 0)
                 return -errno;
 
         staging = NULL;
@@ -123,14 +117,15 @@ int barrier_create(Barrier *b) {
  *
  * If @b is NULL, this is a no-op.
  */
-void barrier_destroy(Barrier *b) {
+Barrier* barrier_destroy(Barrier *b) {
         if (!b)
-                return;
+                return NULL;
 
         b->me = safe_close(b->me);
         b->them = safe_close(b->them);
         safe_close_pair(b->pipe);
         b->barriers = 0;
+        return NULL;
 }
 
 /**
@@ -175,9 +170,9 @@ static bool barrier_write(Barrier *b, uint64_t buf) {
                 return false;
 
         assert(b->me >= 0);
-        do {
+        do
                 len = write(b->me, &buf, sizeof(buf));
-        } while (len < 0 && IN_SET(errno, EAGAIN, EINTR));
+        while (len < 0 && ERRNO_IS_TRANSIENT(errno));
 
         if (len != sizeof(buf))
                 goto error;
@@ -218,10 +213,10 @@ static bool barrier_read(Barrier *b, int64_t comp) {
                 uint64_t buf;
                 int r;
 
-                r = poll(pfd, 2, -1);
-                if (r < 0 && IN_SET(errno, EAGAIN, EINTR))
+                r = ppoll_usec(pfd, ELEMENTSOF(pfd), USEC_INFINITY);
+                if (r == -EINTR)
                         continue;
-                else if (r < 0)
+                if (r < 0)
                         goto error;
 
                 if (pfd[1].revents) {
@@ -229,7 +224,7 @@ static bool barrier_read(Barrier *b, int64_t comp) {
 
                         /* events on @them signal new data for us */
                         len = read(b->them, &buf, sizeof(buf));
-                        if (len < 0 && IN_SET(errno, EAGAIN, EINTR))
+                        if (len < 0 && ERRNO_IS_TRANSIENT(errno))
                                 continue;
 
                         if (len != sizeof(buf))

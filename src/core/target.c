@@ -1,22 +1,22 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "dbus-target.h"
+#include <stdio.h>
+
 #include "dbus-unit.h"
-#include "log.h"
 #include "serialize.h"
 #include "special.h"
 #include "string-util.h"
 #include "target.h"
-#include "unit-name.h"
 #include "unit.h"
 
 static const UnitActiveState state_translation_table[_TARGET_STATE_MAX] = {
-        [TARGET_DEAD] = UNIT_INACTIVE,
-        [TARGET_ACTIVE] = UNIT_ACTIVE
+        [TARGET_DEAD]   = UNIT_INACTIVE,
+        [TARGET_ACTIVE] = UNIT_ACTIVE,
 };
 
 static void target_set_state(Target *t, TargetState state) {
         TargetState old_state;
+
         assert(t);
 
         if (t->state != state)
@@ -26,45 +26,38 @@ static void target_set_state(Target *t, TargetState state) {
         t->state = state;
 
         if (state != old_state)
-                log_debug("%s changed %s -> %s",
-                          UNIT(t)->id,
-                          target_state_to_string(old_state),
-                          target_state_to_string(state));
+                log_unit_debug(UNIT(t), "Changed %s -> %s",
+                               target_state_to_string(old_state), target_state_to_string(state));
 
-        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], 0);
+        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], /* reload_success= */ true);
 }
 
 static int target_add_default_dependencies(Target *t) {
-
-        static const UnitDependency deps[] = {
-                UNIT_REQUIRES,
-                UNIT_REQUISITE,
-                UNIT_WANTS,
-                UNIT_BINDS_TO,
-                UNIT_PART_OF
-        };
-
-        int r;
-        unsigned k;
+        _cleanup_free_ Unit **others = NULL;
+        int r, n_others;
 
         assert(t);
 
         if (!UNIT(t)->default_dependencies)
                 return 0;
 
-        /* Imply ordering for requirement dependencies on target units. Note that when the user created a contradicting
-         * ordering manually we won't add anything in here to make sure we don't create a loop. */
+        /* Imply ordering for requirement dependencies on target units. Note that when the user created a
+         * contradicting ordering manually we won't add anything in here to make sure we don't create a
+         * loop.
+         *
+         * Note that quite likely iterating through these dependencies will add new dependencies, which
+         * conflicts with the hashmap-based iteration logic. Hence, instead of iterating through the
+         * dependencies and acting on them as we go, first take an "atomic snapshot" of sorts and iterate
+         * through that. */
 
-        for (k = 0; k < ELEMENTSOF(deps); k++) {
-                Unit *other;
-                Iterator i;
-                void *v;
+        n_others = unit_get_dependency_array(UNIT(t), UNIT_ATOM_ADD_DEFAULT_TARGET_DEPENDENCY_QUEUE, &others);
+        if (n_others < 0)
+                return n_others;
 
-                HASHMAP_FOREACH_KEY(v, other, UNIT(t)->dependencies[deps[k]], i) {
-                        r = unit_add_default_target_dependency(other, UNIT(t));
-                        if (r < 0)
-                                return r;
-                }
+        FOREACH_ARRAY(i, others, n_others) {
+                r = unit_add_default_target_dependency(*i, UNIT(t));
+                if (r < 0)
+                        return r;
         }
 
         if (unit_has_name(UNIT(t), SPECIAL_SHUTDOWN_TARGET))
@@ -75,29 +68,23 @@ static int target_add_default_dependencies(Target *t) {
 }
 
 static int target_load(Unit *u) {
-        Target *t = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
         int r;
 
-        assert(t);
-
-        r = unit_load_fragment_and_dropin(u);
+        r = unit_load_fragment_and_dropin(u, true);
         if (r < 0)
                 return r;
 
-        /* This is a new unit? Then let's add in some extras */
-        if (u->load_state == UNIT_LOADED) {
-                r = target_add_default_dependencies(t);
-                if (r < 0)
-                        return r;
-        }
+        if (u->load_state != UNIT_LOADED)
+                return 0;
 
-        return 0;
+        /* This is a new unit? Then let's add in some extras */
+        return target_add_default_dependencies(t);
 }
 
 static int target_coldplug(Unit *u) {
-        Target *t = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        assert(t);
         assert(t->state == TARGET_DEAD);
 
         if (t->deserialized_state != t->state)
@@ -107,10 +94,10 @@ static int target_coldplug(Unit *u) {
 }
 
 static void target_dump(Unit *u, FILE *f, const char *prefix) {
-        Target *t = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        assert(t);
         assert(f);
+        assert(prefix);
 
         fprintf(f,
                 "%sTarget State: %s\n",
@@ -118,10 +105,9 @@ static void target_dump(Unit *u, FILE *f, const char *prefix) {
 }
 
 static int target_start(Unit *u) {
-        Target *t = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
         int r;
 
-        assert(t);
         assert(t->state == TARGET_DEAD);
 
         r = unit_acquire_invocation_id(u);
@@ -133,9 +119,8 @@ static int target_start(Unit *u) {
 }
 
 static int target_stop(Unit *u) {
-        Target *t = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        assert(t);
         assert(t->state == TARGET_ACTIVE);
 
         target_set_state(t, TARGET_DEAD);
@@ -143,20 +128,18 @@ static int target_stop(Unit *u) {
 }
 
 static int target_serialize(Unit *u, FILE *f, FDSet *fds) {
-        Target *s = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        assert(s);
         assert(f);
         assert(fds);
 
-        (void) serialize_item(f, "state", target_state_to_string(s->state));
+        (void) serialize_item(f, "state", target_state_to_string(t->state));
         return 0;
 }
 
 static int target_deserialize_item(Unit *u, const char *key, const char *value, FDSet *fds) {
-        Target *s = TARGET(u);
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        assert(u);
         assert(key);
         assert(value);
         assert(fds);
@@ -166,26 +149,26 @@ static int target_deserialize_item(Unit *u, const char *key, const char *value, 
 
                 state = target_state_from_string(value);
                 if (state < 0)
-                        log_debug("Failed to parse state value %s", value);
+                        log_unit_debug(u, "Failed to parse state: %s", value);
                 else
-                        s->deserialized_state = state;
+                        t->deserialized_state = state;
 
         } else
-                log_debug("Unknown serialization key '%s'", key);
+                log_unit_debug(u, "Unknown serialization key: %s", key);
 
         return 0;
 }
 
-_pure_ static UnitActiveState target_active_state(Unit *u) {
-        assert(u);
+static UnitActiveState target_active_state(Unit *u) {
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        return state_translation_table[TARGET(u)->state];
+        return state_translation_table[t->state];
 }
 
-_pure_ static const char *target_sub_state_to_string(Unit *u) {
-        assert(u);
+static const char *target_sub_state_to_string(Unit *u) {
+        Target *t = ASSERT_PTR(TARGET(u));
 
-        return target_state_to_string(TARGET(u)->state);
+        return target_state_to_string(t->state);
 }
 
 const UnitVTable target_vtable = {
@@ -195,6 +178,8 @@ const UnitVTable target_vtable = {
                 "Unit\0"
                 "Target\0"
                 "Install\0",
+
+        .can_fail = true,
 
         .load = target_load,
         .coldplug = target_coldplug,
@@ -210,8 +195,6 @@ const UnitVTable target_vtable = {
         .active_state = target_active_state,
         .sub_state_to_string = target_sub_state_to_string,
 
-        .bus_vtable = bus_target_vtable,
-
         .status_message_formats = {
                 .finished_start_job = {
                         [JOB_DONE]       = "Reached target %s.",
@@ -220,4 +203,6 @@ const UnitVTable target_vtable = {
                         [JOB_DONE]       = "Stopped target %s.",
                 },
         },
+
+        .notify_supervisor = true,
 };

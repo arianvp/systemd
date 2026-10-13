@@ -1,52 +1,71 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
-#include <stdio.h>
+#include <malloc.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-#include "sd-bus-protocol.h"
 #include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-event.h"
-#include "sd-id128.h"
 
 #include "alloc-util.h"
+#include "bus-common-errors.h"
 #include "bus-internal.h"
 #include "bus-label.h"
-#include "bus-message.h"
 #include "bus-util.h"
-#include "cap-list.h"
-#include "cgroup-util.h"
-#include "def.h"
-#include "escape.h"
+#include "capsule-util.h"
+#include "chase.h"
+#include "daemon-util.h"
+#include "env-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "missing.h"
-#include "mountpoint-util.h"
-#include "nsflags.h"
-#include "parse-util.h"
-#include "proc-cmdline.h"
-#include "rlimit-util.h"
+#include "format-util.h"
+#include "log.h"
+#include "memfd-util.h"
+#include "memstream-util.h"
+#include "path-util.h"
+#include "pidref.h"
+#include "socket-util.h"
 #include "stdio-util.h"
+#include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
-#include "user-util.h"
+#include "time-util.h"
 
-static int name_owner_change_callback(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
-        sd_event *e = userdata;
+static int name_owner_change_callback(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
+        sd_event *e = ASSERT_PTR(userdata);
 
         assert(m);
-        assert(e);
 
         sd_bus_close(sd_bus_message_get_bus(m));
         sd_event_exit(e, 0);
 
         return 1;
+}
+
+int bus_log_address_error(int r, BusTransport transport) {
+        bool hint = transport == BUS_TRANSPORT_LOCAL && r == -ENOMEDIUM;
+
+        return log_error_errno(r,
+                               hint ? "Failed to set bus address: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined (consider using --machine=<user>@.host --user to connect to bus of other user)" :
+                                      "Failed to set bus address: %m");
+}
+
+int bus_log_connect_full(int log_level, int r, BusTransport transport, RuntimeScope scope) {
+        bool hint_vars = transport == BUS_TRANSPORT_LOCAL && r == -ENOMEDIUM,
+             hint_addr = transport == BUS_TRANSPORT_LOCAL && ERRNO_IS_PRIVILEGE(r);
+
+        return log_full_errno(log_level, r,
+                              hint_vars ? "Failed to connect to %s scope bus via %s transport: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined (consider using --machine=<user>@.host --user to connect to bus of other user)" :
+                              hint_addr ? "Failed to connect to %s scope bus via %s transport: Operation not permitted (consider using --machine=<user>@.host --user to connect to bus of other user)" :
+                                          "Failed to connect to %s scope bus via %s transport: %m", runtime_scope_to_string(scope), bus_transport_to_string(transport));
+}
+
+int bus_log_connect_error(int r, BusTransport transport, RuntimeScope scope) {
+        return bus_log_connect_full(LOG_ERR, r, transport, scope);
 }
 
 int bus_async_unregister_and_exit(sd_event *e, sd_bus *bus, const char *name) {
@@ -88,6 +107,19 @@ int bus_async_unregister_and_exit(sd_event *e, sd_bus *bus, const char *name) {
         return 0;
 }
 
+static bool idle_allowed(void) {
+        static int allowed = -1;
+
+        if (allowed >= 0)
+                return allowed;
+
+        allowed = secure_getenv_bool("SYSTEMD_EXIT_ON_IDLE");
+        if (allowed < 0 && allowed != -ENXIO)
+                log_debug_errno(allowed, "Failed to parse $SYSTEMD_EXIT_ON_IDLE, ignoring: %m");
+
+        return allowed != 0;
+}
+
 int bus_event_loop_with_idle(
                 sd_event *e,
                 sd_bus *bus,
@@ -95,6 +127,7 @@ int bus_event_loop_with_idle(
                 usec_t timeout,
                 check_idle_t check_idle,
                 void *userdata) {
+
         bool exiting = false;
         int r, code;
 
@@ -111,46 +144,29 @@ int bus_event_loop_with_idle(
                 if (r == SD_EVENT_FINISHED)
                         break;
 
-                if (check_idle)
+                if (!idle_allowed() || sd_bus_pending_method_calls(bus) > 0)
+                        idle = false;
+                else if (check_idle)
                         idle = check_idle(userdata);
                 else
                         idle = true;
 
-                r = sd_event_run(e, exiting || !idle ? (uint64_t) -1 : timeout);
+                r = sd_event_run(e, exiting || !idle ? UINT64_MAX : timeout);
                 if (r < 0)
                         return r;
 
                 if (r == 0 && !exiting && idle) {
+                        log_debug("Idle for %s, exiting.", FORMAT_TIMESPAN(timeout, 1));
 
-                        r = sd_bus_try_close(bus);
-                        if (r == -EBUSY)
-                                continue;
+                        /* Inform the service manager that we are going down, so that it will queue all
+                         * further start requests, instead of assuming we are still running. */
+                        (void) sd_notify(false, NOTIFY_STOPPING_MESSAGE);
 
-                        /* Fallback for dbus1 connections: we
-                         * unregister the name and wait for the
-                         * response to come through for it */
-                        if (r == -EOPNOTSUPP) {
-
-                                /* Inform the service manager that we
-                                 * are going down, so that it will
-                                 * queue all further start requests,
-                                 * instead of assuming we are already
-                                 * running. */
-                                sd_notify(false, "STOPPING=1");
-
-                                r = bus_async_unregister_and_exit(e, bus, name);
-                                if (r < 0)
-                                        return r;
-
-                                exiting = true;
-                                continue;
-                        }
-
+                        r = bus_async_unregister_and_exit(e, bus, name);
                         if (r < 0)
                                 return r;
 
-                        sd_event_exit(e, 0);
-                        break;
+                        exiting = true;
                 }
         }
 
@@ -161,19 +177,19 @@ int bus_event_loop_with_idle(
         return code;
 }
 
-int bus_name_has_owner(sd_bus *c, const char *name, sd_bus_error *error) {
+int bus_name_has_owner(sd_bus *bus, const char *name, sd_bus_error *reterr_error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *rep = NULL;
         int r, has_owner = 0;
 
-        assert(c);
+        assert(bus);
         assert(name);
 
-        r = sd_bus_call_method(c,
+        r = sd_bus_call_method(bus,
                                "org.freedesktop.DBus",
                                "/org/freedesktop/dbus",
                                "org.freedesktop.DBus",
                                "NameHasOwner",
-                               error,
+                               reterr_error,
                                &rep,
                                "s",
                                name);
@@ -182,369 +198,32 @@ int bus_name_has_owner(sd_bus *c, const char *name, sd_bus_error *error) {
 
         r = sd_bus_message_read_basic(rep, 'b', &has_owner);
         if (r < 0)
-                return sd_bus_error_set_errno(error, r);
+                return sd_bus_error_set_errno(reterr_error, r);
 
         return has_owner;
 }
 
-static int check_good_user(sd_bus_message *m, uid_t good_user) {
-        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-        uid_t sender_uid;
-        int r;
-
-        assert(m);
-
-        if (good_user == UID_INVALID)
-                return 0;
-
-        r = sd_bus_query_sender_creds(m, SD_BUS_CREDS_EUID, &creds);
-        if (r < 0)
-                return r;
-
-        /* Don't trust augmented credentials for authorization */
-        assert_return((sd_bus_creds_get_augmented_mask(creds) & SD_BUS_CREDS_EUID) == 0, -EPERM);
-
-        r = sd_bus_creds_get_euid(creds, &sender_uid);
-        if (r < 0)
-                return r;
-
-        return sender_uid == good_user;
+bool bus_error_is_unknown_service(const sd_bus_error *error) {
+        return sd_bus_error_has_names(error,
+                                      SD_BUS_ERROR_SERVICE_UNKNOWN,
+                                      SD_BUS_ERROR_NAME_HAS_NO_OWNER,
+                                      BUS_ERROR_NO_SUCH_UNIT);
 }
 
-int bus_test_polkit(
-                sd_bus_message *call,
-                int capability,
-                const char *action,
-                const char **details,
-                uid_t good_user,
-                bool *_challenge,
-                sd_bus_error *e) {
-
-        int r;
-
-        assert(call);
-        assert(action);
-
-        /* Tests non-interactively! */
-
-        r = check_good_user(call, good_user);
-        if (r != 0)
-                return r;
-
-        r = sd_bus_query_sender_privilege(call, capability);
-        if (r < 0)
-                return r;
-        else if (r > 0)
-                return 1;
-#if ENABLE_POLKIT
-        else {
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-                int authorized = false, challenge = false;
-                const char *sender, **k, **v;
-
-                sender = sd_bus_message_get_sender(call);
-                if (!sender)
-                        return -EBADMSG;
-
-                r = sd_bus_message_new_method_call(
-                                call->bus,
-                                &request,
-                                "org.freedesktop.PolicyKit1",
-                                "/org/freedesktop/PolicyKit1/Authority",
-                                "org.freedesktop.PolicyKit1.Authority",
-                                "CheckAuthorization");
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_message_append(
-                                request,
-                                "(sa{sv})s",
-                                "system-bus-name", 1, "name", "s", sender,
-                                action);
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_message_open_container(request, 'a', "{ss}");
-                if (r < 0)
-                        return r;
-
-                STRV_FOREACH_PAIR(k, v, details) {
-                        r = sd_bus_message_append(request, "{ss}", *k, *v);
-                        if (r < 0)
-                                return r;
-                }
-
-                r = sd_bus_message_close_container(request);
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_message_append(request, "us", 0, NULL);
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_call(call->bus, request, 0, e, &reply);
-                if (r < 0) {
-                        /* Treat no PK available as access denied */
-                        if (sd_bus_error_has_name(e, SD_BUS_ERROR_SERVICE_UNKNOWN)) {
-                                sd_bus_error_free(e);
-                                return -EACCES;
-                        }
-
-                        return r;
-                }
-
-                r = sd_bus_message_enter_container(reply, 'r', "bba{ss}");
-                if (r < 0)
-                        return r;
-
-                r = sd_bus_message_read(reply, "bb", &authorized, &challenge);
-                if (r < 0)
-                        return r;
-
-                if (authorized)
-                        return 1;
-
-                if (_challenge) {
-                        *_challenge = challenge;
-                        return 0;
-                }
-        }
-#endif
-
-        return -EACCES;
+bool bus_error_is_connection(const sd_bus_error *error) {
+        return sd_bus_error_has_names(error,
+                                      SD_BUS_ERROR_NO_REPLY,
+                                      SD_BUS_ERROR_DISCONNECTED,
+                                      SD_BUS_ERROR_TIMED_OUT);
 }
 
-#if ENABLE_POLKIT
-
-typedef struct AsyncPolkitQuery {
-        sd_bus_message *request, *reply;
-        sd_bus_message_handler_t callback;
-        void *userdata;
-        sd_bus_slot *slot;
-        Hashmap *registry;
-} AsyncPolkitQuery;
-
-static void async_polkit_query_free(AsyncPolkitQuery *q) {
-
-        if (!q)
-                return;
-
-        sd_bus_slot_unref(q->slot);
-
-        if (q->registry && q->request)
-                hashmap_remove(q->registry, q->request);
-
-        sd_bus_message_unref(q->request);
-        sd_bus_message_unref(q->reply);
-
-        free(q);
-}
-
-static int async_polkit_callback(sd_bus_message *reply, void *userdata, sd_bus_error *error) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error_buffer = SD_BUS_ERROR_NULL;
-        AsyncPolkitQuery *q = userdata;
-        int r;
-
-        assert(reply);
-        assert(q);
-
-        q->slot = sd_bus_slot_unref(q->slot);
-        q->reply = sd_bus_message_ref(reply);
-
-        r = sd_bus_message_rewind(q->request, true);
-        if (r < 0) {
-                r = sd_bus_reply_method_errno(q->request, r, NULL);
-                goto finish;
-        }
-
-        r = q->callback(q->request, q->userdata, &error_buffer);
-        r = bus_maybe_reply_error(q->request, r, &error_buffer);
-
-finish:
-        async_polkit_query_free(q);
-
-        return r;
-}
-
-#endif
-
-int bus_verify_polkit_async(
-                sd_bus_message *call,
-                int capability,
-                const char *action,
-                const char **details,
-                bool interactive,
-                uid_t good_user,
-                Hashmap **registry,
-                sd_bus_error *error) {
-
-#if ENABLE_POLKIT
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *pk = NULL;
-        AsyncPolkitQuery *q;
-        const char *sender, **k, **v;
-        sd_bus_message_handler_t callback;
-        void *userdata;
-        int c;
-#endif
-        int r;
-
-        assert(call);
-        assert(action);
-        assert(registry);
-
-        r = check_good_user(call, good_user);
-        if (r != 0)
-                return r;
-
-#if ENABLE_POLKIT
-        q = hashmap_get(*registry, call);
-        if (q) {
-                int authorized, challenge;
-
-                /* This is the second invocation of this function, and
-                 * there's already a response from polkit, let's
-                 * process it */
-                assert(q->reply);
-
-                if (sd_bus_message_is_method_error(q->reply, NULL)) {
-                        const sd_bus_error *e;
-
-                        e = sd_bus_message_get_error(q->reply);
-
-                        /* Treat no PK available as access denied */
-                        if (sd_bus_error_has_name(e, SD_BUS_ERROR_SERVICE_UNKNOWN))
-                                return -EACCES;
-
-                        /* Copy error from polkit reply */
-                        sd_bus_error_copy(error, e);
-                        return -sd_bus_error_get_errno(e);
-                }
-
-                r = sd_bus_message_enter_container(q->reply, 'r', "bba{ss}");
-                if (r >= 0)
-                        r = sd_bus_message_read(q->reply, "bb", &authorized, &challenge);
-
-                if (r < 0)
-                        return r;
-
-                if (authorized)
-                        return 1;
-
-                if (challenge)
-                        return sd_bus_error_set(error, SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED, "Interactive authentication required.");
-
-                return -EACCES;
-        }
-#endif
-
-        r = sd_bus_query_sender_privilege(call, capability);
-        if (r < 0)
-                return r;
-        else if (r > 0)
-                return 1;
-
-#if ENABLE_POLKIT
-        if (sd_bus_get_current_message(call->bus) != call)
-                return -EINVAL;
-
-        callback = sd_bus_get_current_handler(call->bus);
-        if (!callback)
-                return -EINVAL;
-
-        userdata = sd_bus_get_current_userdata(call->bus);
-
-        sender = sd_bus_message_get_sender(call);
-        if (!sender)
-                return -EBADMSG;
-
-        c = sd_bus_message_get_allow_interactive_authorization(call);
-        if (c < 0)
-                return c;
-        if (c > 0)
-                interactive = true;
-
-        r = hashmap_ensure_allocated(registry, NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_new_method_call(
-                        call->bus,
-                        &pk,
-                        "org.freedesktop.PolicyKit1",
-                        "/org/freedesktop/PolicyKit1/Authority",
-                        "org.freedesktop.PolicyKit1.Authority",
-                        "CheckAuthorization");
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_append(
-                        pk,
-                        "(sa{sv})s",
-                        "system-bus-name", 1, "name", "s", sender,
-                        action);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_open_container(pk, 'a', "{ss}");
-        if (r < 0)
-                return r;
-
-        STRV_FOREACH_PAIR(k, v, details) {
-                r = sd_bus_message_append(pk, "{ss}", *k, *v);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_bus_message_close_container(pk);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_append(pk, "us", interactive, NULL);
-        if (r < 0)
-                return r;
-
-        q = new0(AsyncPolkitQuery, 1);
-        if (!q)
-                return -ENOMEM;
-
-        q->request = sd_bus_message_ref(call);
-        q->callback = callback;
-        q->userdata = userdata;
-
-        r = hashmap_put(*registry, call, q);
-        if (r < 0) {
-                async_polkit_query_free(q);
-                return r;
-        }
-
-        q->registry = *registry;
-
-        r = sd_bus_call_async(call->bus, &q->slot, pk, async_polkit_callback, q, 0);
-        if (r < 0) {
-                async_polkit_query_free(q);
-                return r;
-        }
-
-        return 0;
-#endif
-
-        return -EACCES;
-}
-
-void bus_verify_polkit_async_registry_free(Hashmap *registry) {
-#if ENABLE_POLKIT
-        hashmap_free_with_destructor(registry, async_polkit_query_free);
-#endif
-}
-
-int bus_check_peercred(sd_bus *c) {
+int bus_check_peercred(sd_bus *bus) {
         struct ucred ucred;
         int fd, r;
 
-        assert(c);
+        assert(bus);
 
-        fd = sd_bus_get_fd(c);
+        fd = sd_bus_get_fd(bus);
         if (fd < 0)
                 return fd;
 
@@ -558,17 +237,11 @@ int bus_check_peercred(sd_bus *c) {
         return 1;
 }
 
-int bus_connect_system_systemd(sd_bus **_bus) {
+int bus_connect_system_systemd(sd_bus **ret) {
         _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        assert(_bus);
-
-        if (geteuid() != 0)
-                return sd_bus_default_system(_bus);
-
-        /* If we are root then let's talk directly to the system
-         * instance, instead of going via the bus */
+        assert(ret);
 
         r = sd_bus_new(&bus);
         if (r < 0)
@@ -580,28 +253,27 @@ int bus_connect_system_systemd(sd_bus **_bus) {
 
         r = sd_bus_start(bus);
         if (r < 0)
-                return sd_bus_default_system(_bus);
+                return r;
 
         r = bus_check_peercred(bus);
         if (r < 0)
                 return r;
 
-        *_bus = TAKE_PTR(bus);
-
+        *ret = TAKE_PTR(bus);
         return 0;
 }
 
-int bus_connect_user_systemd(sd_bus **_bus) {
+int bus_connect_user_systemd(sd_bus **ret) {
         _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
         _cleanup_free_ char *ee = NULL;
         const char *e;
         int r;
 
-        assert(_bus);
+        assert(ret);
 
         e = secure_getenv("XDG_RUNTIME_DIR");
         if (!e)
-                return sd_bus_default_user(_bus);
+                return -ENOMEDIUM;
 
         ee = bus_address_escape(e);
         if (!ee)
@@ -617,684 +289,143 @@ int bus_connect_user_systemd(sd_bus **_bus) {
 
         r = sd_bus_start(bus);
         if (r < 0)
-                return sd_bus_default_user(_bus);
+                return r;
 
         r = bus_check_peercred(bus);
         if (r < 0)
                 return r;
 
-        *_bus = TAKE_PTR(bus);
-
+        *ret = TAKE_PTR(bus);
         return 0;
 }
 
-int bus_print_property_value(const char *name, const char *expected_value, bool only_value, const char *value) {
-        assert(name);
-
-        if (expected_value && !streq_ptr(expected_value, value))
-                return 0;
-
-        if (only_value)
-                puts(value);
-        else
-                printf("%s=%s\n", name, value);
-
-        return 0;
-}
-
-int bus_print_property_valuef(const char *name, const char *expected_value, bool only_value, const char *fmt, ...) {
-        va_list ap;
+static int pin_capsule_socket(const char *capsule, const char *suffix, uid_t *ret_uid, gid_t *ret_gid) {
+        _cleanup_close_ int inode_fd = -EBADF;
+        _cleanup_free_ char *p = NULL;
+        struct stat st;
         int r;
 
-        assert(name);
-        assert(fmt);
+        assert(capsule);
+        assert(suffix);
+        assert(ret_uid);
+        assert(ret_gid);
 
-        if (expected_value) {
-                _cleanup_free_ char *s = NULL;
+        p = path_join("/run/capsules", capsule, suffix);
+        if (!p)
+                return -ENOMEM;
 
-                va_start(ap, fmt);
-                r = vasprintf(&s, fmt, ap);
-                va_end(ap);
-                if (r < 0)
-                        return -ENOMEM;
+        /* We enter territory owned by the user, hence let's be paranoid about symlinks */
+        r = chase(p, /* root= */ NULL, CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS, /* ret_path= */ NULL, &inode_fd);
+        if (r < 0)
+                return r;
 
-                if (streq_ptr(expected_value, s)) {
-                        if (only_value)
-                                puts(s);
-                        else
-                                printf("%s=%s\n", name, s);
-                }
+        if (fstat(inode_fd, &st) < 0)
+                return negative_errno();
 
-                return 0;
-        }
+        *ret_uid = st.st_uid;
+        *ret_gid = st.st_gid;
 
-        if (!only_value)
-                printf("%s=", name);
-        va_start(ap, fmt);
-        vprintf(fmt, ap);
-        va_end(ap);
-        puts("");
-
-        return 0;
+        return TAKE_FD(inode_fd);
 }
 
-static int bus_print_property(const char *name, const char *expected_value, sd_bus_message *m, bool value, bool all) {
-        char type;
-        const char *contents;
-        int r;
-
-        assert(name);
-        assert(m);
-
-        r = sd_bus_message_peek_type(m, &type, &contents);
-        if (r < 0)
-                return r;
-
-        switch (type) {
-
-        case SD_BUS_TYPE_STRING: {
-                const char *s;
-
-                r = sd_bus_message_read_basic(m, type, &s);
-                if (r < 0)
-                        return r;
-
-                if (all || !isempty(s)) {
-                        bool good;
-
-                        /* This property has a single value, so we need to take
-                         * care not to print a new line, everything else is OK. */
-                        good = !strchr(s, '\n');
-                        bus_print_property_value(name, expected_value, value, good ? s : "[unprintable]");
-                }
-
-                return 1;
-        }
-
-        case SD_BUS_TYPE_BOOLEAN: {
-                int b;
-
-                r = sd_bus_message_read_basic(m, type, &b);
-                if (r < 0)
-                        return r;
-
-                if (expected_value && parse_boolean(expected_value) != b)
-                        return 1;
-
-                bus_print_property_value(name, NULL, value, yes_no(b));
-                return 1;
-        }
-
-        case SD_BUS_TYPE_UINT64: {
-                uint64_t u;
-
-                r = sd_bus_message_read_basic(m, type, &u);
-                if (r < 0)
-                        return r;
-
-                /* Yes, heuristics! But we can change this check
-                 * should it turn out to not be sufficient */
-
-                if (endswith(name, "Timestamp") ||
-                    STR_IN_SET(name, "NextElapseUSecRealtime", "LastTriggerUSec", "TimeUSec", "RTCTimeUSec")) {
-                        char timestamp[FORMAT_TIMESTAMP_MAX];
-                        const char *t;
-
-                        t = format_timestamp(timestamp, sizeof(timestamp), u);
-                        if (t || all)
-                                bus_print_property_value(name, expected_value, value, strempty(t));
-
-                } else if (strstr(name, "USec")) {
-                        char timespan[FORMAT_TIMESPAN_MAX];
-
-                        (void) format_timespan(timespan, sizeof(timespan), u, 0);
-                        bus_print_property_value(name, expected_value, value, timespan);
-
-                } else if (streq(name, "RestrictNamespaces")) {
-                        _cleanup_free_ char *s = NULL;
-                        const char *result;
-
-                        if ((u & NAMESPACE_FLAGS_ALL) == 0)
-                                result = "yes";
-                        else if (FLAGS_SET(u, NAMESPACE_FLAGS_ALL))
-                                result = "no";
-                        else {
-                                r = namespace_flags_to_string(u, &s);
-                                if (r < 0)
-                                        return r;
-
-                                result = s;
-                        }
-
-                        bus_print_property_value(name, expected_value, value, result);
-
-                } else if (streq(name, "MountFlags")) {
-                        const char *result;
-
-                        result = mount_propagation_flags_to_string(u);
-                        if (!result)
-                                return -EINVAL;
-
-                        bus_print_property_value(name, expected_value, value, result);
-
-                } else if (STR_IN_SET(name, "CapabilityBoundingSet", "AmbientCapabilities")) {
-                        _cleanup_free_ char *s = NULL;
-
-                        r = capability_set_to_string_alloc(u, &s);
-                        if (r < 0)
-                                return r;
-
-                        bus_print_property_value(name, expected_value, value, s);
-
-                } else if ((STR_IN_SET(name, "CPUWeight", "StartupCPUWeight", "IOWeight", "StartupIOWeight") && u == CGROUP_WEIGHT_INVALID) ||
-                           (STR_IN_SET(name, "CPUShares", "StartupCPUShares") && u == CGROUP_CPU_SHARES_INVALID) ||
-                           (STR_IN_SET(name, "BlockIOWeight", "StartupBlockIOWeight") && u == CGROUP_BLKIO_WEIGHT_INVALID) ||
-                           (STR_IN_SET(name, "MemoryCurrent", "TasksCurrent") && u == (uint64_t) -1) ||
-                           (endswith(name, "NSec") && u == (uint64_t) -1))
-
-                        bus_print_property_value(name, expected_value, value, "[not set]");
-
-                else if ((STR_IN_SET(name, "DefaultMemoryLow", "DefaultMemoryMin", "MemoryLow", "MemoryHigh", "MemoryMax", "MemorySwapMax", "MemoryLimit") && u == CGROUP_LIMIT_MAX) ||
-                         (STR_IN_SET(name, "TasksMax", "DefaultTasksMax") && u == (uint64_t) -1) ||
-                         (startswith(name, "Limit") && u == (uint64_t) -1) ||
-                         (startswith(name, "DefaultLimit") && u == (uint64_t) -1))
-
-                        bus_print_property_value(name, expected_value, value, "infinity");
-                else if (STR_IN_SET(name, "IPIngressBytes", "IPIngressPackets", "IPEgressBytes", "IPEgressPackets") && u == (uint64_t) -1)
-                        bus_print_property_value(name, expected_value, value, "[no data]");
-                else
-                        bus_print_property_valuef(name, expected_value, value, "%"PRIu64, u);
-
-                return 1;
-        }
-
-        case SD_BUS_TYPE_INT64: {
-                int64_t i;
-
-                r = sd_bus_message_read_basic(m, type, &i);
-                if (r < 0)
-                        return r;
-
-                bus_print_property_valuef(name, expected_value, value, "%"PRIi64, i);
-                return 1;
-        }
-
-        case SD_BUS_TYPE_UINT32: {
-                uint32_t u;
-
-                r = sd_bus_message_read_basic(m, type, &u);
-                if (r < 0)
-                        return r;
-
-                if (strstr(name, "UMask") || strstr(name, "Mode"))
-                        bus_print_property_valuef(name, expected_value, value, "%04o", u);
-
-                else if (streq(name, "UID")) {
-                        if (u == UID_INVALID)
-                                bus_print_property_value(name, expected_value, value, "[not set]");
-                        else
-                                bus_print_property_valuef(name, expected_value, value, "%"PRIu32, u);
-                } else if (streq(name, "GID")) {
-                        if (u == GID_INVALID)
-                                bus_print_property_value(name, expected_value, value, "[not set]");
-                        else
-                                bus_print_property_valuef(name, expected_value, value, "%"PRIu32, u);
-                } else
-                        bus_print_property_valuef(name, expected_value, value, "%"PRIu32, u);
-
-                return 1;
-        }
-
-        case SD_BUS_TYPE_INT32: {
-                int32_t i;
-
-                r = sd_bus_message_read_basic(m, type, &i);
-                if (r < 0)
-                        return r;
-
-                bus_print_property_valuef(name, expected_value, value, "%"PRIi32, i);
-                return 1;
-        }
-
-        case SD_BUS_TYPE_DOUBLE: {
-                double d;
-
-                r = sd_bus_message_read_basic(m, type, &d);
-                if (r < 0)
-                        return r;
-
-                bus_print_property_valuef(name, expected_value, value, "%g", d);
-                return 1;
-        }
-
-        case SD_BUS_TYPE_ARRAY:
-                if (streq(contents, "s")) {
-                        bool first = true;
-                        const char *str;
-
-                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, contents);
-                        if (r < 0)
-                                return r;
-
-                        while ((r = sd_bus_message_read_basic(m, SD_BUS_TYPE_STRING, &str)) > 0) {
-                                bool good;
-
-                                if (first && !value)
-                                        printf("%s=", name);
-
-                                /* This property has multiple space-separated values, so
-                                 * neither spaces nor newlines can be allowed in a value. */
-                                good = str[strcspn(str, " \n")] == '\0';
-
-                                printf("%s%s", first ? "" : " ", good ? str : "[unprintable]");
-
-                                first = false;
-                        }
-                        if (r < 0)
-                                return r;
-
-                        if (first && all && !value)
-                                printf("%s=", name);
-                        if (!first || all)
-                                puts("");
-
-                        r = sd_bus_message_exit_container(m);
-                        if (r < 0)
-                                return r;
-
-                        return 1;
-
-                } else if (streq(contents, "y")) {
-                        const uint8_t *u;
-                        size_t n;
-
-                        r = sd_bus_message_read_array(m, SD_BUS_TYPE_BYTE, (const void**) &u, &n);
-                        if (r < 0)
-                                return r;
-
-                        if (all || n > 0) {
-                                unsigned i;
-
-                                if (!value)
-                                        printf("%s=", name);
-
-                                for (i = 0; i < n; i++)
-                                        printf("%02x", u[i]);
-
-                                puts("");
-                        }
-
-                        return 1;
-
-                } else if (streq(contents, "u")) {
-                        uint32_t *u;
-                        size_t n;
-
-                        r = sd_bus_message_read_array(m, SD_BUS_TYPE_UINT32, (const void**) &u, &n);
-                        if (r < 0)
-                                return r;
-
-                        if (all || n > 0) {
-                                unsigned i;
-
-                                if (!value)
-                                        printf("%s=", name);
-
-                                for (i = 0; i < n; i++)
-                                        printf("%08x", u[i]);
-
-                                puts("");
-                        }
-
-                        return 1;
-                }
-
-                break;
-        }
-
-        return 0;
-}
-
-int bus_message_print_all_properties(
-                sd_bus_message *m,
-                bus_message_print_t func,
-                char **filter,
-                bool value,
-                bool all,
-                Set **found_properties) {
-
-        int r;
-
-        assert(m);
-
-        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sv}");
-        if (r < 0)
-                return r;
-
-        while ((r = sd_bus_message_enter_container(m, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
-                _cleanup_free_ char *name_with_equal = NULL;
-                const char *name, *contents, *expected_value = NULL;
-
-                r = sd_bus_message_read_basic(m, SD_BUS_TYPE_STRING, &name);
-                if (r < 0)
-                        return r;
-
-                if (found_properties) {
-                        r = set_ensure_allocated(found_properties, &string_hash_ops);
-                        if (r < 0)
-                                return log_oom();
-
-                        r = set_put(*found_properties, name);
-                        if (r < 0 && r != -EEXIST)
-                                return log_oom();
-                }
-
-                name_with_equal = strappend(name, "=");
-                if (!name_with_equal)
-                        return log_oom();
-
-                if (!filter || strv_find(filter, name) ||
-                    (expected_value = strv_find_startswith(filter, name_with_equal))) {
-                        r = sd_bus_message_peek_type(m, NULL, &contents);
-                        if (r < 0)
-                                return r;
-
-                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
-                        if (r < 0)
-                                return r;
-
-                        if (func)
-                                r = func(name, expected_value, m, value, all);
-                        if (!func || r == 0)
-                                r = bus_print_property(name, expected_value, m, value, all);
-                        if (r < 0)
-                                return r;
-                        if (r == 0) {
-                                if (all && !expected_value)
-                                        printf("%s=[unprintable]\n", name);
-                                /* skip what we didn't read */
-                                r = sd_bus_message_skip(m, contents);
-                                if (r < 0)
-                                        return r;
-                        }
-
-                        r = sd_bus_message_exit_container(m);
-                        if (r < 0)
-                                return r;
-                } else {
-                        r = sd_bus_message_skip(m, "v");
-                        if (r < 0)
-                                return r;
-                }
-
-                r = sd_bus_message_exit_container(m);
-                if (r < 0)
-                        return r;
-        }
-        if (r < 0)
-                return r;
-
-        r = sd_bus_message_exit_container(m);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-int bus_print_all_properties(
-                sd_bus *bus,
-                const char *dest,
-                const char *path,
-                bus_message_print_t func,
-                char **filter,
-                bool value,
-                bool all,
-                Set **found_properties) {
-
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+static int bus_set_address_capsule(sd_bus *bus, const char *capsule, const char *suffix, int *ret_pin_fd) {
+        _cleanup_close_ int inode_fd = -EBADF;
+        _cleanup_free_ char *pp = NULL;
+        uid_t uid;
+        gid_t gid;
         int r;
 
         assert(bus);
-        assert(path);
+        assert(capsule);
+        assert(suffix);
+        assert(ret_pin_fd);
 
-        r = sd_bus_call_method(bus,
-                        dest,
-                        path,
-                        "org.freedesktop.DBus.Properties",
-                        "GetAll",
-                        &error,
-                        &reply,
-                        "s", "");
+        /* Connects to a capsule's user bus. We need to do so under the capsule's UID/GID, otherwise
+         * the service manager might refuse our connection. Hence fake it. */
+
+        r = capsule_name_is_valid(capsule);
         if (r < 0)
                 return r;
-
-        return bus_message_print_all_properties(reply, func, filter, value, all, found_properties);
-}
-
-int bus_map_id128(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
-        sd_id128_t *p = userdata;
-        const void *v;
-        size_t n;
-        int r;
-
-        r = sd_bus_message_read_array(m, SD_BUS_TYPE_BYTE, &v, &n);
-        if (r < 0)
-                return r;
-
-        if (n == 0)
-                *p = SD_ID128_NULL;
-        else if (n == 16)
-                memcpy((*p).bytes, v, n);
-        else
+        if (r == 0)
                 return -EINVAL;
 
+        inode_fd = pin_capsule_socket(capsule, suffix, &uid, &gid);
+        if (inode_fd < 0)
+                return inode_fd;
+
+        pp = bus_address_escape(FORMAT_PROC_FD_PATH(inode_fd));
+        if (!pp)
+                return -ENOMEM;
+
+        if (asprintf(&bus->address, "unix:path=%s,uid=" UID_FMT ",gid=" GID_FMT, pp, uid, gid) < 0)
+                return -ENOMEM;
+
+        *ret_pin_fd = TAKE_FD(inode_fd); /* This fd must be kept pinned until the connection has been established */
         return 0;
 }
 
-static int map_basic(sd_bus *bus, const char *member, sd_bus_message *m, unsigned flags, sd_bus_error *error, void *userdata) {
-        char type;
-        int r;
-
-        r = sd_bus_message_peek_type(m, &type, NULL);
-        if (r < 0)
-                return r;
-
-        switch (type) {
-
-        case SD_BUS_TYPE_STRING: {
-                const char **p = userdata;
-                const char *s;
-
-                r = sd_bus_message_read_basic(m, type, &s);
-                if (r < 0)
-                        return r;
-
-                if (isempty(s))
-                        s = NULL;
-
-                if (flags & BUS_MAP_STRDUP)
-                        return free_and_strdup((char **) userdata, s);
-
-                *p = s;
-                return 0;
-        }
-
-        case SD_BUS_TYPE_ARRAY: {
-                _cleanup_strv_free_ char **l = NULL;
-                char ***p = userdata;
-
-                r = bus_message_read_strv_extend(m, &l);
-                if (r < 0)
-                        return r;
-
-                return strv_free_and_replace(*p, l);
-        }
-
-        case SD_BUS_TYPE_BOOLEAN: {
-                int b;
-
-                r = sd_bus_message_read_basic(m, type, &b);
-                if (r < 0)
-                        return r;
-
-                if (flags & BUS_MAP_BOOLEAN_AS_BOOL)
-                        *(bool*) userdata = b;
-                else
-                        *(int*) userdata = b;
-
-                return 0;
-        }
-
-        case SD_BUS_TYPE_INT32:
-        case SD_BUS_TYPE_UINT32: {
-                uint32_t u, *p = userdata;
-
-                r = sd_bus_message_read_basic(m, type, &u);
-                if (r < 0)
-                        return r;
-
-                *p = u;
-                return 0;
-        }
-
-        case SD_BUS_TYPE_INT64:
-        case SD_BUS_TYPE_UINT64: {
-                uint64_t t, *p = userdata;
-
-                r = sd_bus_message_read_basic(m, type, &t);
-                if (r < 0)
-                        return r;
-
-                *p = t;
-                return 0;
-        }
-
-        case SD_BUS_TYPE_DOUBLE: {
-                double d, *p = userdata;
-
-                r = sd_bus_message_read_basic(m, type, &d);
-                if (r < 0)
-                        return r;
-
-                *p = d;
-                return 0;
-        }}
-
-        return -EOPNOTSUPP;
+int bus_set_address_capsule_bus(sd_bus *bus, const char *capsule, int *ret_pin_fd) {
+        return bus_set_address_capsule(bus, capsule, "bus", ret_pin_fd);
 }
 
-int bus_message_map_all_properties(
-                sd_bus_message *m,
-                const struct bus_properties_map *map,
-                unsigned flags,
-                sd_bus_error *error,
-                void *userdata) {
-
+int bus_connect_capsule_systemd(const char *capsule, sd_bus **ret) {
+        _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_close_ int inode_fd = -EBADF;
         int r;
 
-        assert(m);
-        assert(map);
+        assert(capsule);
+        assert(ret);
 
-        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sv}");
+        r = sd_bus_new(&bus);
         if (r < 0)
                 return r;
 
-        while ((r = sd_bus_message_enter_container(m, SD_BUS_TYPE_DICT_ENTRY, "sv")) > 0) {
-                const struct bus_properties_map *prop;
-                const char *member;
-                const char *contents;
-                void *v;
-                unsigned i;
-
-                r = sd_bus_message_read_basic(m, SD_BUS_TYPE_STRING, &member);
-                if (r < 0)
-                        return r;
-
-                for (i = 0, prop = NULL; map[i].member; i++)
-                        if (streq(map[i].member, member)) {
-                                prop = &map[i];
-                                break;
-                        }
-
-                if (prop) {
-                        r = sd_bus_message_peek_type(m, NULL, &contents);
-                        if (r < 0)
-                                return r;
-
-                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_VARIANT, contents);
-                        if (r < 0)
-                                return r;
-
-                        v = (uint8_t *)userdata + prop->offset;
-                        if (map[i].set)
-                                r = prop->set(sd_bus_message_get_bus(m), member, m, error, v);
-                        else
-                                r = map_basic(sd_bus_message_get_bus(m), member, m, flags, error, v);
-                        if (r < 0)
-                                return r;
-
-                        r = sd_bus_message_exit_container(m);
-                        if (r < 0)
-                                return r;
-                } else {
-                        r = sd_bus_message_skip(m, "v");
-                        if (r < 0)
-                                return r;
-                }
-
-                r = sd_bus_message_exit_container(m);
-                if (r < 0)
-                        return r;
-        }
+        r = bus_set_address_capsule(bus, capsule, "systemd/private", &inode_fd);
         if (r < 0)
                 return r;
 
-        return sd_bus_message_exit_container(m);
+        r = sd_bus_start(bus);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(bus);
+        return 0;
 }
 
-int bus_map_all_properties(
-                sd_bus *bus,
-                const char *destination,
-                const char *path,
-                const struct bus_properties_map *map,
-                unsigned flags,
-                sd_bus_error *error,
-                sd_bus_message **reply,
-                void *userdata) {
-
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+int bus_connect_capsule_bus(const char *capsule, sd_bus **ret) {
+        _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_close_ int inode_fd = -EBADF;
         int r;
 
-        assert(bus);
-        assert(destination);
-        assert(path);
-        assert(map);
-        assert(reply || (flags & BUS_MAP_STRDUP));
+        assert(capsule);
+        assert(ret);
 
-        r = sd_bus_call_method(
-                        bus,
-                        destination,
-                        path,
-                        "org.freedesktop.DBus.Properties",
-                        "GetAll",
-                        error,
-                        &m,
-                        "s", "");
+        r = sd_bus_new(&bus);
         if (r < 0)
                 return r;
 
-        r = bus_message_map_all_properties(m, map, flags, error, userdata);
+        r = bus_set_address_capsule_bus(bus, capsule, &inode_fd);
         if (r < 0)
                 return r;
 
-        if (reply)
-                *reply = sd_bus_message_ref(m);
+        r = sd_bus_set_bus_client(bus, true);
+        if (r < 0)
+                return r;
 
-        return r;
+        r = sd_bus_start(bus);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(bus);
+        return 0;
 }
 
-int bus_connect_transport(BusTransport transport, const char *host, bool user, sd_bus **ret) {
+int bus_connect_transport(
+                BusTransport transport,
+                const char *host,
+                RuntimeScope runtime_scope,
+                sd_bus **ret) {
+
         _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
         int r;
 
@@ -1302,35 +433,62 @@ int bus_connect_transport(BusTransport transport, const char *host, bool user, s
         assert(transport < _BUS_TRANSPORT_MAX);
         assert(ret);
 
-        assert_return((transport == BUS_TRANSPORT_LOCAL) == !host, -EINVAL);
-        assert_return(transport == BUS_TRANSPORT_LOCAL || !user, -EOPNOTSUPP);
-
         switch (transport) {
 
         case BUS_TRANSPORT_LOCAL:
-                if (user)
-                        r = sd_bus_default_user(&bus);
-                else {
-                        if (sd_booted() <= 0) {
-                                /* Print a friendly message when the local system is actually not running systemd as PID 1. */
-                                log_error("System has not been booted with systemd as init system (PID 1). Can't operate.");
+                assert_return(!host, -EINVAL);
 
-                                return -EHOSTDOWN;
-                        }
+                switch (runtime_scope) {
+
+                case RUNTIME_SCOPE_USER:
+                        r = sd_bus_default_user(&bus);
+                        break;
+
+                case RUNTIME_SCOPE_SYSTEM:
+                        if (sd_booted() <= 0)
+                                /* Print a friendly message when the local system is actually not running systemd as PID 1. */
+                                return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN),
+                                                       "System has not been booted with systemd as init system (PID 1). Can't operate.");
+
                         r = sd_bus_default_system(&bus);
+                        break;
+
+                default:
+                        assert_not_reached();
                 }
                 break;
 
         case BUS_TRANSPORT_REMOTE:
+                assert_return(runtime_scope == RUNTIME_SCOPE_SYSTEM, -EOPNOTSUPP);
+
                 r = sd_bus_open_system_remote(&bus, host);
                 break;
 
         case BUS_TRANSPORT_MACHINE:
-                r = sd_bus_open_system_machine(&bus, host);
+                switch (runtime_scope) {
+
+                case RUNTIME_SCOPE_USER:
+                        r = sd_bus_open_user_machine(&bus, host);
+                        break;
+
+                case RUNTIME_SCOPE_SYSTEM:
+                        r = sd_bus_open_system_machine(&bus, host);
+                        break;
+
+                default:
+                        assert_not_reached();
+                }
+
+                break;
+
+        case BUS_TRANSPORT_CAPSULE:
+                assert_return(runtime_scope == RUNTIME_SCOPE_USER, -EINVAL);
+
+                r = bus_connect_capsule_bus(host, &bus);
                 break;
 
         default:
-                assert_not_reached("Hmm, unknown transport type.");
+                assert_not_reached();
         }
         if (r < 0)
                 return r;
@@ -1340,151 +498,75 @@ int bus_connect_transport(BusTransport transport, const char *host, bool user, s
                 return r;
 
         *ret = TAKE_PTR(bus);
-
         return 0;
 }
 
-int bus_connect_transport_systemd(BusTransport transport, const char *host, bool user, sd_bus **bus) {
+int bus_connect_transport_systemd(
+                BusTransport transport,
+                const char *host,
+                RuntimeScope runtime_scope,
+                sd_bus **ret) {
+
         int r;
 
         assert(transport >= 0);
         assert(transport < _BUS_TRANSPORT_MAX);
-        assert(bus);
-
-        assert_return((transport == BUS_TRANSPORT_LOCAL) == !host, -EINVAL);
-        assert_return(transport == BUS_TRANSPORT_LOCAL || !user, -EOPNOTSUPP);
+        assert(ret);
 
         switch (transport) {
 
         case BUS_TRANSPORT_LOCAL:
-                if (user)
-                        r = bus_connect_user_systemd(bus);
-                else {
+                assert_return(!host, -EINVAL);
+
+                switch (runtime_scope) {
+
+                case RUNTIME_SCOPE_USER:
+                        r = bus_connect_user_systemd(ret);
+                        /* We used to always fall back to the user session bus if we couldn't connect to the
+                         * private manager bus. To keep compat with existing code that was setting
+                         * DBUS_SESSION_BUS_ADDRESS without setting XDG_RUNTIME_DIR, connect to the user
+                         * session bus if DBUS_SESSION_BUS_ADDRESS is set and XDG_RUNTIME_DIR isn't. */
+                        if (r == -ENOMEDIUM && secure_getenv("DBUS_SESSION_BUS_ADDRESS")) {
+                                log_debug_errno(r, "$XDG_RUNTIME_DIR not set, unable to connect to private bus. Falling back to session bus.");
+                                r = sd_bus_default_user(ret);
+                        }
+
+                        return r;
+
+                case RUNTIME_SCOPE_SYSTEM:
                         if (sd_booted() <= 0)
                                 /* Print a friendly message when the local system is actually not running systemd as PID 1. */
                                 return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN),
                                                        "System has not been booted with systemd as init system (PID 1). Can't operate.");
-                        r = bus_connect_system_systemd(bus);
+
+                        /* If we are root then let's talk directly to the system instance, instead of
+                         * going via the bus. */
+                        if (geteuid() == 0)
+                                return bus_connect_system_systemd(ret);
+
+                        return sd_bus_default_system(ret);
+
+                default:
+                        assert_not_reached();
                 }
+
                 break;
 
         case BUS_TRANSPORT_REMOTE:
-                r = sd_bus_open_system_remote(bus, host);
-                break;
+                assert_return(runtime_scope == RUNTIME_SCOPE_SYSTEM, -EOPNOTSUPP);
+                return sd_bus_open_system_remote(ret, host);
 
         case BUS_TRANSPORT_MACHINE:
-                r = sd_bus_open_system_machine(bus, host);
-                break;
+                assert_return(runtime_scope == RUNTIME_SCOPE_SYSTEM, -EOPNOTSUPP);
+                return sd_bus_open_system_machine(ret, host);
+
+        case BUS_TRANSPORT_CAPSULE:
+                assert_return(runtime_scope == RUNTIME_SCOPE_USER, -EINVAL);
+                return bus_connect_capsule_systemd(host, ret);
 
         default:
-                assert_not_reached("Hmm, unknown transport type.");
+                assert_not_reached();
         }
-
-        return r;
-}
-
-int bus_property_get_bool(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        int b = *(bool*) userdata;
-
-        return sd_bus_message_append_basic(reply, 'b', &b);
-}
-
-int bus_property_set_bool(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *value,
-                void *userdata,
-                sd_bus_error *error) {
-
-        int b, r;
-
-        r = sd_bus_message_read(value, "b", &b);
-        if (r < 0)
-                return r;
-
-        *(bool*) userdata = b;
-        return 0;
-}
-
-int bus_property_get_id128(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        sd_id128_t *id = userdata;
-
-        if (sd_id128_is_null(*id)) /* Add an empty array if the ID is zero */
-                return sd_bus_message_append(reply, "ay", 0);
-        else
-                return sd_bus_message_append_array(reply, 'y', id->bytes, 16);
-}
-
-#if __SIZEOF_SIZE_T__ != 8
-int bus_property_get_size(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        uint64_t sz = *(size_t*) userdata;
-
-        return sd_bus_message_append_basic(reply, 't', &sz);
-}
-#endif
-
-#if __SIZEOF_LONG__ != 8
-int bus_property_get_long(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        int64_t l = *(long*) userdata;
-
-        return sd_bus_message_append_basic(reply, 'x', &l);
-}
-
-int bus_property_get_ulong(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        uint64_t ul = *(unsigned long*) userdata;
-
-        return sd_bus_message_append_basic(reply, 't', &ul);
-}
-#endif
-
-int bus_log_parse_error(int r) {
-        return log_error_errno(r, "Failed to parse bus message: %m");
-}
-
-int bus_log_create_error(int r) {
-        return log_error_errno(r, "Failed to create bus message: %m");
 }
 
 /**
@@ -1530,7 +612,7 @@ int bus_path_encode_unique(sd_bus *b, const char *prefix, const char *sender_id,
         int r;
 
         assert_return(b || (sender_id && external_id), -EINVAL);
-        assert_return(object_path_is_valid(prefix), -EINVAL);
+        assert_return(sd_bus_object_path_is_valid(prefix), -EINVAL);
         assert_return(ret_path, -EINVAL);
 
         if (!sender_id) {
@@ -1552,7 +634,7 @@ int bus_path_encode_unique(sd_bus *b, const char *prefix, const char *sender_id,
         if (!external_label)
                 return -ENOMEM;
 
-        p = strjoin(prefix, "/", sender_label, "/", external_label);
+        p = path_join(prefix, sender_label, external_label);
         if (!p)
                 return -ENOMEM;
 
@@ -1582,8 +664,8 @@ int bus_path_decode_unique(const char *path, const char *prefix, char **ret_send
         const char *p, *q;
         char *sender, *external;
 
-        assert(object_path_is_valid(path));
-        assert(object_path_is_valid(prefix));
+        assert(sd_bus_object_path_is_valid(path));
+        assert(sd_bus_object_path_is_valid(prefix));
         assert(ret_sender);
         assert(ret_external);
 
@@ -1614,71 +696,37 @@ int bus_path_decode_unique(const char *path, const char *prefix, char **ret_send
         return 1;
 }
 
-int bus_property_get_rlimit(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        const char *is_soft;
-        struct rlimit *rl;
-        uint64_t u;
-        rlim_t x;
-
-        assert(bus);
-        assert(reply);
-        assert(userdata);
-
-        is_soft = endswith(property, "Soft");
-
-        rl = *(struct rlimit**) userdata;
-        if (rl)
-                x = is_soft ? rl->rlim_cur : rl->rlim_max;
-        else {
-                struct rlimit buf = {};
-                const char *s, *p;
-                int z;
-
-                /* Chop off "Soft" suffix */
-                s = is_soft ? strndupa(property, is_soft - property) : property;
-
-                /* Skip over any prefix, such as "Default" */
-                assert_se(p = strstr(s, "Limit"));
-
-                z = rlimit_from_string(p + 5);
-                assert(z >= 0);
-
-                (void) getrlimit(z, &buf);
-                x = is_soft ? buf.rlim_cur : buf.rlim_max;
-        }
-
-        /* rlim_t might have different sizes, let's map RLIMIT_INFINITY to (uint64_t) -1, so that it is the same on all
-         * archs */
-        u = x == RLIM_INFINITY ? (uint64_t) -1 : (uint64_t) x;
-
-        return sd_bus_message_append(reply, "t", u);
-}
-
-int bus_track_add_name_many(sd_bus_track *t, char **l) {
+int bus_track_add_name_many(sd_bus_track *t, char * const *l) {
         int r = 0;
-        char **i;
 
         assert(t);
 
         /* Continues adding after failure, and returns the first failure. */
 
-        STRV_FOREACH(i, l) {
-                int k;
+        STRV_FOREACH(i, l)
+                RET_GATHER(r, sd_bus_track_add_name(t, *i));
+        return r;
+}
 
-                k = sd_bus_track_add_name(t, *i);
-                if (k < 0 && r >= 0)
-                        r = k;
+int bus_track_to_strv(sd_bus_track *t, char ***ret) {
+        _cleanup_strv_free_ char **subscribed = NULL;
+        int r;
+
+        assert(ret);
+
+        for (const char *n = sd_bus_track_first(t); n; n = sd_bus_track_next(t)) {
+                int c = sd_bus_track_count_name(t, n);
+                assert(c >= 0);
+
+                for (int j = 0; j < c; j++) {
+                        r = strv_extend(&subscribed, n);
+                        if (r < 0)
+                                return r;
+                }
         }
 
-        return r;
+        *ret = TAKE_PTR(subscribed);
+        return 0;
 }
 
 int bus_open_system_watch_bind_with_description(sd_bus **ret, const char *description) {
@@ -1688,7 +736,8 @@ int bus_open_system_watch_bind_with_description(sd_bus **ret, const char *descri
 
         assert(ret);
 
-        /* Match like sd_bus_open_system(), but with the "watch_bind" feature and the Connected() signal turned on. */
+        /* Match like sd_bus_open_system(), but with the "watch_bind" feature and the Connected() signal
+         * turned on. */
 
         r = sd_bus_new(&bus);
         if (r < 0)
@@ -1709,10 +758,6 @@ int bus_open_system_watch_bind_with_description(sd_bus **ret, const char *descri
                 return r;
 
         r = sd_bus_set_bus_client(bus, true);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_set_trusted(bus, true);
         if (r < 0)
                 return r;
 
@@ -1737,15 +782,14 @@ int bus_open_system_watch_bind_with_description(sd_bus **ret, const char *descri
         return 0;
 }
 
-int bus_reply_pair_array(sd_bus_message *m, char **l) {
+int bus_reply_pair_array(sd_bus_message *m, char * const *l) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        char **k, **v;
         int r;
 
         assert(m);
 
-        /* Reply to the specified message with a message containing a dictionary put together from the specified
-         * strv */
+        /* Reply to the specified message with a message containing a dictionary put together from the
+         * specified strv */
 
         r = sd_bus_message_new_method_return(m, &reply);
         if (r < 0)
@@ -1765,15 +809,117 @@ int bus_reply_pair_array(sd_bus_message *m, char **l) {
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
-static void bus_message_unref_wrapper(void *m) {
-        sd_bus_message_unref(m);
+static int method_dump_memory_state_by_fd(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        _cleanup_(memstream_done) MemStream m = {};
+        _cleanup_free_ char *dump = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        size_t dump_size;
+        FILE *f;
+        int r;
+
+        assert(message);
+
+        f = memstream_init(&m);
+        if (!f)
+                return -ENOMEM;
+
+        r = RET_NERRNO(malloc_info(/* options= */ 0, f));
+        if (r < 0)
+                return r;
+
+        r = memstream_finalize(&m, &dump, &dump_size);
+        if (r < 0)
+                return r;
+
+        fd = memfd_new_and_seal("malloc-info", dump, dump_size);
+        if (fd < 0)
+                return fd;
+
+        r = sd_bus_reply_method_return(message, "h", fd);
+        if (r < 0)
+                return r;
+
+        return 1; /* Stop further processing */
 }
 
-const struct hash_ops bus_message_hash_ops = {
-        .hash = trivial_hash_func,
-        .compare = trivial_compare_func,
-        .free_value = bus_message_unref_wrapper,
+/* The default install callback will fail and disconnect the bus if it cannot register the match, but this
+ * is only a debug method, we definitely don't want to fail in case there's some permission issue. */
+static int dummy_install_callback(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        return 1;
+}
+
+int bus_register_malloc_status(sd_bus *bus, const char *destination) {
+        const char *match;
+        int r;
+
+        assert(bus);
+        assert(!isempty(destination));
+
+        match = strjoina("type='method_call',"
+                         "interface='org.freedesktop.MemoryAllocation1',"
+                         "path='/org/freedesktop/MemoryAllocation1',"
+                         "destination='", destination, "',",
+                         "member='GetMallocInfo'");
+
+        r = sd_bus_add_match_async(bus, NULL, match, method_dump_memory_state_by_fd, dummy_install_callback, NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to subscribe to GetMallocInfo() calls on MemoryAllocation1 interface: %m");
+
+        return 0;
+}
+
+int bus_creds_get_pidref(
+                sd_bus_creds *c,
+                PidRef *ret) {
+
+        int pidfd = -EBADF;
+        pid_t pid;
+        int r;
+
+        assert(c);
+        assert(ret);
+
+        r = sd_bus_creds_get_pid(c, &pid);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_creds_get_pidfd_dup(c, &pidfd);
+        if (r < 0 && r != -ENODATA)
+                return r;
+
+        *ret = (PidRef) {
+                .pid = pid,
+                .fd = pidfd,
+        };
+
+        return 0;
+}
+
+int bus_query_sender_pidref(
+                sd_bus_message *m,
+                PidRef *ret) {
+
+        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        int r;
+
+        assert(m);
+        assert(ret);
+
+        r = sd_bus_query_sender_creds(m, SD_BUS_CREDS_PID|SD_BUS_CREDS_PIDFD, &creds);
+        if (r < 0)
+                return r;
+
+        return bus_creds_get_pidref(creds, ret);
+}
+
+static const char* const bus_transport_table[] = {
+        [BUS_TRANSPORT_LOCAL]   = "local",
+        [BUS_TRANSPORT_REMOTE]  = "remote",
+        [BUS_TRANSPORT_MACHINE] = "machine",
+        [BUS_TRANSPORT_CAPSULE] = "capsule",
 };
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(bus_transport, BusTransport);

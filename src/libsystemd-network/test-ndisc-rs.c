@@ -1,51 +1,100 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
 
 #include <netinet/icmp6.h>
-#include <arpa/inet.h>
 #include <unistd.h>
 
 #include "sd-ndisc.h"
 
 #include "alloc-util.h"
+#include "fd-util.h"
 #include "hexdecoct.h"
-#include "icmp6-util.h"
-#include "socket-util.h"
-#include "strv.h"
+#include "icmp6-packet.h"
+#include "icmp6-test-util.h"
+#include "in-addr-util.h"
 #include "ndisc-internal.h"
+#include "ndisc-neighbor-internal.h"
+#include "ndisc-redirect-internal.h"
+#include "ndisc-router-internal.h"
+#include "strv.h"
 #include "tests.h"
 
 static struct ether_addr mac_addr = {
         .ether_addr_octet = {'A', 'B', 'C', '1', '2', '3'}
 };
 
-static bool verbose = false;
-static sd_event_source *test_hangcheck;
-static int test_fd[2];
-static sd_ndisc *test_timeout_nd;
+static ICMP6Packet* make_packet(const void *raw, size_t size) {
+        ICMP6Packet *packet;
 
-typedef int (*send_ra_t)(uint8_t flags);
-static send_ra_t send_ra_function;
+        assert(raw);
+
+        packet = malloc0(offsetof(ICMP6Packet, raw_packet) + size);
+        ASSERT_NOT_NULL(packet);
+
+        packet->n_ref = 1;
+        packet->raw_size = size;
+        memcpy(packet->raw_packet, raw, size);
+
+        return packet;
+}
+
+TEST(parse_rejects_nonzero_code) {
+        static const struct nd_router_advert router_advertisement = {
+                .nd_ra_type = ND_ROUTER_ADVERT,
+                .nd_ra_code = 1,
+        };
+        static const struct nd_neighbor_advert neighbor_advertisement = {
+                .nd_na_type = ND_NEIGHBOR_ADVERT,
+                .nd_na_code = 1,
+        };
+        static const struct nd_redirect redirect = {
+                .nd_rd_type = ND_REDIRECT,
+                .nd_rd_code = 1,
+        };
+
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet =
+                make_packet(&router_advertisement, sizeof(router_advertisement));
+        _cleanup_(sd_ndisc_router_unrefp) sd_ndisc_router *router =
+                ASSERT_PTR(ndisc_router_new(packet));
+
+        ASSERT_ERROR(ndisc_router_parse(/* nd= */ NULL, router), EBADMSG);
+        router = sd_ndisc_router_unref(router);
+        packet = icmp6_packet_unref(packet);
+
+        packet = make_packet(&neighbor_advertisement, sizeof(neighbor_advertisement));
+        _cleanup_(sd_ndisc_neighbor_unrefp) sd_ndisc_neighbor *neighbor =
+                ASSERT_PTR(ndisc_neighbor_new(packet));
+
+        ASSERT_ERROR(ndisc_neighbor_parse(/* nd= */ NULL, neighbor), EBADMSG);
+        neighbor = sd_ndisc_neighbor_unref(neighbor);
+        packet = icmp6_packet_unref(packet);
+
+        packet = make_packet(&redirect, sizeof(redirect));
+        _cleanup_(sd_ndisc_redirect_unrefp) sd_ndisc_redirect *rd =
+                ASSERT_PTR(ndisc_redirect_new(packet));
+
+        ASSERT_ERROR(ndisc_redirect_parse(/* nd= */ NULL, rd), EBADMSG);
+}
 
 static void router_dump(sd_ndisc_router *rt) {
         struct in6_addr addr;
-        char buf[FORMAT_TIMESTAMP_MAX];
         uint8_t hop_limit;
-        uint64_t t, flags;
+        usec_t t, lifetime, retrans_time;
+        uint64_t flags;
         uint32_t mtu;
-        uint16_t lifetime;
-        unsigned preference;
+        uint8_t preference;
         int r;
 
         assert_se(rt);
 
         log_info("--");
-        assert_se(sd_ndisc_router_get_address(rt, &addr) == -ENODATA);
+        assert_se(sd_ndisc_router_get_sender_address(rt, &addr) >= 0);
+        log_info("Sender: %s", IN6_ADDR_TO_STRING(&addr));
 
         assert_se(sd_ndisc_router_get_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
-        log_info("Timestamp: %s", format_timestamp(buf, sizeof(buf), t));
+        log_info("Timestamp: %s", FORMAT_TIMESTAMP(t));
 
         assert_se(sd_ndisc_router_get_timestamp(rt, CLOCK_MONOTONIC, &t) >= 0);
         log_info("Monotonic: %" PRIu64, t);
@@ -56,6 +105,7 @@ static void router_dump(sd_ndisc_router *rt) {
                 log_info("Hop limit: %u", hop_limit);
 
         assert_se(sd_ndisc_router_get_flags(rt, &flags) >= 0);
+        ASSERT_EQ(flags & UINT64_C(0x00ffffffffffff00), UINT64_C(0x0066554433221100));
         log_info("Flags: <%s|%s>",
                  flags & ND_RA_FLAG_OTHER ? "OTHER" : "",
                  flags & ND_RA_FLAG_MANAGED ? "MANAGED" : "");
@@ -66,7 +116,11 @@ static void router_dump(sd_ndisc_router *rt) {
                  preference == SD_NDISC_PREFERENCE_HIGH ? "high" : "medium");
 
         assert_se(sd_ndisc_router_get_lifetime(rt, &lifetime) >= 0);
-        log_info("Lifetime: %" PRIu16, lifetime);
+        assert_se(sd_ndisc_router_get_lifetime_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
+        log_info("Lifetime: %s (%s)", FORMAT_TIMESPAN(lifetime, USEC_PER_SEC), FORMAT_TIMESTAMP(t));
+
+        assert_se(sd_ndisc_router_get_retransmission_time(rt, &retrans_time) >= 0);
+        log_info("Retransmission Time: %s", FORMAT_TIMESPAN(retrans_time, USEC_PER_SEC));
 
         if (sd_ndisc_router_get_mtu(rt, &mtu) < 0)
                 log_info("No MTU set");
@@ -91,29 +145,28 @@ static void router_dump(sd_ndisc_router *rt) {
                 case SD_NDISC_OPTION_SOURCE_LL_ADDRESS:
                 case SD_NDISC_OPTION_TARGET_LL_ADDRESS: {
                         _cleanup_free_ char *c = NULL;
-                        const void *p;
+                        const uint8_t *p;
                         size_t n;
 
                         assert_se(sd_ndisc_router_option_get_raw(rt, &p, &n) >= 0);
                         assert_se(n > 2);
-                        assert_se(c = hexmem((uint8_t*) p + 2, n - 2));
+                        assert_se(c = hexmem(p + 2, n - 2));
 
                         log_info("Address: %s", c);
                         break;
                 }
 
                 case SD_NDISC_OPTION_PREFIX_INFORMATION: {
-                        uint32_t lifetime_valid, lifetime_preferred;
-                        unsigned prefix_len;
-                        uint8_t pfl;
+                        uint8_t prefix_len, pfl;
                         struct in6_addr a;
-                        char buff[INET6_ADDRSTRLEN];
 
-                        assert_se(sd_ndisc_router_prefix_get_valid_lifetime(rt, &lifetime_valid) >= 0);
-                        log_info("Valid Lifetime: %" PRIu32, lifetime_valid);
+                        assert_se(sd_ndisc_router_prefix_get_valid_lifetime(rt, &lifetime) >= 0);
+                        assert_se(sd_ndisc_router_prefix_get_valid_lifetime_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
+                        log_info("Valid Lifetime: %s (%s)", FORMAT_TIMESPAN(lifetime, USEC_PER_SEC), FORMAT_TIMESTAMP(t));
 
-                        assert_se(sd_ndisc_router_prefix_get_preferred_lifetime(rt, &lifetime_preferred) >= 0);
-                        log_info("Preferred Lifetime: %" PRIu32, lifetime_preferred);
+                        assert_se(sd_ndisc_router_prefix_get_preferred_lifetime(rt, &lifetime) >= 0);
+                        assert_se(sd_ndisc_router_prefix_get_preferred_lifetime_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
+                        log_info("Preferred Lifetime: %s (%s)", FORMAT_TIMESPAN(lifetime, USEC_PER_SEC), FORMAT_TIMESTAMP(t));
 
                         assert_se(sd_ndisc_router_prefix_get_flags(rt, &pfl) >= 0);
                         log_info("Flags: <%s|%s>",
@@ -124,42 +177,38 @@ static void router_dump(sd_ndisc_router *rt) {
                         log_info("Prefix Length: %u", prefix_len);
 
                         assert_se(sd_ndisc_router_prefix_get_address(rt, &a) >= 0);
-                        log_info("Prefix: %s", inet_ntop(AF_INET6, &a, buff, sizeof(buff)));
+                        log_info("Prefix: %s", IN6_ADDR_TO_STRING(&a));
 
                         break;
                 }
 
                 case SD_NDISC_OPTION_RDNSS: {
                         const struct in6_addr *a;
-                        uint32_t lt;
                         int n, i;
 
                         n = sd_ndisc_router_rdnss_get_addresses(rt, &a);
                         assert_se(n > 0);
 
-                        for (i = 0; i < n; i++) {
-                                char buff[INET6_ADDRSTRLEN];
-                                log_info("DNS: %s", inet_ntop(AF_INET6, a + i, buff, sizeof(buff)));
-                        }
+                        for (i = 0; i < n; i++)
+                                log_info("DNS: %s", IN6_ADDR_TO_STRING(a + i));
 
-                        assert_se(sd_ndisc_router_rdnss_get_lifetime(rt, &lt) >= 0);
-                        log_info("Lifetime: %" PRIu32, lt);
+                        assert_se(sd_ndisc_router_rdnss_get_lifetime(rt, &lifetime) >= 0);
+                        assert_se(sd_ndisc_router_rdnss_get_lifetime_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
+                        log_info("Lifetime: %s (%s)", FORMAT_TIMESPAN(lifetime, USEC_PER_SEC), FORMAT_TIMESTAMP(t));
                         break;
                 }
 
                 case SD_NDISC_OPTION_DNSSL: {
-                        _cleanup_strv_free_ char **l = NULL;
-                        uint32_t lt;
-                        int n, i;
+                        char **l;
 
-                        n = sd_ndisc_router_dnssl_get_domains(rt, &l);
-                        assert_se(n > 0);
+                        assert_se(sd_ndisc_router_dnssl_get_domains(rt, &l) >= 0);
 
-                        for (i = 0; i < n; i++)
-                                log_info("Domain: %s", l[i]);
+                        STRV_FOREACH(s, l)
+                                log_info("Domain: %s", *s);
 
-                        assert_se(sd_ndisc_router_dnssl_get_lifetime(rt, &lt) >= 0);
-                        log_info("Lifetime: %" PRIu32, lt);
+                        assert_se(sd_ndisc_router_dnssl_get_lifetime(rt, &lifetime) >= 0);
+                        assert_se(sd_ndisc_router_dnssl_get_lifetime_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
+                        log_info("Lifetime: %s (%s)", FORMAT_TIMESPAN(lifetime, USEC_PER_SEC), FORMAT_TIMESTAMP(t));
                         break;
                 }}
 
@@ -167,73 +216,41 @@ static void router_dump(sd_ndisc_router *rt) {
         }
 }
 
-static int test_rs_hangcheck(sd_event_source *s, uint64_t usec,
-                             void *userdata) {
-        assert_se(false);
-
-        return 0;
-}
-
-int icmp6_bind_router_solicitation(int index) {
-        assert_se(index == 42);
-
-        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, test_fd) < 0)
-                return -errno;
-
-        return test_fd[0];
-}
-
-int icmp6_bind_router_advertisement(int index) {
-
-        return -ENOSYS;
-}
-
-int icmp6_receive(int fd, void *iov_base, size_t iov_len,
-                  struct in6_addr *dst, triple_timestamp *timestamp) {
-        assert_se(read (fd, iov_base, iov_len) == (ssize_t)iov_len);
-
-        if (timestamp)
-                triple_timestamp_get(timestamp);
-
-        return 0;
-}
-
 static int send_ra(uint8_t flags) {
         uint8_t advertisement[] = {
-                0x86, 0x00, 0xde, 0x83, 0x40, 0xc0, 0x00, 0xb4,
+                /* struct nd_router_advert */
+                0x86, 0x00, 0x00, 0x00, 0x40, 0xc0, 0x00, 0xb4,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                /* type = 0x03 (SD_NDISC_OPTION_PREFIX_INFORMATION), length = 32 */
                 0x03, 0x04, 0x40, 0xc0, 0x00, 0x00, 0x01, 0xf4,
                 0x00, 0x00, 0x01, 0xb8, 0x00, 0x00, 0x00, 0x00,
                 0x20, 0x01, 0x0d, 0xb8, 0xde, 0xad, 0xbe, 0xef,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                /* type = 0x19 (SD_NDISC_OPTION_RDNSS), length = 24 */
                 0x19, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c,
                 0x20, 0x01, 0x0d, 0xb8, 0xde, 0xad, 0xbe, 0xef,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                /* type = 0x1f (SD_NDISC_OPTION_DNSSL), length = 24 */
                 0x1f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c,
                 0x03, 0x6c, 0x61, 0x62, 0x05, 0x69, 0x6e, 0x74,
                 0x72, 0x61, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                /* type = 0x01 (SD_NDISC_OPTION_SOURCE_LL_ADDRESS), length = 8 */
                 0x01, 0x01, 0x78, 0x2b, 0xcb, 0xb3, 0x6d, 0x53,
+                /* type = 0x1a (SD_NDISC_OPTION_FLAGS_EXTENSION), length = 8 */
+                0x1a, 0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
         };
 
         advertisement[5] = flags;
 
         assert_se(write(test_fd[1], advertisement, sizeof(advertisement)) ==
-               sizeof(advertisement));
+                  sizeof(advertisement));
 
-        if (verbose)
-                printf("  sent RA with flag 0x%02x\n", flags);
+        log_debug("%s: Sent RA with flag 0x%02x", __func__, flags);
 
         return 0;
 }
 
-int icmp6_send_router_solicitation(int s, const struct ether_addr *ether_addr) {
-        if (!send_ra_function)
-                return 0;
-
-        return send_ra_function(0);
-}
-
-static void test_callback(sd_ndisc *nd, sd_ndisc_event event, sd_ndisc_router *rt, void *userdata) {
+static void test_callback_ra(sd_ndisc *nd, sd_ndisc_event_t event, void *message, void *userdata) {
         sd_event *e = userdata;
         static unsigned idx = 0;
         uint64_t flags_array[] = {
@@ -244,41 +261,117 @@ static void test_callback(sd_ndisc *nd, sd_ndisc_event event, sd_ndisc_router *r
                 ND_RA_FLAG_MANAGED
         };
         uint64_t flags;
-        uint32_t mtu;
 
         assert_se(nd);
 
         if (event != SD_NDISC_EVENT_ROUTER)
                 return;
 
+        sd_ndisc_router *rt = ASSERT_PTR(message);
+
         router_dump(rt);
 
         assert_se(sd_ndisc_router_get_flags(rt, &flags) >= 0);
-        assert_se(flags == flags_array[idx]);
+        ASSERT_EQ(flags & 0xff, flags_array[idx]);
         idx++;
 
-        if (verbose)
-                printf("  got event 0x%02" PRIx64 "\n", flags);
+        log_debug("%s: Got event 0x%02" PRIx64, __func__, flags);
 
         if (idx < ELEMENTSOF(flags_array)) {
                 send_ra(flags_array[idx]);
                 return;
         }
 
-        assert_se(sd_ndisc_get_mtu(nd, &mtu) == -ENODATA);
-
+        idx = 0;
         sd_event_exit(e, 0);
 }
 
-static void test_rs(void) {
-        sd_event *e;
-        sd_ndisc *nd;
-        usec_t time_now = now(clock_boottime_or_monotonic());
+static void test_callback_count(
+                sd_ndisc *nd,
+                sd_ndisc_event_t event,
+                void *message,
+                void *userdata) {
 
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
+        unsigned *count = ASSERT_PTR(userdata);
 
-        send_ra_function = send_ra;
+        if (event == SD_NDISC_EVENT_ROUTER)
+                (*count)++;
+}
+
+static int on_recv_rs_exit(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet = NULL;
+
+        ASSERT_OK(icmp6_packet_receive(fd, &packet));
+        ASSERT_EQ(icmp6_packet_get_type(packet), ND_ROUTER_SOLICIT);
+
+        return ASSERT_OK(sd_event_exit(ASSERT_PTR(userdata), 0));
+}
+
+static int on_recv_rs(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet = NULL;
+        assert_se(icmp6_packet_receive(fd, &packet) >= 0);
+
+        return send_ra(0);
+}
+
+TEST(rs_ifindex_mismatch) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
+        unsigned count = 0;
+
+        assert_se(sd_event_new(&e) >= 0);
+        assert_se(sd_ndisc_new(&nd) >= 0);
+        assert_se(sd_ndisc_attach_event(nd, e, 0) >= 0);
+        assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
+        assert_se(sd_ndisc_set_callback(nd, test_callback_count, &count) >= 0);
+        assert_se(sd_ndisc_start(nd) >= 0);
+
+        test_ifindex = 43;
+        send_ra(0);
+        assert_se(sd_event_run(e, UINT64_MAX) >= 0);
+        assert_se(count == 0);
+
+        assert_se(sd_ndisc_stop(nd) >= 0);
+        test_fd[1] = safe_close(test_fd[1]);
+}
+
+TEST(rs_after_zero_lifetime_ra) {
+        static const struct nd_router_advert advertisement = {
+                .nd_ra_type = ND_ROUTER_ADVERT,
+        };
+
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
+        unsigned count = 0;
+
+        ASSERT_OK(sd_event_new(&e));
+        ASSERT_OK(sd_ndisc_new(&nd));
+        ASSERT_OK(sd_ndisc_attach_event(nd, e, 0));
+        ASSERT_OK(sd_ndisc_set_ifindex(nd, 42));
+        ASSERT_OK(sd_ndisc_set_callback(nd, test_callback_count, &count));
+        ASSERT_OK(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)));
+        ASSERT_OK(sd_ndisc_start(nd));
+
+        ASSERT_EQ(write(test_fd[1], &advertisement, sizeof(advertisement)), (ssize_t) sizeof(advertisement));
+        ASSERT_OK_POSITIVE(sd_event_run(e, UINT64_MAX));
+        ASSERT_EQ(count, 1U);
+        ASSERT_OK_POSITIVE(sd_event_source_get_enabled(nd->timeout_event_source, NULL));
+
+        ASSERT_OK(sd_event_add_io(e, &s, test_fd[1], EPOLLIN, on_recv_rs_exit, e));
+        ASSERT_OK(sd_event_source_set_io_fd_own(s, true));
+        ASSERT_OK(sd_event_source_set_time(nd->timeout_event_source, 0));
+        ASSERT_OK(sd_event_loop(e));
+
+        test_fd[1] = -EBADF;
+}
+
+TEST(rs) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
 
         assert_se(sd_event_new(&e) >= 0);
 
@@ -289,41 +382,231 @@ static void test_rs(void) {
 
         assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
         assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
-        assert_se(sd_ndisc_set_callback(nd, test_callback, e) >= 0);
+        assert_se(sd_ndisc_set_callback(nd, test_callback_ra, e) >= 0);
 
-        assert_se(sd_event_add_time(e, &test_hangcheck, clock_boottime_or_monotonic(),
-                                 time_now + 2 *USEC_PER_SEC, 0,
-                                 test_rs_hangcheck, NULL) >= 0);
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         assert_se(sd_ndisc_stop(nd) >= 0);
         assert_se(sd_ndisc_start(nd) >= 0);
+        assert_se(sd_ndisc_start(nd) >= 0);
         assert_se(sd_ndisc_stop(nd) >= 0);
+        test_fd[1] = safe_close(test_fd[1]);
 
         assert_se(sd_ndisc_start(nd) >= 0);
 
-        sd_event_loop(e);
+        assert_se(sd_event_add_io(e, &s, test_fd[1], EPOLLIN, on_recv_rs, nd) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
 
-        test_hangcheck = sd_event_source_unref(test_hangcheck);
+        assert_se(sd_event_loop(e) >= 0);
 
-        nd = sd_ndisc_unref(nd);
-        assert_se(!nd);
-
-        close(test_fd[1]);
-
-        sd_event_unref(e);
+        test_fd[1] = -EBADF;
 }
 
-static int test_timeout_value(uint8_t flags) {
-        static int count = 0;
-        static usec_t last = 0;
-        sd_ndisc *nd = test_timeout_nd;
-        usec_t min, max;
-        char time_string_min[FORMAT_TIMESPAN_MAX];
-        char time_string_nd[FORMAT_TIMESPAN_MAX];
-        char time_string_max[FORMAT_TIMESPAN_MAX];
+static int send_ra_invalid_domain(uint8_t flags) {
+        uint8_t advertisement[] = {
+                /* struct nd_router_advert */
+                0x86, 0x00, 0x00, 0x00, 0x40, 0xc0, 0x00, 0xb4,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                /* type = 0x03 (SD_NDISC_OPTION_PREFIX_INFORMATION), length = 32 */
+                0x03, 0x04, 0x40, 0xc0, 0x00, 0x00, 0x01, 0xf4,
+                0x00, 0x00, 0x01, 0xb8, 0x00, 0x00, 0x00, 0x00,
+                0x20, 0x01, 0x0d, 0xb8, 0xde, 0xad, 0xbe, 0xef,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                /* type = 0x19 (SD_NDISC_OPTION_RDNSS), length = 24 */
+                0x19, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c,
+                0x20, 0x01, 0x0d, 0xb8, 0xde, 0xad, 0xbe, 0xef,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                /* type = 0x1f (SD_NDISC_OPTION_DNSSL), length = 112 */
+                0x1f, 0x0e, 0xee, 0x68, 0xb0, 0xf4, 0x36, 0x39,
+                0x2c, 0xbc, 0x0b, 0xbc, 0xa9, 0x97, 0x71, 0x37,
+                0xad, 0x86, 0x80, 0x14, 0x2e, 0x58, 0xaa, 0x8a,
+                0xb7, 0xa1, 0xbe, 0x91, 0x59, 0x00, 0xc4, 0xe8,
+                0xdd, 0xd8, 0x6d, 0xe5, 0x4a, 0x7a, 0x71, 0x42,
+                0x74, 0x45, 0x9e, 0x2e, 0xfd, 0x9d, 0x71, 0x1d,
+                0xd0, 0xc0, 0x54, 0x0c, 0x4d, 0x1f, 0xbf, 0x90,
+                0xd9, 0x79, 0x58, 0xc0, 0x1d, 0xa3, 0x39, 0xcf,
+                0xb8, 0xec, 0xd2, 0xe4, 0xcd, 0xb6, 0x13, 0x2f,
+                0xc0, 0x46, 0xe8, 0x07, 0x3f, 0xaa, 0x28, 0xa5,
+                0x23, 0xf1, 0xf0, 0xca, 0xd3, 0x19, 0x3f, 0xfa,
+                0x6c, 0x7c, 0xec, 0x1b, 0xcf, 0x71, 0xeb, 0xba,
+                0x68, 0x1b, 0x8e, 0x7d, 0x93, 0x7e, 0x0b, 0x9f,
+                0xdb, 0x12, 0x9c, 0x75, 0x22, 0x5f, 0x12, 0x00,
+                /* type = 0x01 (SD_NDISC_OPTION_SOURCE_LL_ADDRESS), length = 8 */
+                0x01, 0x01, 0x78, 0x2b, 0xcb, 0xb3, 0x6d, 0x53,
+                /* type = 0x1a (SD_NDISC_OPTION_FLAGS_EXTENSION), length = 8 */
+                0x1a, 0x01, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+        };
+
+        advertisement[5] = flags;
+
+        assert_se(write(test_fd[1], advertisement, sizeof(advertisement)) ==
+                  sizeof(advertisement));
+
+        log_debug("%s: Sent RA with flag 0x%02x", __func__, flags);
+
+        return 0;
+}
+
+static int on_recv_rs_invalid_domain(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet = NULL;
+        assert_se(icmp6_packet_receive(fd, &packet) >= 0);
+
+        return send_ra_invalid_domain(0);
+}
+
+TEST(invalid_domain) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
+
+        assert_se(sd_event_new(&e) >= 0);
+
+        assert_se(sd_ndisc_new(&nd) >= 0);
+        assert_se(nd);
+
+        assert_se(sd_ndisc_attach_event(nd, e, 0) >= 0);
+
+        assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
+        assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
+        assert_se(sd_ndisc_set_callback(nd, test_callback_ra, e) >= 0);
+
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
+
+        assert_se(sd_ndisc_start(nd) >= 0);
+
+        assert_se(sd_event_add_io(e, &s, test_fd[1], EPOLLIN, on_recv_rs_invalid_domain, nd) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
+
+        assert_se(sd_event_loop(e) >= 0);
+
+        test_fd[1] = -EBADF;
+}
+
+static void neighbor_dump(sd_ndisc_neighbor *na) {
+        struct in6_addr addr;
+        uint32_t flags;
+
+        assert_se(na);
+
+        log_info("--");
+        assert_se(sd_ndisc_neighbor_get_sender_address(na, &addr) >= 0);
+        log_info("Sender: %s", IN6_ADDR_TO_STRING(&addr));
+
+        assert_se(sd_ndisc_neighbor_get_flags(na, &flags) >= 0);
+        log_info("Flags: Router:%s, Solicited:%s, Override: %s",
+                 yes_no(flags & ND_NA_FLAG_ROUTER),
+                 yes_no(flags & ND_NA_FLAG_SOLICITED),
+                 yes_no(flags & ND_NA_FLAG_OVERRIDE));
+
+        assert_se(sd_ndisc_neighbor_is_router(na) == FLAGS_SET(flags, ND_NA_FLAG_ROUTER));
+        assert_se(sd_ndisc_neighbor_is_solicited(na) == FLAGS_SET(flags, ND_NA_FLAG_SOLICITED));
+        assert_se(sd_ndisc_neighbor_is_override(na) == FLAGS_SET(flags, ND_NA_FLAG_OVERRIDE));
+}
+
+static int send_na(uint32_t flags) {
+        uint8_t advertisement[] = {
+                /* struct nd_neighbor_advert */
+                0x88, 0x00, 0xde, 0x83, 0x00, 0x00, 0x00, 0x00,
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                /* type = 0x02 (SD_NDISC_OPTION_TARGET_LL_ADDRESS), length = 8 */
+                0x01, 0x01, 'A', 'B', 'C', '1', '2', '3',
+        };
+
+        ((struct nd_neighbor_advert*) advertisement)->nd_na_flags_reserved = flags;
+
+        assert_se(write(test_fd[1], advertisement, sizeof(advertisement)) == sizeof(advertisement));
+
+        log_debug("%s: Sent NA with flag 0x%02x", __func__, flags);
+
+        return 0;
+}
+
+static void test_callback_na(sd_ndisc *nd, sd_ndisc_event_t event, void *message, void *userdata) {
+        sd_event *e = userdata;
+        static unsigned idx = 0;
+        uint32_t flags_array[] = {
+                0,
+                0,
+                ND_NA_FLAG_ROUTER,
+                ND_NA_FLAG_SOLICITED,
+                ND_NA_FLAG_SOLICITED | ND_NA_FLAG_OVERRIDE,
+        };
+        uint32_t flags;
 
         assert_se(nd);
-        assert_se(nd->event);
+
+        if (event != SD_NDISC_EVENT_NEIGHBOR)
+                return;
+
+        sd_ndisc_neighbor *rt = ASSERT_PTR(message);
+
+        neighbor_dump(rt);
+
+        assert_se(sd_ndisc_neighbor_get_flags(rt, &flags) >= 0);
+        assert_se(flags == flags_array[idx]);
+        idx++;
+
+        log_debug("%s: Got event 0x%02" PRIx32, __func__, flags);
+
+        if (idx < ELEMENTSOF(flags_array)) {
+                send_na(flags_array[idx]);
+                return;
+        }
+
+        idx = 0;
+        sd_event_exit(e, 0);
+}
+
+static int on_recv_rs_na(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet = NULL;
+        assert_se(icmp6_packet_receive(fd, &packet) >= 0);
+
+        return send_na(0);
+}
+
+TEST(na) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
+
+        assert_se(sd_event_new(&e) >= 0);
+
+        assert_se(sd_ndisc_new(&nd) >= 0);
+        assert_se(nd);
+
+        assert_se(sd_ndisc_attach_event(nd, e, 0) >= 0);
+
+        assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
+        assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
+        assert_se(sd_ndisc_set_callback(nd, test_callback_na, e) >= 0);
+
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
+
+        assert_se(sd_ndisc_start(nd) >= 0);
+
+        assert_se(sd_event_add_io(e, &s, test_fd[1], EPOLLIN, on_recv_rs_na, nd) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
+
+        assert_se(sd_event_loop(e) >= 0);
+
+        test_fd[1] = -EBADF;
+}
+
+static int on_recv_rs_timeout(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        _cleanup_(icmp6_packet_unrefp) ICMP6Packet *packet = NULL;
+        sd_ndisc *nd = ASSERT_PTR(userdata);
+        static int count = 0;
+        static usec_t last = 0;
+        usec_t min, max;
+
+        assert_se(icmp6_packet_receive(fd, &packet) >= 0);
 
         if (++count >= 20)
                 sd_event_exit(nd->event, 0);
@@ -348,17 +631,12 @@ static int test_timeout_value(uint8_t flags) {
                         NDISC_MAX_ROUTER_SOLICITATION_INTERVAL / 10;
         }
 
-        format_timespan(time_string_min, FORMAT_TIMESPAN_MAX,
-                        min, USEC_PER_MSEC);
-        format_timespan(time_string_nd, FORMAT_TIMESPAN_MAX,
-                        nd->retransmit_time, USEC_PER_MSEC);
-        format_timespan(time_string_max, FORMAT_TIMESPAN_MAX,
-                        max, USEC_PER_MSEC);
-
         log_info("backoff timeout interval %2d %s%s <= %s <= %s",
                  count,
-                 (last * 2 > NDISC_MAX_ROUTER_SOLICITATION_INTERVAL)? "(max) ": "",
-                 time_string_min, time_string_nd, time_string_max);
+                 last * 2 > NDISC_MAX_ROUTER_SOLICITATION_INTERVAL ? "(max) ": "",
+                 FORMAT_TIMESPAN(min, USEC_PER_MSEC),
+                 FORMAT_TIMESPAN(nd->retransmit_time, USEC_PER_MSEC),
+                 FORMAT_TIMESPAN(max, USEC_PER_MSEC));
 
         assert_se(min <= nd->retransmit_time);
         assert_se(max >= nd->retransmit_time);
@@ -370,49 +648,33 @@ static int test_timeout_value(uint8_t flags) {
         return 0;
 }
 
-static void test_timeout(void) {
-        sd_event *e;
-        sd_ndisc *nd;
-        usec_t time_now = now(clock_boottime_or_monotonic());
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
-
-        send_ra_function = test_timeout_value;
+TEST(timeout) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
 
         assert_se(sd_event_new(&e) >= 0);
 
         assert_se(sd_ndisc_new(&nd) >= 0);
         assert_se(nd);
 
-        test_timeout_nd = nd;
-
         assert_se(sd_ndisc_attach_event(nd, e, 0) >= 0);
 
         assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
         assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
 
-        assert_se(sd_event_add_time(e, &test_hangcheck, clock_boottime_or_monotonic(),
-                                 time_now + 2U * USEC_PER_SEC, 0,
-                                 test_rs_hangcheck, NULL) >= 0);
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         assert_se(sd_ndisc_start(nd) >= 0);
 
-        sd_event_loop(e);
+        assert_se(sd_event_add_io(e, &s, test_fd[1], EPOLLIN, on_recv_rs_timeout, nd) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
 
-        test_hangcheck = sd_event_source_unref(test_hangcheck);
+        assert_se(sd_event_loop(e) >= 0);
 
-        nd = sd_ndisc_unref(nd);
-
-        sd_event_unref(e);
+        test_fd[1] = -EBADF;
 }
 
-int main(int argc, char *argv[]) {
-
-        test_setup_logging(LOG_DEBUG);
-
-        test_rs();
-        test_timeout();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

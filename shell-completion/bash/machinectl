@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # machinectl(1) completion                      -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word() {
     local w word=$1; shift
@@ -24,31 +25,42 @@ __contains_word() {
 }
 
 __get_machines() {
+    local mode=$1; shift 1
     local a b
-    (machinectl list-images --no-legend --no-pager; machinectl list --no-legend --no-pager; echo ".host") | \
-	{ while read a b; do echo " $a"; done; } | sort -u;
+    { machinectl $mode list-images --full --no-legend --no-pager 2>/dev/null; machinectl $mode list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 _machinectl() {
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
-    local i verb comps
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
+    local i verb comps mode
 
     local -A OPTS=(
         [STANDALONE]='--all -a -l --full --help -h --no-ask-password --no-legend --no-pager --version --value
-                      --mkdir --read-only --force -q --quiet'
-        [ARG]='--host -H --kill-who -M --machine --property -p --signal -s --uid -E --setenv -n --lines
-                      -o --output --verify --format --max-addresses'
+                      --mkdir --read-only --force -q --quiet --system --user --now -V'
+        [ARG]='--host -H --kill-whom -M --machine --property -p -P --signal -s --uid -E --setenv -n --lines
+                      -o --output --verify --format --max-addresses --runner'
     )
 
     local -A VERBS=(
         [STANDALONE]='list list-images clean pull-tar pull-raw list-transfers cancel-transfer import-fs'
-        [MACHINES]='status show start stop login shell enable disable poweroff reboot terminate kill bind
-                    copy-to copy-from image-status show-image clone rename read-only remove set-limit
-                    export-tar export-raw'
+        [MACHINES]='status show start stop login shell enable disable poweroff reboot restart pause resume terminate kill
+                    image-status show-image remove export-tar export-raw'
+        [MACHINES_OR_FILES]='edit cat'
+        [MACHINE_ONLY]='clone rename set-limit bind-volume unbind-volume'
+        [READONLY]='read-only'
         [FILE]='import-tar import-raw'
+        [MACHINES_AND_FILES]='copy-to copy-from bind'
     )
 
     _init_completion || return
+
+    if __contains_word "--user" ${COMP_WORDS[*]}; then
+        mode=--user
+    else
+        mode=--system
+    fi
 
     for ((i=0; i <= COMP_CWORD; i++)); do
         if __contains_word "${COMP_WORDS[i]}" ${VERBS[*]} &&
@@ -64,16 +76,16 @@ _machinectl() {
                 _signals
                 return
                 ;;
-            --kill-who)
+            --kill-whom|--kill-who)
                 comps='all leader'
                 ;;
             --host|-H)
                 comps=$(compgen -A hostname)
                 ;;
             --machine|-M)
-                comps=$( __get_machines )
+                comps=$( __get_machines $mode )
                 ;;
-            --property|-p)
+            --property|-p|-P)
                 comps=''
                 ;;
             --output|-o)
@@ -83,7 +95,10 @@ _machinectl() {
                 comps=$( machinectl --verify=help 2>/dev/null )
                 ;;
             --format)
-                comps='uncompressed xz gzip bzip2'
+                comps='uncompressed xz gzip bzip2 zstd'
+                ;;
+            --runner)
+                comps='nspawn vmspawn'
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
@@ -95,18 +110,83 @@ _machinectl() {
         return 0
     fi
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
 
     elif __contains_word "$verb" ${VERBS[STANDALONE]}; then
         comps=''
 
     elif __contains_word "$verb" ${VERBS[MACHINES]}; then
-        comps=$( __get_machines )
+        comps=$( __get_machines $mode )
+
+    elif __contains_word "$verb" ${VERBS[MACHINES_OR_FILES]}; then
+        comps=$( __get_machines $mode )
+        compopt -o filenames
+        comps+=" $(compgen -f -- "$cur")"
+
+    elif __contains_word "$verb" ${VERBS[MACHINE_ONLY]}; then
+        local k args=0
+        for ((k=i+1; k < COMP_CWORD; k++)); do
+            if __contains_word "${COMP_WORDS[k]}" ${OPTS[ARG]}; then
+                ((k++))
+            elif [[ ${COMP_WORDS[k]} = -* ]]; then
+                continue
+            else
+                ((args++))
+            fi
+        done
+        if (( args == 0 )); then
+            comps=$( __get_machines $mode )
+        else
+            comps=''
+        fi
+
+    elif __contains_word "$verb" ${VERBS[READONLY]}; then
+        local k args=0
+        for ((k=i+1; k < COMP_CWORD; k++)); do
+            if __contains_word "${COMP_WORDS[k]}" ${OPTS[ARG]}; then
+                ((k++))
+            elif [[ ${COMP_WORDS[k]} = -* ]]; then
+                continue
+            else
+                ((args++))
+            fi
+        done
+        if (( args == 0 )); then
+            comps=$( __get_machines $mode )
+        elif (( args == 1 )); then
+            comps='true false'
+        else
+            comps=''
+        fi
+
+    elif __contains_word "$verb" ${VERBS[MACHINES_AND_FILES]}; then
+        local k args=0
+        for ((k=i+1; k < COMP_CWORD; k++)); do
+            if __contains_word "${COMP_WORDS[k]}" ${OPTS[ARG]}; then
+                ((k++))
+            elif [[ ${COMP_WORDS[k]} = -* ]]; then
+                continue
+            else
+                ((args++))
+            fi
+        done
+        if (( args == 0 )); then
+            comps=$( __get_machines $mode )
+        elif (( args <= 2 )); then
+            comps=$(compgen -f -- "$cur")
+            compopt -o filenames
+        else
+            comps=''
+        fi
 
     elif __contains_word "$verb" ${VERBS[FILE]}; then
-        comps=$(compgen -f -- "cur")
-        compopt -o filenames
+        if (( COMP_CWORD == i + 1 )); then # first argument after verb
+            comps=$(compgen -f -- "$cur")
+            compopt -o filenames
+        else
+            comps=''
+        fi
     fi
 
     COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

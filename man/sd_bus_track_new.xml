@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_track_new" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -32,6 +32,12 @@
   <refsynopsisdiv>
     <funcsynopsis>
       <funcsynopsisinfo>#include &lt;systemd/sd-bus.h&gt;</funcsynopsisinfo>
+
+      <funcprototype>
+        <funcdef>typedef int (*<function>sd_bus_track_handler_t</function>)</funcdef>
+        <paramdef>sd_bus_track *<parameter>track</parameter></paramdef>
+        <paramdef>void *<parameter>userdata</parameter></paramdef>
+      </funcprototype>
 
       <funcprototype>
         <funcdef>int <function>sd_bus_track_new</function></funcdef>
@@ -101,11 +107,11 @@
     <function>sd_bus_track_add_sender()</function>. They may be dropped again via
     <function>sd_bus_track_remove_name()</function> and
     <function>sd_bus_track_remove_sender()</function>. Alternatively, references on peers are removed automatically
-    when they disconnect from the bus.  If non-NULL the <parameter>handler</parameter> may specify a function that is
-    invoked whenever the last reference is dropped, regardless whether the reference is dropped explicitly via
-    <function>sd_bus_track_remove_name()</function> or implicitly because the peer disconnected from the bus. The final
-    argument <parameter>userdata</parameter> may be used to attach a generic user data pointer to the object. This
-    pointer is passed to the handler callback when it is invoked.</para>
+    when they disconnect from the bus.  If non-<constant>NULL</constant> the <parameter>handler</parameter> may specify
+    a function that is invoked whenever the last reference is dropped, regardless whether the reference is dropped
+    explicitly via <function>sd_bus_track_remove_name()</function> or implicitly because the peer disconnected from the
+    bus. The final argument <parameter>userdata</parameter> may be used to attach a generic user data pointer to the
+    object. This pointer is passed to the handler callback when it is invoked.</para>
 
     <para><function>sd_bus_track_ref()</function> creates a new reference to a bus peer tracking object. This object
     will not be destroyed until <function>sd_bus_track_unref()</function> has been called as many times plus once
@@ -137,7 +143,7 @@
     irrelevant and the tracking of the specific peer is immediately
     removed. <function>sd_bus_track_get_recursive()</function> may be used to determine whether the bus peer tracking
     object is operating in recursive mode. <function>sd_bus_track_set_recursive()</function> may be used to enable or
-    disable recursive mode. By default a bus peer tracking object operates in non-recursive mode, and
+    disable recursive mode. By default, a bus peer tracking object operates in non-recursive mode, and
     <function>sd_bus_track_get_recursive()</function> for a newly allocated object hence returns a value equal to
     zero. Use <function>sd_bus_track_set_recursive()</function> to enable recursive mode, right after allocation. It
     takes a boolean argument to enable or disable recursive mode. Note that tracking objects for which
@@ -216,16 +222,30 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_track_new()</function>,
+    <function>sd_bus_track_handler_t()</function>,
+    <function>sd_bus_track_ref()</function>,
+    <function>sd_bus_track_unref()</function>,
+    <function>sd_bus_track_unrefp()</function>,
+    <function>sd_bus_track_get_recursive()</function>,
+    <function>sd_bus_track_set_recursive()</function>,
+    <function>sd_bus_track_get_bus()</function>,
+    <function>sd_bus_track_get_userdata()</function>, and
+    <function>sd_bus_track_set_userdata()</function> were added in version 232.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-      <citerefentry><refentrytitle>sd_bus_track_add_name</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_track_add_name</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

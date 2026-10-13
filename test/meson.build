@@ -1,244 +1,143 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-test_data_files = '''
-        a.service
-        b.service
-        basic.target
-        c.service
-        d.service
-        daughter.service
-        dml.slice
-        dml-passthrough.slice
-        dml-passthrough-empty.service
-        dml-passthrough-set-dml.service
-        dml-passthrough-set-ml.service
-        dml-override.slice
-        dml-override-empty.service
-        dml-discard.slice
-        dml-discard-empty.service
-        dml-discard-set-ml.service
-        e.service
-        end.service
-        f.service
-        g.service
-        grandchild.service
-        h.service
-        hello-after-sleep.target
-        hello.service
-        hwdb/10-bad.hwdb
-        journal-data/journal-1.txt
-        journal-data/journal-2.txt
-        nomem.slice
-        nomemleaf.service
-        parent-deep.slice
-        parent.slice
-        sched_idle_bad.service
-        sched_idle_ok.service
-        sched_rr_bad.service
-        sched_rr_change.service
-        sched_rr_ok.service
-        shutdown.target
-        sleep.service
-        sockets.target
-        son.service
-        sysinit.target
-        test-execute/exec-basic.service
-        test-execute/exec-ambientcapabilities-merge-nfsnobody.service
-        test-execute/exec-ambientcapabilities-merge-nobody.service
-        test-execute/exec-ambientcapabilities-merge.service
-        test-execute/exec-ambientcapabilities-nfsnobody.service
-        test-execute/exec-ambientcapabilities-nobody.service
-        test-execute/exec-ambientcapabilities.service
-        test-execute/exec-bindpaths.service
-        test-execute/exec-capabilityboundingset-invert.service
-        test-execute/exec-capabilityboundingset-merge.service
-        test-execute/exec-capabilityboundingset-reset.service
-        test-execute/exec-capabilityboundingset-simple.service
-        test-execute/exec-cpuaffinity1.service
-        test-execute/exec-cpuaffinity2.service
-        test-execute/exec-cpuaffinity3.service
-        test-execute/exec-dynamicuser-fixeduser-adm.service
-        test-execute/exec-dynamicuser-fixeduser-games.service
-        test-execute/exec-dynamicuser-fixeduser-one-supplementarygroup.service
-        test-execute/exec-dynamicuser-fixeduser.service
-        test-execute/exec-dynamicuser-statedir-migrate-step1.service
-        test-execute/exec-dynamicuser-statedir-migrate-step2.service
-        test-execute/exec-dynamicuser-statedir.service
-        test-execute/exec-dynamicuser-supplementarygroups.service
-        test-execute/exec-environment-no-substitute.service
-        test-execute/exec-environment-empty.service
-        test-execute/exec-environment-multiple.service
-        test-execute/exec-environment.service
-        test-execute/exec-environmentfile.service
-        test-execute/exec-group-nfsnobody.service
-        test-execute/exec-group-nobody.service
-        test-execute/exec-group-nogroup.service
-        test-execute/exec-group.service
-        test-execute/exec-ignoresigpipe-no.service
-        test-execute/exec-ignoresigpipe-yes.service
-        test-execute/exec-inaccessiblepaths-mount-propagation.service
-        test-execute/exec-inaccessiblepaths-sys.service
-        test-execute/exec-ioschedulingclass-best-effort.service
-        test-execute/exec-ioschedulingclass-idle.service
-        test-execute/exec-ioschedulingclass-none.service
-        test-execute/exec-ioschedulingclass-realtime.service
-        test-execute/exec-oomscoreadjust-negative.service
-        test-execute/exec-oomscoreadjust-positive.service
-        test-execute/exec-passenvironment-absent.service
-        test-execute/exec-passenvironment-empty.service
-        test-execute/exec-passenvironment-repeated.service
-        test-execute/exec-passenvironment.service
-        test-execute/exec-personality-aarch64.service
-        test-execute/exec-personality-ppc64.service
-        test-execute/exec-personality-ppc64le.service
-        test-execute/exec-personality-s390.service
-        test-execute/exec-personality-x86-64.service
-        test-execute/exec-personality-x86.service
-        test-execute/exec-privatedevices-disabled-by-prefix.service
-        test-execute/exec-privatedevices-no-capability-mknod.service
-        test-execute/exec-privatedevices-no-capability-sys-rawio.service
-        test-execute/exec-privatedevices-no.service
-        test-execute/exec-privatedevices-yes-capability-mknod.service
-        test-execute/exec-privatedevices-yes-capability-sys-rawio.service
-        test-execute/exec-privatedevices-yes.service
-        test-execute/exec-privatenetwork-yes.service
-        test-execute/exec-privatetmp-no.service
-        test-execute/exec-privatetmp-yes.service
-        test-execute/exec-protecthome-tmpfs-vs-protectsystem-strict.service
-        test-execute/exec-protectkernelmodules-no-capabilities.service
-        test-execute/exec-protectkernelmodules-yes-capabilities.service
-        test-execute/exec-protectkernelmodules-yes-mount-propagation.service
-        test-execute/exec-readonlypaths-mount-propagation.service
-        test-execute/exec-readonlypaths-simple.service
-        test-execute/exec-readonlypaths-with-bindpaths.service
-        test-execute/exec-readonlypaths.service
-        test-execute/exec-readwritepaths-mount-propagation.service
-        test-execute/exec-restrictnamespaces-merge-all.service
-        test-execute/exec-restrictnamespaces-merge-and.service
-        test-execute/exec-restrictnamespaces-merge-or.service
-        test-execute/exec-restrictnamespaces-mnt-blacklist.service
-        test-execute/exec-restrictnamespaces-mnt.service
-        test-execute/exec-restrictnamespaces-no.service
-        test-execute/exec-restrictnamespaces-yes.service
-        test-execute/exec-runtimedirectory-mode.service
-        test-execute/exec-runtimedirectory-owner-nfsnobody.service
-        test-execute/exec-runtimedirectory-owner-nobody.service
-        test-execute/exec-runtimedirectory-owner-nogroup.service
-        test-execute/exec-runtimedirectory-owner.service
-        test-execute/exec-runtimedirectory.service
-        test-execute/exec-specifier-interpolation.service
-        test-execute/exec-specifier.service
-        test-execute/exec-specifier@.service
-        test-execute/exec-standardinput-data.service
-        test-execute/exec-standardinput-file.service
-        test-execute/exec-standardoutput-file.service
-        test-execute/exec-standardoutput-append.service
-        test-execute/exec-supplementarygroups-multiple-groups-default-group-user.service
-        test-execute/exec-supplementarygroups-multiple-groups-withgid.service
-        test-execute/exec-supplementarygroups-multiple-groups-withuid.service
-        test-execute/exec-supplementarygroups-single-group-user.service
-        test-execute/exec-supplementarygroups-single-group.service
-        test-execute/exec-supplementarygroups.service
-        test-execute/exec-systemcallerrornumber-name.service
-        test-execute/exec-systemcallerrornumber-number.service
-        test-execute/exec-systemcallfilter-failing.service
-        test-execute/exec-systemcallfilter-failing2.service
-        test-execute/exec-systemcallfilter-not-failing.service
-        test-execute/exec-systemcallfilter-not-failing2.service
-        test-execute/exec-systemcallfilter-system-user-nfsnobody.service
-        test-execute/exec-systemcallfilter-system-user-nobody.service
-        test-execute/exec-systemcallfilter-system-user.service
-        test-execute/exec-systemcallfilter-with-errno-multi.service
-        test-execute/exec-systemcallfilter-with-errno-name.service
-        test-execute/exec-systemcallfilter-with-errno-number.service
-        test-execute/exec-temporaryfilesystem-options.service
-        test-execute/exec-temporaryfilesystem-ro.service
-        test-execute/exec-temporaryfilesystem-rw.service
-        test-execute/exec-temporaryfilesystem-usr.service
-        test-execute/exec-umask-0177.service
-        test-execute/exec-umask-default.service
-        test-execute/exec-unsetenvironment.service
-        test-execute/exec-user-nfsnobody.service
-        test-execute/exec-user-nobody.service
-        test-execute/exec-user.service
-        test-execute/exec-workingdirectory.service
-        test-execute/exec-workingdirectory-trailing-dot.service
-        test-path/basic.target
-        test-path/path-changed.path
-        test-path/path-changed.service
-        test-path/path-directorynotempty.path
-        test-path/path-directorynotempty.service
-        test-path/path-exists.path
-        test-path/path-exists.service
-        test-path/path-existsglob.path
-        test-path/path-existsglob.service
-        test-path/path-makedirectory.path
-        test-path/path-makedirectory.service
-        test-path/path-modified.path
-        test-path/path-modified.service
-        test-path/path-mycustomunit.service
-        test-path/path-service.service
-        test-path/path-unit.path
-        test-path/paths.target
-        test-path/sysinit.target
-        test-umount/empty.mountinfo
-        test-umount/example.swaps
-        test-umount/garbled.mountinfo
-        test-umount/rhbug-1554943.mountinfo
-        testsuite.target
-        timers.target
-        unit-with-.service.d/20-override.conf
-        unit-with-multiple-.service.d/20-override.conf
-        unit-with-multiple-.service.d/30-override.conf
-        unit-with-multiple-dashes.service
-        unit-with-multiple-dashes.service.d/10-override.conf
-        unstoppable.service
-'''.split()
+if conf.get('ENABLE_SYSUSERS') == 1
+        test_sysusers_sh = configure_file(
+                input : 'test-sysusers.sh.in',
+                output : 'test-sysusers.sh',
+                configuration : conf)
 
-if conf.get('ENABLE_RESOLVE') == 1
-        test_data_files += '''
-                test-resolve/_openpgpkey.fedoraproject.org.pkts
-                test-resolve/fedoraproject.org.pkts
-                test-resolve/gandi.net.pkts
-                test-resolve/google.com.pkts
-                test-resolve/root.pkts
-                test-resolve/sw1a1aa-sw1a2aa-sw1a2ab-sw1a2ac.find.me.uk.pkts
-                test-resolve/teamits.com.pkts
-                test-resolve/zbyszek@fedoraproject.org.pkts
-                test-resolve/_443._tcp.fedoraproject.org.pkts
-                test-resolve/kyhwana.org.pkts
-                test-resolve/fake-caa.pkts
-        '''.split()
-endif
+        if want_tests != 'false'
+                exe = executables_by_name.get('systemd-sysusers')
+                test('test-sysusers',
+                     test_sysusers_sh,
+                     # https://github.com/mesonbuild/meson/issues/2681
+                     args : exe.full_path(),
+                     depends : exe,
+                     env : test_env,
+                     suite : 'sysusers')
 
-if install_tests
-        foreach file : test_data_files
-                subdir = file.split('/')[0]
-                if subdir == file
-                        subdir = ''
+                if 'systemd-sysusers.standalone' in executables_by_name
+                        exe = executables_by_name.get('systemd-sysusers.standalone')
+                        test('test-sysusers.standalone',
+                             test_sysusers_sh,
+                             # https://github.com/mesonbuild/meson/issues/2681
+                             args : exe.full_path(),
+                             depends : exe,
+                             env : test_env,
+                             suite : 'sysusers')
                 endif
+        endif
 
-                install_data(file,
-                             install_dir : testsdir + '/testdata/' + subdir)
-        endforeach
+        if install_tests
+                install_data(test_sysusers_sh,
+                             install_dir : unittestsdir)
+                install_subdir('test-sysusers',
+                               exclude_files : '.gitattributes',
+                               install_dir : testdata_dir)
+        endif
 endif
 
 ############################################################
 
-rule_syntax_check_py = find_program('rule-syntax-check.py')
+if want_tests != 'false' and conf.get('ENABLE_HWDB') == 1
+        exe = executables_by_name.get('systemd-hwdb')
+        test('hwdb-test',
+             files('hwdb-test.sh'),
+             suite : 'dist',
+             args : exe.full_path(),
+             depends : exe,
+             timeout : 90)
+endif
+
+############################################################
+
+if want_tests != 'false'
+        systemctl = executables_by_name.get('systemctl')
+        systemd_id128 = executables_by_name.get('systemd-id128')
+        test('test-systemctl-enable',
+             files('test-systemctl-enable.sh'),
+             # https://github.com/mesonbuild/meson/issues/2681
+             args : [systemctl.full_path(),
+                     systemd_id128.full_path()],
+             depends : [systemctl, systemd_id128],
+             suite : 'systemctl')
+endif
+
+############################################################
+
+if want_tests != 'false' and conf.get('HAVE_BLKID') == 1
+        exe = executables_by_name.get('bootctl')
+        test('test-bootctl-json',
+             files('test-bootctl-json.sh'),
+             args : exe.full_path(),
+             depends : exe,
+             suite : 'boot')
+endif
+
+############################################################
+
+if want_tests != 'false' and conf.get('ENABLE_TMPFILES') == 1
+        test_systemd_tmpfiles_py = files('test-systemd-tmpfiles.py')
+        exe = executables_by_name.get('systemd-tmpfiles')
+        test('test-systemd-tmpfiles',
+             test_systemd_tmpfiles_py,
+             args : exe.full_path(),
+             depends : exe,
+             suite : 'tmpfiles')
+
+        if 'systemd-tmpfiles.standalone' in executables_by_name
+                exe = executables_by_name.get('systemd-tmpfiles.standalone')
+                test('test-systemd-tmpfiles.standalone',
+                     test_systemd_tmpfiles_py,
+                     args : exe.full_path(),
+                     depends : exe,
+                     suite : 'tmpfiles')
+        endif
+endif
+
+############################################################
+
+test_compare_versions_sh = files('test-compare-versions.sh')
+if want_tests != 'false' and 'systemd-analyze' in executables_by_name
+        exe = executables_by_name.get('systemd-analyze')
+        test('test-compare-versions',
+             test_compare_versions_sh,
+             args : exe.full_path(),
+             depends : exe,
+             suite : 'test')
+endif
+if install_tests
+        install_data(test_compare_versions_sh,
+                     install_dir : unittestsdir)
+endif
+
+############################################################
+
 if want_tests != 'false'
         test('rule-syntax-check',
-             rule_syntax_check_py,
+             files('rule-syntax-check.py'),
+             suite : 'dist',
              args : all_rules)
-endif
 
-############################################################
+        exe = executables_by_name.get('udevadm')
+        test('udev-rules-check',
+             exe,
+             suite : 'udev',
+             args : ['verify', '--resolve-names=late', all_rules])
 
-if conf.get('HAVE_SYSV_COMPAT') == 1
-        sysv_generator_test_py = find_program('sysv-generator-test.py')
-        if want_tests != 'false'
-                test('sysv-generator-test',
-                     sysv_generator_test_py)
+        link_abi_targets = [libsystemd, libudev, libshared, libcore]
+        link_abi_targets += module_targets
+        foreach _, exe : executables_by_name
+                link_abi_targets += exe
+        endforeach
+
+        if conf.get('BUILD_MODE_DEVELOPER') == 1
+                test('test-link-abi',
+                     files('test-link-abi.py'),
+                     args : link_abi_targets,
+                     depends : link_abi_targets,
+                     suite : 'dist',
+                     timeout : 120)
         endif
 endif
 
@@ -248,36 +147,320 @@ if install_tests
         install_data('run-unit-tests.py',
                      install_mode : 'rwxr-xr-x',
                      install_dir : testsdir)
+
+        install_data('integration-test-setup.sh',
+                     install_mode : 'rwxr-xr-x',
+                     install_dir : testdata_dir)
 endif
 
 ############################################################
 
-# prepare test/sys tree
-sys_script_py = find_program('sys-script.py')
-custom_target(
-        'sys',
-        command : [sys_script_py, meson.current_build_dir()],
-        output : 'sys',
-        build_by_default : want_tests != 'false')
+test_fstab_generator_sh = files('test-fstab-generator.sh')
+if want_tests != 'false' and 'systemd-fstab-generator' in executables_by_name
+        exe = executables_by_name.get('systemd-fstab-generator')
+        test('test-fstab-generator',
+             test_fstab_generator_sh,
+             # https://github.com/mesonbuild/meson/issues/2681
+             args : exe.full_path(),
+             env : test_env,
+             depends : exe,
+             suite : 'fstab')
+endif
+if install_tests
+        install_data(test_fstab_generator_sh,
+                     install_mode : 'rwxr-xr-x',
+                     install_dir : unittestsdir)
+endif
 
-if perl.found()
-        udev_test_pl = find_program('udev-test.pl')
+############################################################
+
+test_network_generator_conversion_sh = files('test-network-generator-conversion.sh')
+if want_tests != 'false'
+        exe = executables_by_name.get('systemd-network-generator')
+        test('test-network-generator-conversion',
+             test_network_generator_conversion_sh,
+             # https://github.com/mesonbuild/meson/issues/2681
+             args : exe.full_path(),
+             depends : exe,
+             suite : 'network')
+endif
+if install_tests
+        install_data(test_network_generator_conversion_sh,
+                     install_mode : 'rwxr-xr-x',
+                     install_dir : unittestsdir)
+endif
+
+############################################################
+
+sys_script_py = files('sys-script.py')
+test_udev_py = files('test-udev.py')
+if want_tests != 'false'
+        exe = executables_by_name.get('test-udev-rule-runner')
+        test('test-udev',
+             test_udev_py,
+             args : ['-v'],
+             env : test_env + { 'UDEV_RULE_RUNNER' : exe.full_path() },
+             depends : exe,
+             timeout : 180,
+             suite : 'udev')
+endif
+if install_tests
+        install_data(
+                sys_script_py,
+                test_udev_py,
+                install_dir : unittestsdir)
+endif
+
+############################################################
+
+rpm = find_program('rpm', required : false)
+rpmspec = find_program('rpmspec', required : false)
+
+if rpm.found() and rpmspec.found()
         if want_tests != 'false'
-                test('udev-test',
-                     udev_test_pl,
-                     timeout : 180)
+                test('test-rpm-macros',
+                     files('test-rpm-macros.sh'),
+                     suite : 'dist',
+                     args : [meson.project_build_root()],
+                     depends : rpm_depends)
         endif
 else
-        message('Skipping udev-test because perl is not available')
+      message('Skipping test-rpm-macros since rpm and/or rpmspec are not available')
 endif
 
-if conf.get('ENABLE_HWDB') == 1
-        hwdb_test_sh = find_program('hwdb-test.sh')
-        if want_tests != 'false'
-                test('hwdb-test',
-                     hwdb_test_sh,
-                     timeout : 90)
+############################################################
+
+if want_tests != 'false' and conf.get('HAVE_DMI') == 1
+        udev_dmi_memory_id_test = files('udev-dmi-memory-id-test.sh')
+        exe = executables_by_name.get('dmi_memory_id')
+
+        if git.found() and fs.is_dir(meson.project_source_root() / '.git')
+                out = run_command(
+                        env, '-u', 'GIT_WORK_TREE',
+                        git, '--git-dir=@0@/.git'.format(meson.project_source_root()),
+                        'ls-files', ':/test/dmidecode-dumps/*.bin',
+                        check: true)
+        else
+                out = run_command(
+                        sh, '-c', 'cd "$1"; echo test/dmidecode-dumps/*.bin', '_', meson.project_source_root(),
+                        check: true)
         endif
+
+        foreach p : out.stdout().split()
+                source = meson.project_source_root() / p
+                test('dmidecode_' + fs.stem(p),
+                     udev_dmi_memory_id_test,
+                     suite : 'udev',
+                     args : [exe.full_path(),
+                             source,
+                             source + '.txt'],
+                     depends : exe)
+        endforeach
 endif
 
-subdir('fuzz')
+############################################################
+
+if want_tests != 'false' and conf.get('ENABLE_KERNEL_INSTALL') == 1
+        kernel_install = executables_by_name.get('kernel-install')
+        args = [kernel_install.full_path(), loaderentry_install.full_path(), uki_copy_install]
+        deps = [kernel_install, loaderentry_install]
+        if want_ukify and boot_stubs.length() > 0
+                args += [ukify.full_path(), ukify_install.full_path(), test_ukify_install_py, boot_stubs[0]]
+                deps += [ukify, ukify_install, boot_stubs[0]]
+        endif
+
+        test('test-kernel-install',
+             test_kernel_install_sh,
+             env : test_env,
+             args : args,
+             depends : deps,
+             suite : 'kernel-install')
+endif
+
+############################################################
+
+test_dlopen_note_py = files('test-dlopen-note.py')
+
+if want_dlopen_tests
+        foreach name, exe : executables_by_name
+                if name.endswith('.static') or name.endswith('.shared')
+                        continue
+                endif
+
+                name_static = name + '.static'
+                if name + '.standalone' in executables_by_name
+                        exe_shared = exe
+                        exe_static = executables_by_name.get(name + '.standalone')
+                elif name + '.shared' in executables_by_name
+                        exe_shared = executables_by_name.get(name + '.shared')
+                        exe_static = exe
+                else
+                        continue
+                endif
+
+                test(name,
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', exe_shared.full_path(), '--static', exe_static.full_path()],
+                     depends : [exe_shared, exe_static],
+                     suite : 'dlopen')
+        endforeach
+
+        foreach name, lib : modules_by_name
+                if name.endswith('.standalone')
+                        continue
+                endif
+
+                lib_static = modules_by_name.get(name + '.standalone', lib)
+
+                test('lib' + lib.name(),
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', lib.full_path(), '--static', lib_static.full_path()],
+                     depends : [lib, lib_static],
+                     suite : 'dlopen')
+        endforeach
+
+        foreach lib : [libshared, libsystemd, libudev]
+                test('lib' + lib.name(),
+                     test_dlopen_note_py,
+                     env : test_env,
+                     args : ['--shared', lib.full_path(), '--static', lib.full_path()],
+                     depends : [lib],
+                     suite : 'dlopen')
+        endforeach
+endif
+
+############################################################
+
+if want_tests != 'false'
+        subdir('integration-tests')
+endif
+
+if install_tests
+        if meson.version().version_compare('<1.3.0')
+                if not rsync.found()
+                        error('rsync is required to install the integration test data')
+                endif
+
+                rsync_r = rsync.full_path() + ' -rlpt --exclude .gitattributes -- "@0@" "${DESTDIR:-}@1@"'
+        endif
+
+        if meson.version().version_compare('>=1.3.0')
+                # Installing symlinks to directories is broken in install_subdir() so we exclude the
+                # standalone directory from install_subdir() and handle it manually.
+                # TODO: Remove when https://github.com/mesonbuild/meson/pull/14471 is available in all
+                # supported distributions.
+                install_subdir('integration-tests',
+                               install_dir : testsdir,
+                               exclude_directories : ['standalone'],
+                               follow_symlinks : false)
+                install_emptydir(testsdir / 'integration-tests/standalone')
+                install_data('integration-tests/standalone/meson.build',
+                             install_dir : testsdir / 'integration-tests/standalone')
+                install_symlink('integration-tests',
+                                pointing_to : '..',
+                                install_dir : testsdir / 'integration-tests/standalone')
+        else
+                meson.add_install_script(sh, '-c',
+                                         rsync_r.format(meson.current_source_dir() / 'integration-tests', testsdir))
+        endif
+
+        foreach integration_test : integration_tests
+                integration_test_unit_env = []
+                integration_test_extra_unit_properties = []
+                integration_test_extra_service_properties = []
+
+                foreach key, value : integration_test['configuration']['env']
+                        integration_test_unit_env += [f'@key@=@value@']
+                endforeach
+
+                foreach key, value : integration_test['configuration']['unit']
+                        integration_test_extra_unit_properties += [f'@key@=@value@']
+                endforeach
+
+                foreach key, value : integration_test['configuration']['service']
+                        integration_test_extra_service_properties += [f'@key@=@value@']
+                endforeach
+
+                integration_test_unit = configure_file(
+                        input : 'test.service.in',
+                        output : '@0@.service'.format(integration_test['name']),
+                        configuration : integration_test['configuration'] + {
+                                'env' : ' '.join(integration_test_unit_env),
+                                'unit' : '\n'.join(integration_test_extra_unit_properties),
+                                'service' : '\n'.join(integration_test_extra_service_properties),
+                        },
+                )
+
+                install_data(integration_test_unit, install_dir : testdata_dir / 'units')
+        endforeach
+
+        testdata_subdirs = [
+                'auxv',
+                'journal-data',
+                'knot-data',
+                'test-cgroup-mask',
+                'test-engine',
+                'test-execute',
+                'test-fstab-generator',
+                'test-journals',
+                'test-network',
+                'test-network-generator-conversion',
+                'test-path',
+                'test-path-util',
+                'test-sched-prio',
+                'test-umount',
+                'integration-tests/TEST-07-PID1/TEST-07-PID1.units',
+                'integration-tests/TEST-03-JOBS/TEST-03-JOBS.units',
+                'integration-tests/TEST-04-JOURNAL/TEST-04-JOURNAL.units',
+                'integration-tests/TEST-06-SELINUX/TEST-06-SELINUX.units',
+                'integration-tests/TEST-16-EXTEND-TIMEOUT/TEST-16-EXTEND-TIMEOUT.units',
+                'integration-tests/TEST-23-UNIT-FILE/TEST-23-UNIT-FILE.units',
+                'integration-tests/TEST-30-ONCLOCKCHANGE/TEST-30-ONCLOCKCHANGE.units',
+                'integration-tests/TEST-38-FREEZER/TEST-38-FREEZER.units',
+                'integration-tests/TEST-52-HONORFIRSTSHUTDOWN/TEST-52-HONORFIRSTSHUTDOWN.units',
+                'integration-tests/TEST-54-CREDS/TEST-54-CREDS.units',
+                'integration-tests/TEST-55-OOMD/TEST-55-OOMD.units',
+                'integration-tests/TEST-62-RESTRICT-IFACES/TEST-62-RESTRICT-IFACES.units',
+                'integration-tests/TEST-63-PATH/TEST-63-PATH.units',
+                'integration-tests/TEST-65-ANALYZE/TEST-65-ANALYZE.units',
+                'integration-tests/TEST-66-DEVICE-ISOLATION/TEST-66-DEVICE-ISOLATION.units',
+                'integration-tests/TEST-74-AUX-UTILS/TEST-74-AUX-UTILS.units',
+                'integration-tests/TEST-80-NOTIFYACCESS/TEST-80-NOTIFYACCESS.units',
+                'units',
+        ]
+
+        foreach subdir : testdata_subdirs
+                # install_subdir() before meson 1.3.0 does not handle symlinks correctly (it follows them
+                # instead of copying the symlink) so we use rsync instead.
+                if meson.version().version_compare('>=1.3.0')
+                        install_subdir(subdir,
+                                       exclude_files : ['.gitattributes'],
+                                       install_dir : testdata_dir,
+                                       follow_symlinks : false)
+                else
+                        meson.add_install_script(sh, '-c',
+                                                 rsync_r.format(meson.current_source_dir() / subdir, testdata_dir))
+                endif
+        endforeach
+
+        install_data(kbd_model_map,
+                     install_dir : testdata_dir + '/test-keymap-util')
+
+        if conf.get('HAVE_ZSTD') == 1 and efi_arch != ''
+                install_subdir('test-bcd',
+                               exclude_files : '.gitattributes',
+                               install_dir : testdata_dir)
+        endif
+        install_subdir('test-resolve',
+                       exclude_files : '.gitattributes',
+                       install_dir : testdata_dir)
+
+        # The unit tests implemented as shell scripts expect to find testdata/
+        # in the directory where they are stored.
+        assert(fs.parent(unittestsdir) / 'testdata' == testdata_dir)
+        install_symlink('testdata',
+                        pointing_to : '../testdata',
+                        install_dir : unittestsdir)
+endif

@@ -1,9 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "device-internal.h"
 #include "device-private.h"
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fuzz.h"
 #include "tmpfile-util.h"
 
@@ -12,8 +11,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_(unlink_tempfilep) char filename[] = "/tmp/fuzz-udev-database.XXXXXX";
         _cleanup_fclose_ FILE *f = NULL;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         assert_se(fmkostemp_safe(filename, "r+", &f) == 0);
         if (size != 0)

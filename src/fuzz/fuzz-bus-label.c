@@ -1,6 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <errno.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "bus-label.h"
@@ -8,6 +6,8 @@
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         _cleanup_free_ char *unescaped = NULL, *escaped = NULL;
+
+        fuzz_setup_logging();
 
         unescaped = bus_label_unescape_n((const char*)data, size);
         assert_se(unescaped != NULL);

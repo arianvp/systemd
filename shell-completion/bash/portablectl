@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # portablectl(1) completion                             -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -25,8 +26,9 @@ __contains_word () {
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager 2>/dev/null |
-        { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 _portablectl() {
@@ -34,13 +36,14 @@ _portablectl() {
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     local -A OPTS=(
         [STANDALONE]='-q --quiet --runtime --no-reload --cat --no-pager --no-legend
-                              --no-ask-password -h --help --version'
-        [ARG]='-p --profile --copy -H --host -M --machine'
+                              --no-ask-password --enable --now -h --help --version
+                              --clean --no-block --force --user --system'
+        [ARG]='-p --profile --copy -H --host -M --machine --extension'
     )
 
     local -A VERBS=(
         [STANDALONE]='list'
-        [IMAGE]='attach detach inspect is-attached set-limit'
+        [IMAGE]='attach detach reattach inspect is-attached set-limit'
         [IMAGES]='remove'
         [IMAGE_WITH_BOOL]='read-only'
     )
@@ -51,13 +54,17 @@ _portablectl() {
                 comps="default nonetwork strict trusted"
                 ;;
             --copy)
-                comps="copy symlink auto"
+                comps="copy symlink auto mixed"
                 ;;
             --host|-H)
                 comps=$(compgen -A hostname)
                 ;;
             --machine|-M)
                 comps=$( __get_machines )
+                ;;
+            --extension)
+                comps=$( compgen -A file -- "$cur" )
+                compopt -o filenames
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
@@ -77,14 +84,14 @@ _portablectl() {
         fi
     done
 
-    n=$(($COMP_CWORD - $i))
+    n=$((COMP_CWORD - i))
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
     elif __contains_word "$verb" ${VERBS[STANDALONE]}; then
         comps=''
     elif __contains_word "$verb" ${VERBS[IMAGE]}; then
-        if [[ $n == 1 ]]; then
+        if [[ $n == 1 ]] || [[ "$prev" = -* ]] || __contains_word "${COMP_WORDS[COMP_CWORD-2]}" ${OPTS[ARG]}; then
             comps=$( compgen -A file -- "$cur" )
             compopt -o filenames
         else
@@ -94,10 +101,10 @@ _portablectl() {
         comps=$( compgen -A file -- "$cur" )
         compopt -o filenames
     elif __contains_word "$verb" ${VERBS[IMAGE_WITH_BOOL]}; then
-        if [[ $n == 1 ]]; then
+        if [[ $n == 1 ]] || [[ "$prev" = -* ]] || __contains_word "${COMP_WORDS[COMP_CWORD-2]}" ${OPTS[ARG]}; then
             comps=$( compgen -A file -- "$cur" )
             compopt -o filenames
-        elif [[ $n == 2 ]]; then
+        elif ! __contains_word "$prev" "yes" "no" && { [[ $n == 2 ]] || [[ "$prev" != -* ]]; }; then
             comps='yes no'
         else
             comps=''

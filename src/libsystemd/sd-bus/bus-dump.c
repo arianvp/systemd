@@ -1,66 +1,64 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/time.h>
+#include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-dump.h"
 #include "bus-internal.h"
 #include "bus-message.h"
 #include "bus-type.h"
-#include "cap-list.h"
+#include "capability-list.h"
 #include "capability-util.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "locale-util.h"
-#include "macro.h"
+#include "glyph-util.h"
+#include "log.h"
+#include "pcapng.h"
 #include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
-#include "util.h"
+#include "time-util.h"
 
-static char *indent(unsigned level, unsigned flags) {
-        char *p;
-        unsigned n, i = 0;
-
-        n = 0;
-
-        if (flags & BUS_MESSAGE_DUMP_SUBTREE_ONLY && level > 0)
+static char* indent(unsigned level, uint64_t flags) {
+        if (FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_SUBTREE_ONLY) && level > 0)
                 level -= 1;
 
-        if (flags & BUS_MESSAGE_DUMP_WITH_HEADER)
+        unsigned n = level * 8;
+        if (FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_WITH_HEADER))
                 n += 2;
 
-        p = new(char, n + level*8 + 1);
+        char *p = new(char, n + 1);
         if (!p)
                 return NULL;
 
-        if (flags & BUS_MESSAGE_DUMP_WITH_HEADER) {
-                p[i++] = ' ';
-                p[i++] = ' ';
-        }
-
-        memset(p + i, ' ', level*8);
-        p[i + level*8] = 0;
+        memset(p, ' ', n);
+        p[n] = '\0';
 
         return p;
 }
 
-int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
+_public_ int sd_bus_message_dump(sd_bus_message *m, FILE *f, uint64_t flags) {
         unsigned level = 1;
         int r;
 
-        assert(m);
+        assert_return(m, -EINVAL);
+        assert_return((flags & ~_SD_BUS_MESSAGE_DUMP_KNOWN_FLAGS) == 0, -EINVAL);
 
         if (!f)
                 f = stdout;
 
-        if (flags & BUS_MESSAGE_DUMP_WITH_HEADER) {
+        if (FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_WITH_HEADER)) {
+                usec_t ts = m->realtime;
+
+                if (ts == 0)
+                        ts = now(CLOCK_REALTIME);
+
                 fprintf(f,
-                        "%s%s%s Type=%s%s%s  Endian=%c  Flags=%u  Version=%u  Priority=%"PRIi64,
+                        "%s%s%s Type=%s%s%s  Endian=%c  Flags=%u  Version=%u",
                         m->header->type == SD_BUS_MESSAGE_METHOD_ERROR ? ansi_highlight_red() :
                         m->header->type == SD_BUS_MESSAGE_METHOD_RETURN ? ansi_highlight_green() :
                         m->header->type != SD_BUS_MESSAGE_SIGNAL ? ansi_highlight() : "",
-                        special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET),
+                        glyph(GLYPH_TRIANGULAR_BULLET),
                         ansi_normal(),
 
                         ansi_highlight(),
@@ -69,12 +67,11 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
 
                         m->header->endian,
                         m->header->flags,
-                        m->header->version,
-                        m->priority);
+                        m->header->version);
 
                 /* Display synthetic message serial number in a more readable
-                 * format than (uint32_t) -1 */
-                if (BUS_MESSAGE_COOKIE(m) == 0xFFFFFFFFULL)
+                 * format than UINT32_MAX */
+                if (BUS_MESSAGE_COOKIE(m) == UINT32_MAX)
                         fprintf(f, " Cookie=-1");
                 else
                         fprintf(f, " Cookie=%" PRIu64, BUS_MESSAGE_COOKIE(m));
@@ -82,7 +79,7 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
                 if (m->reply_cookie != 0)
                         fprintf(f, "  ReplyCookie=%" PRIu64, m->reply_cookie);
 
-                fputs("\n", f);
+                fprintf(f, "  Timestamp=\"%s\"\n", strna(FORMAT_TIMESTAMP_STYLE(ts, TIMESTAMP_US_UTC)));
 
                 if (m->sender)
                         fprintf(f, "  Sender=%s%s%s", ansi_highlight(), m->sender, ansi_normal());
@@ -118,16 +115,16 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
                 bus_creds_dump(&m->creds, f, true);
         }
 
-        r = sd_bus_message_rewind(m, !(flags & BUS_MESSAGE_DUMP_SUBTREE_ONLY));
+        r = sd_bus_message_rewind(m, !FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_SUBTREE_ONLY));
         if (r < 0)
-                return log_error_errno(r, "Failed to rewind: %m");
+                return log_debug_errno(r, "Failed to rewind: %m");
 
-        if (!(flags & BUS_MESSAGE_DUMP_SUBTREE_ONLY)) {
+        if (!FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_SUBTREE_ONLY)) {
                 _cleanup_free_ char *prefix = NULL;
 
                 prefix = indent(0, flags);
                 if (!prefix)
-                        return log_oom();
+                        return log_oom_debug();
 
                 fprintf(f, "%sMESSAGE \"%s\" {\n", prefix, strempty(m->root_container.signature));
         }
@@ -151,7 +148,7 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
 
                 r = sd_bus_message_peek_type(m, &type, &contents);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to peek type: %m");
+                        return log_debug_errno(r, "Failed to peek type: %m");
 
                 if (r == 0) {
                         if (level <= 1)
@@ -159,13 +156,13 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
 
                         r = sd_bus_message_exit_container(m);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to exit container: %m");
+                                return log_debug_errno(r, "Failed to exit container: %m");
 
                         level--;
 
                         prefix = indent(level, flags);
                         if (!prefix)
-                                return log_oom();
+                                return log_oom_debug();
 
                         fprintf(f, "%s};\n", prefix);
                         continue;
@@ -173,12 +170,12 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
 
                 prefix = indent(level, flags);
                 if (!prefix)
-                        return log_oom();
+                        return log_oom_debug();
 
                 if (bus_type_is_container(type) > 0) {
                         r = sd_bus_message_enter_container(m, type, contents);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to enter container: %m");
+                                return log_debug_errno(r, "Failed to enter container: %m");
 
                         if (type == SD_BUS_TYPE_ARRAY)
                                 fprintf(f, "%sARRAY \"%s\" {\n", prefix, contents);
@@ -196,7 +193,7 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
 
                 r = sd_bus_message_read_basic(m, type, &basic);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to get basic: %m");
+                        return log_debug_errno(r, "Failed to get basic: %m");
 
                 assert(r > 0);
 
@@ -255,16 +252,16 @@ int bus_message_dump(sd_bus_message *m, FILE *f, unsigned flags) {
                         break;
 
                 default:
-                        assert_not_reached("Unknown basic type.");
+                        assert_not_reached();
                 }
         }
 
-        if (!(flags & BUS_MESSAGE_DUMP_SUBTREE_ONLY)) {
+        if (!FLAGS_SET(flags, SD_BUS_MESSAGE_DUMP_SUBTREE_ONLY)) {
                 _cleanup_free_ char *prefix = NULL;
 
                 prefix = indent(0, flags);
                 if (!prefix)
-                        return log_oom();
+                        return log_oom_debug();
 
                 fprintf(f, "%s};\n\n", prefix);
         }
@@ -350,6 +347,8 @@ int bus_creds_dump(sd_bus_creds *c, FILE *f, bool terse) {
 
         if (c->mask & SD_BUS_CREDS_PID)
                 fprintf(f, "%sPID=%s"PID_FMT"%s", prefix, color, c->pid, suffix);
+        if (c->mask & SD_BUS_CREDS_PIDFD)
+                fprintf(f, "%sPIDFD=%syes%s", prefix, color, suffix);
         if (c->mask & SD_BUS_CREDS_TID)
                 fprintf(f, "%sTID=%s"PID_FMT"%s", prefix, color, c->tid, suffix);
         if (c->mask & SD_BUS_CREDS_PPID) {
@@ -385,10 +384,8 @@ int bus_creds_dump(sd_bus_creds *c, FILE *f, bool terse) {
                 fprintf(f, "%sFSGID=%s"GID_FMT"%s", prefix, color, c->fsgid, suffix);
 
         if (c->mask & SD_BUS_CREDS_SUPPLEMENTARY_GIDS) {
-                unsigned i;
-
                 fprintf(f, "%sSupplementaryGIDs=%s", prefix, color);
-                for (i = 0; i < c->n_supplementary_gids; i++)
+                for (unsigned i = 0; i < c->n_supplementary_gids; i++)
                         fprintf(f, "%s" GID_FMT, i > 0 ? " " : "", c->supplementary_gids[i]);
                 fprintf(f, "%s", suffix);
         }
@@ -410,8 +407,6 @@ int bus_creds_dump(sd_bus_creds *c, FILE *f, bool terse) {
 
         r = sd_bus_creds_get_cmdline(c, &cmdline);
         if (r >= 0) {
-                char **i;
-
                 fprintf(f, "%sCommandLine=%s", prefix, color);
                 STRV_FOREACH(i, cmdline) {
                         if (i != cmdline)
@@ -476,8 +471,6 @@ int bus_creds_dump(sd_bus_creds *c, FILE *f, bool terse) {
                 fprintf(f, "%sUniqueName=%s%s%s", prefix, color, c->unique_name, suffix);
 
         if (sd_bus_creds_get_well_known_names(c, &well_known) >= 0) {
-                char **i;
-
                 fprintf(f, "%sWellKnownNames=%s", prefix, color);
                 STRV_FOREACH(i, well_known) {
                         if (i != well_known)
@@ -500,79 +493,130 @@ int bus_creds_dump(sd_bus_creds *c, FILE *f, bool terse) {
         return 0;
 }
 
-/*
- * For details about the file format, see:
- *
- * http://wiki.wireshark.org/Development/LibpcapFileFormat
- */
+static uint16_t pcapng_optlen(size_t len) {
+        return ALIGN4(len + sizeof(struct pcapng_option));
+}
 
-typedef struct _packed_ pcap_hdr_s {
-        uint32_t magic_number;   /* magic number */
-        uint16_t version_major;  /* major version number */
-        uint16_t version_minor;  /* minor version number */
-        int32_t  thiszone;       /* GMT to local correction */
-        uint32_t sigfigs;        /* accuracy of timestamps */
-        uint32_t snaplen;        /* max length of captured packets, in octets */
-        uint32_t network;        /* data link type */
-} pcap_hdr_t ;
-
-typedef struct  _packed_ pcaprec_hdr_s {
-        uint32_t ts_sec;         /* timestamp seconds */
-        uint32_t ts_usec;        /* timestamp microseconds */
-        uint32_t incl_len;       /* number of octets of packet saved in file */
-        uint32_t orig_len;       /* actual length of packet */
-} pcaprec_hdr_t;
-
-int bus_pcap_header(size_t snaplen, FILE *f) {
-
-        pcap_hdr_t hdr = {
-                .magic_number = 0xa1b2c3d4U,
-                .version_major = 2,
-                .version_minor = 4,
-                .thiszone = 0, /* UTC */
-                .sigfigs = 0,
-                .network = 231, /* D-Bus */
+static void pcapng_putopt(FILE *f, uint16_t code, const void *data, size_t len) {
+        struct pcapng_option opt = {
+                .code = code,
+                .length = len,
         };
 
-        if (!f)
-                f = stdout;
+        assert(f);
+        assert((uint16_t) len == len);
+        assert(data || len == 0);
 
+        fwrite(&opt, 1, sizeof(opt), f);
+        if (len > 0) {
+                size_t pad = ALIGN4(len) - len;
+
+                fwrite(data, 1, len, f);
+
+                assert(pad < sizeof(uint32_t));
+                while (pad-- > 0)
+                        fputc('\0', f);
+        }
+}
+
+static void pcapng_section_header(FILE *f, const char *os, const char *app) {
+        uint32_t len;
+
+        assert(f);
+
+        /* determine length of section header and options */
+        len = sizeof(struct pcapng_section);
+        if (os)
+                len += pcapng_optlen(strlen(os));
+        if (app)
+                len += pcapng_optlen(strlen(app));
+        len += pcapng_optlen(0);        /* OPT_END */
+        len += sizeof(uint32_t);        /* trailer length */
+
+        struct pcapng_section hdr = {
+                .block_type = PCAPNG_SECTION_BLOCK,
+                .block_length = len,
+                .byte_order_magic = PCAPNG_BYTE_ORDER_MAGIC,
+                .major_version = PCAPNG_MAJOR_VERS,
+                .minor_version = PCAPNG_MINOR_VERS,
+                .section_length = UINT64_MAX,
+        };
+
+        fwrite(&hdr, 1, sizeof(hdr), f);
+        if (os)
+                pcapng_putopt(f, PCAPNG_SHB_OS, os, strlen(os));
+        if (app)
+                pcapng_putopt(f, PCAPNG_SHB_USERAPPL, app, strlen(app));
+        pcapng_putopt(f, PCAPNG_OPT_END, NULL, 0);
+        fwrite(&len, 1, sizeof(uint32_t), f);
+}
+
+/* Only have a single instance of dbus pseudo interface */
+static void pcapng_interface_header(FILE *f, size_t snaplen) {
+        uint32_t len;
+
+        assert(f);
         assert(snaplen > 0);
         assert((size_t) (uint32_t) snaplen == snaplen);
 
-        hdr.snaplen = (uint32_t) snaplen;
+        /* no options (yet) */
+        len = sizeof(struct pcapng_interface_block) + sizeof(uint32_t);
+        struct pcapng_interface_block hdr = {
+                .block_type = PCAPNG_INTERFACE_BLOCK,
+                .block_length = len,
+                .link_type  = 231, /* D-Bus */
+                .snap_len = snaplen,
+        };
 
         fwrite(&hdr, 1, sizeof(hdr), f);
+        fwrite(&len, 1, sizeof(uint32_t), f);
+}
 
+int bus_pcap_header(size_t snaplen, const char *os, const char *info, FILE *f) {
+        if (!f)
+                f = stdout;
+
+        pcapng_section_header(f, os, info);
+        pcapng_interface_header(f, snaplen);
         return fflush_and_check(f);
 }
 
 int bus_message_pcap_frame(sd_bus_message *m, size_t snaplen, FILE *f) {
-        struct bus_body_part *part;
-        pcaprec_hdr_t hdr = {};
-        struct timeval tv;
+        BusMessageBodyPart *part;
+        size_t msglen, caplen, pad;
+        uint32_t length;
+        uint64_t ts;
         unsigned i;
         size_t w;
-
-        if (!f)
-                f = stdout;
 
         assert(m);
         assert(snaplen > 0);
         assert((size_t) (uint32_t) snaplen == snaplen);
 
-        if (m->realtime != 0)
-                timeval_store(&tv, m->realtime);
-        else
-                assert_se(gettimeofday(&tv, NULL) >= 0);
+        if (!f)
+                f = stdout;
 
-        hdr.ts_sec = tv.tv_sec;
-        hdr.ts_usec = tv.tv_usec;
-        hdr.orig_len = BUS_MESSAGE_SIZE(m);
-        hdr.incl_len = MIN(hdr.orig_len, snaplen);
+        ts = m->realtime ?: now(CLOCK_REALTIME);
+        msglen = BUS_MESSAGE_SIZE(m);
+        caplen = MIN(msglen, snaplen);
+        pad = ALIGN4(caplen) - caplen;
 
-        /* write the pcap header */
-        fwrite(&hdr, 1, sizeof(hdr), f);
+        /* packet block has no options */
+        length = sizeof(struct pcapng_enhance_packet_block)
+                + caplen + pad + sizeof(uint32_t);
+
+        struct pcapng_enhance_packet_block epb = {
+                .block_type = PCAPNG_ENHANCED_PACKET_BLOCK,
+                .block_length = length,
+                .interface_id = 0,
+                .timestamp_hi = (uint32_t)(ts >> 32),
+                .timestamp_lo = (uint32_t)ts,
+                .original_length = msglen,
+                .capture_length = caplen,
+        };
+
+        /* write the pcapng enhanced packet block header */
+        fwrite(&epb, 1, sizeof(epb), f);
 
         /* write the dbus header */
         w = MIN(BUS_MESSAGE_BODY_BEGIN(m), snaplen);
@@ -588,6 +632,12 @@ int bus_message_pcap_frame(sd_bus_message *m, size_t snaplen, FILE *f) {
                 fwrite(part->data, 1, w, f);
                 snaplen -= w;
         }
+
+        while (pad-- > 0)
+                fputc('\0', f);
+
+        /* trailing block length */
+        fwrite(&length, 1, sizeof(uint32_t), f);
 
         return fflush_and_check(f);
 }

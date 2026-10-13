@@ -1,29 +1,76 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <math.h>
-#include <stdlib.h>
+/* We make an exception here to our usual "include system headers first" rule because we need one of these
+ * macros to disable a warning triggered by the glib headers. */
+#include "macro.h"
 
 #if HAVE_GLIB
-#include <gio/gio.h>
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBGLIB
+#  error "missing libglib_cflags in meson dependency."
+#endif
+DISABLE_WARNING_FORMAT_NONLITERAL
+#include <gio/gio.h> /* NOLINT */
+REENABLE_WARNING
 #endif
 
 #if HAVE_DBUS
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBDBUS
+#  error "missing libdbus_cflags in meson dependency."
+#endif
 #include <dbus/dbus.h>
 #endif
 
 #include "sd-bus.h"
 
 #include "alloc-util.h"
-#include "bus-dump.h"
+#include "bus-internal.h"
 #include "bus-label.h"
 #include "bus-message.h"
 #include "bus-util.h"
+#include "dlfcn-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "log.h"
+#include "memfd-util.h"
+#include "memstream-util.h"
+#include "stat-util.h"
 #include "tests.h"
-#include "util.h"
+
+#if HAVE_GLIB
+static DLSYM_PROTOTYPE(g_dbus_message_new_from_blob) = NULL;
+static DLSYM_PROTOTYPE(g_dbus_message_print)         = NULL;
+static DLSYM_PROTOTYPE(g_free)                       = NULL;
+static DLSYM_PROTOTYPE(g_object_unref)               = NULL;
+
+static int dlopen_glib(void) {
+        static void *glib_dl = NULL;
+
+        return dlopen_many_sym_or_warn(
+                        &glib_dl, "libgio-2.0.so.0", LOG_DEBUG,
+                        DLSYM_ARG(g_dbus_message_new_from_blob),
+                        DLSYM_ARG(g_dbus_message_print),
+                        DLSYM_ARG(g_free),
+                        DLSYM_ARG(g_object_unref));
+}
+#endif
+
+#if HAVE_DBUS
+static DLSYM_PROTOTYPE(dbus_error_init)        = NULL;
+static DLSYM_PROTOTYPE(dbus_error_free)        = NULL;
+static DLSYM_PROTOTYPE(dbus_message_demarshal) = NULL;
+static DLSYM_PROTOTYPE(dbus_message_unref)     = NULL;
+
+static int dlopen_libdbus(void) {
+        static void *libdbus_dl = NULL;
+
+        return dlopen_many_sym_or_warn(
+                        &libdbus_dl, "libdbus-1.so.3", LOG_DEBUG,
+                        DLSYM_ARG(dbus_error_init),
+                        DLSYM_ARG(dbus_error_free),
+                        DLSYM_ARG(dbus_message_demarshal),
+                        DLSYM_ARG(dbus_message_unref));
+}
+#endif
 
 static void test_bus_path_encode_unique(void) {
         _cleanup_free_ char *a = NULL, *b = NULL, *c = NULL, *d = NULL, *e = NULL;
@@ -36,20 +83,22 @@ static void test_bus_path_encode_unique(void) {
 }
 
 static void test_bus_path_encode(void) {
-        _cleanup_free_ char *a = NULL, *b = NULL, *c = NULL, *d = NULL, *e = NULL, *f = NULL;
+        _cleanup_free_ char *a = NULL, *b = NULL, *c = NULL, *d = NULL, *e = NULL, *f = NULL, *g = NULL;
 
         assert_se(sd_bus_path_encode("/foo/bar", "waldo", &a) >= 0 && streq(a, "/foo/bar/waldo"));
         assert_se(sd_bus_path_decode(a, "/waldo", &b) == 0 && b == NULL);
         assert_se(sd_bus_path_decode(a, "/foo/bar", &b) > 0 && streq(b, "waldo"));
 
-        assert_se(sd_bus_path_encode("xxxx", "waldo", &c) < 0);
-        assert_se(sd_bus_path_encode("/foo/", "waldo", &c) < 0);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_path_encode("xxxx", "waldo", &c) < 0);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_path_encode("/foo/", "waldo", &c) < 0);
 
         assert_se(sd_bus_path_encode("/foo/bar", "", &c) >= 0 && streq(c, "/foo/bar/_"));
         assert_se(sd_bus_path_decode(c, "/foo/bar", &d) > 0 && streq(d, ""));
 
         assert_se(sd_bus_path_encode("/foo/bar", "foo.bar", &e) >= 0 && streq(e, "/foo/bar/foo_2ebar"));
         assert_se(sd_bus_path_decode(e, "/foo/bar", &f) > 0 && streq(f, "foo.bar"));
+
+        assert_se(sd_bus_path_decode("/waldo", "/waldo", &g) > 0 && streq(g, ""));
 }
 
 static void test_bus_path_encode_many(void) {
@@ -95,6 +144,171 @@ static void test_bus_label_escape_one(const char *a, const char *b) {
         assert_se(streq(a, y));
 }
 
+static ino_t get_inode(int fd) {
+        struct stat st;
+        assert_se(fstat(fd, &st) >= 0);
+        return st.st_ino;
+}
+
+static void test_bus_fds_truncated(void) {
+        _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_close_ int memfd0 = -EBADF, memfd1 = -EBADF;
+        _cleanup_free_ void *blob = NULL;
+        _cleanup_free_ int *fds = NULL;
+        ino_t ino0, ino1;
+        size_t blob_size;
+        int fd;
+
+        /* Create two memfds and record their inodes for later verification */
+        memfd0 = ASSERT_OK(memfd_create_wrapper("test-fd-0", 0));
+        ino0 = get_inode(memfd0);
+
+        memfd1 = ASSERT_OK(memfd_create_wrapper("test-fd-1", 0));
+        ino1 = get_inode(memfd1);
+
+        /* Create a bus for message operations (no actual connection needed) */
+        ASSERT_OK(sd_bus_new(&bus));
+        bus->state = BUS_RUNNING; /* Fake state to allow message creation */
+        bus->can_fds = true;      /* Allow fd passing */
+
+        /* Build a message containing two fds */
+        ASSERT_OK(sd_bus_message_new_method_call(bus, &m, "foo.bar", "/", "foo.bar", "Ping"));
+        ASSERT_OK(sd_bus_message_append(m, "hh", memfd0, memfd1));
+        ASSERT_OK(sd_bus_message_seal(m, 1, 0));
+
+        /* Serialize the message to a blob */
+        ASSERT_OK(bus_message_get_blob(m, &blob, &blob_size));
+        m = sd_bus_message_unref(m);
+
+        /* Duplicate the fds since bus_message_from_malloc() takes ownership */
+        fds = ASSERT_NOT_NULL(new(int, 2));
+        fds[0] = ASSERT_OK_ERRNO(fcntl(memfd0, F_DUPFD_CLOEXEC, 3));
+        fds[1] = ASSERT_OK_ERRNO(fcntl(memfd1, F_DUPFD_CLOEXEC, 3));
+
+        /* Test 1: Parse with correct fd count, no truncation - should succeed */
+        log_info("Test 1: Exact fd count match, got_ctrunc=false");
+        void *blob_copy = ASSERT_NOT_NULL(memdup(blob, blob_size));
+        ASSERT_OK(bus_message_from_malloc(bus, blob_copy, blob_size, fds, 2, /* got_ctrunc= */ false, NULL, &m));
+
+        /* Verify we can read both fds and they have the expected inodes */
+        ASSERT_OK(sd_bus_message_read_basic(m, 'h', &fd));
+        ASSERT_EQ(get_inode(fd), ino0);
+        ASSERT_OK(sd_bus_message_read_basic(m, 'h', &fd));
+        ASSERT_EQ(get_inode(fd), ino1);
+
+        m = sd_bus_message_unref(m);
+        fds = NULL; /* ownership transferred */
+
+        /* Test 2: Parse with fewer fds than declared, no truncation flag - should fail */
+        log_info("Test 2: Fewer fds than declared, got_ctrunc=false");
+        fds = ASSERT_NOT_NULL(new(int, 1));
+        fds[0] = ASSERT_OK_ERRNO(fcntl(memfd0, F_DUPFD_CLOEXEC, 3));
+
+        blob_copy = ASSERT_NOT_NULL(memdup(blob, blob_size));
+        ASSERT_ERROR(bus_message_from_malloc(bus, blob_copy, blob_size, fds, 1, /* got_ctrunc= */ false, NULL, &m), EBADMSG);
+        free(blob_copy);
+        close(fds[0]);
+        fds = mfree(fds);
+
+        /* Test 3: Parse with fewer fds than declared, with truncation flag - parsing should succeed */
+        log_info("Test 3: Fewer fds than declared, got_ctrunc=true");
+        fds = ASSERT_NOT_NULL(new(int, 1));
+        fds[0] = ASSERT_OK_ERRNO(fcntl(memfd0, F_DUPFD_CLOEXEC, 3));
+
+        blob_copy = ASSERT_NOT_NULL(memdup(blob, blob_size));
+        ASSERT_OK(bus_message_from_malloc(bus, blob_copy, blob_size, fds, 1, /* got_ctrunc= */ true, NULL, &m));
+
+        /* First fd should be readable and have correct inode */
+        ASSERT_OK(sd_bus_message_read_basic(m, 'h', &fd));
+        ASSERT_EQ(get_inode(fd), ino0);
+
+        /* Second fd was truncated - reading it should fail */
+        ASSERT_ERROR(sd_bus_message_read_basic(m, 'h', &fd), EBADMSG);
+
+        m = sd_bus_message_unref(m);
+        fds = NULL; /* ownership transferred */
+
+        /* Test 4: Parse with more fds than declared, with truncation flag - should fail */
+        log_info("Test 4: More fds than declared, got_ctrunc=true");
+        fds = ASSERT_NOT_NULL(new(int, 3));
+        fds[0] = ASSERT_OK_ERRNO(fcntl(memfd0, F_DUPFD_CLOEXEC, 3));
+        fds[1] = ASSERT_OK_ERRNO(fcntl(memfd1, F_DUPFD_CLOEXEC, 3));
+        fds[2] = ASSERT_OK_ERRNO(fcntl(memfd0, F_DUPFD_CLOEXEC, 3));
+
+        blob_copy = ASSERT_NOT_NULL(memdup(blob, blob_size));
+        ASSERT_ERROR(bus_message_from_malloc(bus, blob_copy, blob_size, fds, 3, /* got_ctrunc= */ true, NULL, &m), EBADMSG);
+        free(blob_copy);
+        close(fds[0]);
+        close(fds[1]);
+        close(fds[2]);
+        fds = mfree(fds);
+
+        /* Test 5: Parse with zero fds when two were declared, with truncation flag - should succeed */
+        log_info("Test 5: Zero fds when some declared, got_ctrunc=true");
+        blob_copy = ASSERT_NOT_NULL(memdup(blob, blob_size));
+        ASSERT_OK(bus_message_from_malloc(bus, blob_copy, blob_size, NULL, 0, /* got_ctrunc= */ true, NULL, &m));
+
+        /* Both fd reads should fail since all were truncated */
+        ASSERT_ERROR(sd_bus_message_read_basic(m, 'h', &fd), EBADMSG);
+
+        m = sd_bus_message_unref(m);
+
+        log_info("All fd truncation tests passed");
+}
+
+static void test_bus_nested_variant_depth_limit(void) {
+        /* Craft a raw D-Bus message with an unknown header field whose value is a variant
+         * containing a variant containing a variant... nested beyond BUS_CONTAINER_DEPTH.
+         * Without the depth limit in message_skip_fields(), this causes unbounded recursion
+         * and stack overflow. With the fix, it should be rejected with -EBADMSG. */
+
+        _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        const unsigned depth = BUS_CONTAINER_DEPTH + 1; /* one past the limit */
+
+        /* Each nesting level in the fields area is: 1 byte sig_len + 1 byte 'v' + 1 byte NUL = 3 bytes.
+         * The innermost level has sig_len=1, 'u', NUL, then 4 bytes for the uint32 value.
+         * The field header is: 1 byte field_code + 1 byte sig_len + 1 byte 'v' + 1 byte NUL = 4 bytes. */
+        size_t fields_size = 4 + (depth * 3) + 4; /* field header + nested variant sigs + uint32 */
+        size_t padded_fields = ALIGN8(fields_size);
+        size_t total = sizeof(BusMessageHeader) + padded_fields;
+
+        _cleanup_free_ void *buf = ASSERT_PTR(malloc0(total));
+
+        BusMessageHeader *h = buf;
+        *h = (BusMessageHeader) {
+                .endian = BUS_NATIVE_ENDIAN,
+                .type = SD_BUS_MESSAGE_METHOD_CALL,
+                .version = 1,
+                .serial = 1,
+                .fields_size = (uint32_t) fields_size,
+        };
+
+        uint8_t *p = (uint8_t *) buf + sizeof(BusMessageHeader);
+
+        /* Unknown field code (triggers default: in message_parse_fields) */
+        *p++ = 0xFF;
+        /* Field signature: variant */
+        *p++ = 1;    /* sig length */
+        *p++ = 'v';
+        *p++ = '\0';
+
+        /* Nested variant signatures: each level declares its content is another variant */
+        for (unsigned i = 0; i < depth; i++) {
+                *p++ = 1;    /* sig length */
+                *p++ = 'v';
+                *p++ = '\0';
+        }
+
+        /* Innermost value: a uint32 */
+        memset(p, 0, 4);
+
+        ASSERT_OK(sd_bus_new(&bus));
+
+        ASSERT_ERROR(bus_message_from_malloc(bus, buf, total, NULL, 0, false, NULL, &m), EBADMSG);
+}
+
 static void test_bus_label_escape(void) {
         test_bus_label_escape_one("foo123bar", "foo123bar");
         test_bus_label_escape_one("foo.bar", "foo_2ebar");
@@ -107,20 +321,19 @@ static void test_bus_label_escape(void) {
 
 int main(int argc, char *argv[]) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *copy = NULL;
-        int r, boolean;
-        const char *x, *x2, *y, *z, *a, *b, *c, *d, *a_signature;
-        uint8_t u, v;
-        void *buffer = NULL;
-        size_t sz;
-        _cleanup_free_ char *h = NULL;
+        _cleanup_free_ char *h = NULL, *first = NULL, *second = NULL, *third = NULL;
         const int32_t integer_array[] = { -1, -2, 0, 1, 2 }, *return_array;
-        char *s;
-        _cleanup_free_ char *first = NULL, *second = NULL, *third = NULL;
-        _cleanup_fclose_ FILE *ms = NULL;
-        size_t first_size = 0, second_size = 0, third_size = 0;
+        const char *x, *x2, *y, *z, *a, *b, *c, *d, *a_signature;
+        size_t sz, first_size, second_size = 0, third_size = 0;
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
-        double dbl;
+        _cleanup_(memstream_done) MemStream ms = {};
+        void *buffer = NULL;
+        int r, boolean;
         uint64_t u64;
+        uint8_t u, v;
+        double dbl;
+        FILE *mf;
+        char *s;
 
         test_setup_logging(LOG_INFO);
 
@@ -188,12 +401,11 @@ int main(int argc, char *argv[]) {
         r = sd_bus_message_seal(m, 4711, 0);
         assert_se(r >= 0);
 
-        bus_message_dump(m, stdout, BUS_MESSAGE_DUMP_WITH_HEADER);
+        sd_bus_message_dump(m, stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
 
-        ms = open_memstream_unlocked(&first, &first_size);
-        bus_message_dump(m, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(m, mf, 0);
+        assert_se(memstream_finalize(&ms, &first, &first_size) >= 0);
 
         r = bus_message_get_blob(m, &buffer, &sz);
         assert_se(r >= 0);
@@ -203,53 +415,45 @@ int main(int argc, char *argv[]) {
         log_info("message size = %zu, contents =\n%s", sz, h);
 
 #if HAVE_GLIB
-#if !HAS_FEATURE_ADDRESS_SANITIZER
-        {
+        if (dlopen_glib() >= 0) {
                 GDBusMessage *g;
                 char *p;
 
-#if !defined(GLIB_VERSION_2_36)
-                g_type_init();
-#endif
-
-                g = g_dbus_message_new_from_blob(buffer, sz, 0, NULL);
-                p = g_dbus_message_print(g, 0);
+                g = sym_g_dbus_message_new_from_blob(buffer, sz, 0, NULL);
+                p = sym_g_dbus_message_print(g, 0);
                 log_info("%s", p);
-                g_free(p);
-                g_object_unref(g);
+                sym_g_free(p);
+                sym_g_object_unref(g);
         }
-#endif
 #endif
 
 #if HAVE_DBUS
-        {
+        if (dlopen_libdbus() >= 0) {
                 DBusMessage *w;
                 DBusError error;
 
-                dbus_error_init(&error);
+                sym_dbus_error_init(&error);
 
-                w = dbus_message_demarshal(buffer, sz, &error);
+                w = sym_dbus_message_demarshal(buffer, sz, &error);
                 if (!w)
                         log_error("%s", error.message);
                 else
-                        dbus_message_unref(w);
+                        sym_dbus_message_unref(w);
 
-                dbus_error_free(&error);
+                sym_dbus_error_free(&error);
         }
 #endif
 
         m = sd_bus_message_unref(m);
 
-        r = bus_message_from_malloc(bus, buffer, sz, NULL, 0, NULL, &m);
+        r = bus_message_from_malloc(bus, buffer, sz, NULL, 0, /* got_ctrunc= */ false, NULL, &m);
         assert_se(r >= 0);
 
-        bus_message_dump(m, stdout, BUS_MESSAGE_DUMP_WITH_HEADER);
+        sd_bus_message_dump(m, stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
 
-        fclose(ms);
-        ms = open_memstream_unlocked(&second, &second_size);
-        bus_message_dump(m, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(m, mf, 0);
+        assert_se(memstream_finalize(&ms, &second, &second_size) >= 0);
         assert_se(first_size == second_size);
         assert_se(memcmp(first, second, first_size) == 0);
 
@@ -333,7 +537,7 @@ int main(int argc, char *argv[]) {
         assert_se(r > 0);
         assert_se(streq(x, "foo"));
         assert_se(u64 == 815ULL);
-        assert_se(fabs(dbl - 47.0) < 0.1);
+        assert_se(ABS(dbl - 47.0) < 0.1);
         assert_se(streq(y, "/"));
 
         r = sd_bus_message_peek_type(m, NULL, NULL);
@@ -351,11 +555,9 @@ int main(int argc, char *argv[]) {
         r = sd_bus_message_seal(copy, 4712, 0);
         assert_se(r >= 0);
 
-        fclose(ms);
-        ms = open_memstream_unlocked(&third, &third_size);
-        bus_message_dump(copy, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(copy, mf, 0);
+        assert_se(memstream_finalize(&ms, &third, &third_size) >= 0);
 
         printf("<%.*s>\n", (int) first_size, first);
         printf("<%.*s>\n", (int) third_size, third);
@@ -416,6 +618,8 @@ int main(int argc, char *argv[]) {
         test_bus_path_encode();
         test_bus_path_encode_unique();
         test_bus_path_encode_many();
+        test_bus_fds_truncated();
+        test_bus_nested_variant_depth_limit();
 
         return 0;
 }

@@ -1,36 +1,92 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <errno.h>
-#include <stdio.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "extract-word.h"
 #include "securebits-util.h"
 #include "string-util.h"
+#include "strv.h"
 
-int secure_bits_to_string_alloc(int i, char **s) {
-        _cleanup_free_ char *str = NULL;
-        size_t len;
+static inline const char* secure_bit_to_string(int i) {
+        /* match a single bit */
+
+        switch (i) {
+                case SECURE_KEEP_CAPS:
+                        return "keep-caps";
+                case SECURE_KEEP_CAPS_LOCKED:
+                        return "keep-caps-locked";
+                case SECURE_NO_SETUID_FIXUP:
+                        return "no-setuid-fixup";
+                case SECURE_NO_SETUID_FIXUP_LOCKED:
+                        return "no-setuid-fixup-locked";
+                case SECURE_NOROOT:
+                        return "noroot";
+                case SECURE_NOROOT_LOCKED:
+                        return "noroot-locked";
+                case SECURE_NO_CAP_AMBIENT_RAISE:
+                        return "no-cap-ambient-raise";
+                case SECURE_NO_CAP_AMBIENT_RAISE_LOCKED:
+                        return "no-cap-ambient-raise-locked";
+                case SECURE_EXEC_RESTRICT_FILE:
+                        return "exec-restrict-file";
+                case SECURE_EXEC_RESTRICT_FILE_LOCKED:
+                        return "exec-restrict-file-locked";
+                case SECURE_EXEC_DENY_INTERACTIVE:
+                        return "exec-deny-interactive";
+                case SECURE_EXEC_DENY_INTERACTIVE_LOCKED:
+                        return "exec-deny-interactive-locked";
+                default:
+                        assert_not_reached();
+        }
+}
+
+int secure_bits_to_string_alloc(int i, char **ret) {
+        _cleanup_strv_free_ char **sv = NULL;
+        _cleanup_free_ char *joined = NULL;
         int r;
 
-        assert(s);
+        assert(ret);
 
-        r = asprintf(&str, "%s%s%s%s%s%s",
-                     (i & (1 << SECURE_KEEP_CAPS)) ? "keep-caps " : "",
-                     (i & (1 << SECURE_KEEP_CAPS_LOCKED)) ? "keep-caps-locked " : "",
-                     (i & (1 << SECURE_NO_SETUID_FIXUP)) ? "no-setuid-fixup " : "",
-                     (i & (1 << SECURE_NO_SETUID_FIXUP_LOCKED)) ? "no-setuid-fixup-locked " : "",
-                     (i & (1 << SECURE_NOROOT)) ? "noroot " : "",
-                     (i & (1 << SECURE_NOROOT_LOCKED)) ? "noroot-locked " : "");
+        r = secure_bits_to_strv(i, &sv);
         if (r < 0)
+                return r;
+
+        joined = strv_join(sv, " ");
+        if (!joined)
                 return -ENOMEM;
 
-        len = strlen(str);
-        if (len != 0)
-                str[len - 1] = '\0';
+        *ret = TAKE_PTR(joined);
+        return 0;
+}
 
-        *s = TAKE_PTR(str);
+int secure_bits_to_strv(int i, char ***ret) {
+        _cleanup_strv_free_ char **sv = NULL;
+        static const int bits[] = {
+                SECURE_KEEP_CAPS,
+                SECURE_KEEP_CAPS_LOCKED,
+                SECURE_NO_SETUID_FIXUP,
+                SECURE_NO_SETUID_FIXUP_LOCKED,
+                SECURE_NOROOT,
+                SECURE_NOROOT_LOCKED,
+                SECURE_NO_CAP_AMBIENT_RAISE,
+                SECURE_NO_CAP_AMBIENT_RAISE_LOCKED,
+                SECURE_EXEC_RESTRICT_FILE,
+                SECURE_EXEC_RESTRICT_FILE_LOCKED,
+                SECURE_EXEC_DENY_INTERACTIVE,
+                SECURE_EXEC_DENY_INTERACTIVE_LOCKED,
+        };
+        int r;
 
+        assert(ret);
+
+        FOREACH_ELEMENT(bit, bits) {
+                if (i & (1 << *bit)) {
+                        r = strv_extend(&sv, secure_bit_to_string(*bit));
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        *ret = TAKE_PTR(sv);
         return 0;
 }
 
@@ -42,7 +98,7 @@ int secure_bits_from_string(const char *s) {
         for (p = s;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, EXTRACT_QUOTES);
+                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
                 if (r == -ENOMEM)
                         return r;
                 if (r <= 0)
@@ -60,6 +116,18 @@ int secure_bits_from_string(const char *s) {
                         secure_bits |= 1 << SECURE_NOROOT;
                 else if (streq(word, "noroot-locked"))
                         secure_bits |= 1 << SECURE_NOROOT_LOCKED;
+                else if (streq(word, "no-cap-ambient-raise"))
+                        secure_bits |= 1 << SECURE_NO_CAP_AMBIENT_RAISE;
+                else if (streq(word, "no-cap-ambient-raise-locked"))
+                        secure_bits |= 1 << SECURE_NO_CAP_AMBIENT_RAISE_LOCKED;
+                else if (streq(word, "exec-restrict-file"))
+                        secure_bits |= 1 << SECURE_EXEC_RESTRICT_FILE;
+                else if (streq(word, "exec-restrict-file-locked"))
+                        secure_bits |= 1 << SECURE_EXEC_RESTRICT_FILE_LOCKED;
+                else if (streq(word, "exec-deny-interactive"))
+                        secure_bits |= 1 << SECURE_EXEC_DENY_INTERACTIVE;
+                else if (streq(word, "exec-deny-interactive-locked"))
+                        secure_bits |= 1 << SECURE_EXEC_DENY_INTERACTIVE_LOCKED;
         }
 
         return secure_bits;

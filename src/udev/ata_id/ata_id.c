@@ -1,35 +1,41 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ata_id - reads product/serial number from ATA drives
  *
  * Copyright © 2009-2010 David Zeuthen <zeuthen@gmail.com>
  */
 
-#include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/bsg.h>
 #include <linux/hdreg.h>
-#include <scsi/scsi.h>
-#include <scsi/scsi_ioctl.h>
 #include <scsi/sg.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
+#include "sd-json.h"
+
+#include "build.h"
+#include "device-nodes.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "libudev-util.h"
 #include "log.h"
-#include "memory-util.h"
+#include "main-func.h"
+#include "strv.h"
 #include "udev-util.h"
+#include "unaligned.h"
+#include "verbs.h"
 
 #define COMMAND_TIMEOUT_MSEC (30 * 1000)
+
+static bool arg_export = false;
+static const char *arg_device = NULL;
+
+COMMAND(
+        "ata_id\0",
+        "Identify ATA storage devices.",
+        .argspec = "DEVICE\0",
+);
 
 static int disk_scsi_inquiry_command(
                 int fd,
@@ -55,45 +61,39 @@ static int disk_scsi_inquiry_command(
                 .din_xferp = (uintptr_t) buf,
                 .timeout = COMMAND_TIMEOUT_MSEC,
         };
-        int ret;
 
-        ret = ioctl(fd, SG_IO, &io_v4);
-        if (ret != 0) {
+        if (ioctl(fd, SG_IO, &io_v4) != 0) {
+                if (errno != EINVAL)
+                        return log_debug_errno(errno, "ioctl v4 failed: %m");
+
                 /* could be that the driver doesn't do version 4, try version 3 */
-                if (errno == EINVAL) {
-                        struct sg_io_hdr io_hdr = {
-                                .interface_id = 'S',
-                                .cmdp = (unsigned char*) cdb,
-                                .cmd_len = sizeof (cdb),
-                                .dxferp = buf,
-                                .dxfer_len = buf_len,
-                                .sbp = sense,
-                                .mx_sb_len = sizeof(sense),
-                                .dxfer_direction = SG_DXFER_FROM_DEV,
-                                .timeout = COMMAND_TIMEOUT_MSEC,
-                        };
+                struct sg_io_hdr io_hdr = {
+                        .interface_id = 'S',
+                        .cmdp = (unsigned char*) cdb,
+                        .cmd_len = sizeof (cdb),
+                        .dxferp = buf,
+                        .dxfer_len = buf_len,
+                        .sbp = sense,
+                        .mx_sb_len = sizeof(sense),
+                        .dxfer_direction = SG_DXFER_FROM_DEV,
+                        .timeout = COMMAND_TIMEOUT_MSEC,
+                };
 
-                        ret = ioctl(fd, SG_IO, &io_hdr);
-                        if (ret != 0)
-                                return ret;
+                if (ioctl(fd, SG_IO, &io_hdr) != 0)
+                        return log_debug_errno(errno, "ioctl v3 failed: %m");
 
-                        /* even if the ioctl succeeds, we need to check the return value */
-                        if (!(io_hdr.status == 0 &&
-                              io_hdr.host_status == 0 &&
-                              io_hdr.driver_status == 0)) {
-                                errno = EIO;
-                                return -1;
-                        }
-                } else
-                        return ret;
-        }
+                /* even if the ioctl succeeds, we need to check the return value */
+                if (io_hdr.status != 0 ||
+                    io_hdr.host_status != 0 ||
+                    io_hdr.driver_status != 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "ioctl v3 failed.");
 
-        /* even if the ioctl succeeds, we need to check the return value */
-        if (!(io_v4.device_status == 0 &&
-              io_v4.transport_status == 0 &&
-              io_v4.driver_status == 0)) {
-                errno = EIO;
-                return -1;
+        } else {
+                /* even if the ioctl succeeds, we need to check the return value */
+                if (io_v4.device_status != 0 ||
+                    io_v4.transport_status != 0 ||
+                    io_v4.driver_status != 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "ioctl v4 failed.");
         }
 
         return 0;
@@ -137,34 +137,30 @@ static int disk_identify_command(
                 .din_xferp = (uintptr_t) buf,
                 .timeout = COMMAND_TIMEOUT_MSEC,
         };
-        int ret;
 
-        ret = ioctl(fd, SG_IO, &io_v4);
-        if (ret != 0) {
+        if (ioctl(fd, SG_IO, &io_v4) != 0) {
+                if (errno != EINVAL)
+                        return log_debug_errno(errno, "ioctl v4 failed: %m");
+
                 /* could be that the driver doesn't do version 4, try version 3 */
-                if (errno == EINVAL) {
-                        struct sg_io_hdr io_hdr = {
-                                .interface_id = 'S',
-                                .cmdp = (unsigned char*) cdb,
-                                .cmd_len = sizeof (cdb),
-                                .dxferp = buf,
-                                .dxfer_len = buf_len,
-                                .sbp = sense,
-                                .mx_sb_len = sizeof (sense),
-                                .dxfer_direction = SG_DXFER_FROM_DEV,
-                                .timeout = COMMAND_TIMEOUT_MSEC,
-                        };
+                struct sg_io_hdr io_hdr = {
+                        .interface_id = 'S',
+                        .cmdp = (unsigned char*) cdb,
+                        .cmd_len = sizeof (cdb),
+                        .dxferp = buf,
+                        .dxfer_len = buf_len,
+                        .sbp = sense,
+                        .mx_sb_len = sizeof (sense),
+                        .dxfer_direction = SG_DXFER_FROM_DEV,
+                        .timeout = COMMAND_TIMEOUT_MSEC,
+                };
 
-                        ret = ioctl(fd, SG_IO, &io_hdr);
-                        if (ret != 0)
-                                return ret;
-                } else
-                        return ret;
-        }
-
-        if (!(sense[0] == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c)) {
-                errno = EIO;
-                return -1;
+                if (ioctl(fd, SG_IO, &io_hdr) != 0)
+                        return log_debug_errno(errno, "ioctl v3 failed: %m");
+        } else {
+                if (!((sense[0] & 0x7f) == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c) &&
+                    !((sense[0] & 0x7f) == 0x70 && sense[12] == 0x00 && sense[13] == 0x1d))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "ioctl v4 failed.");
         }
 
         return 0;
@@ -214,34 +210,29 @@ static int disk_identify_packet_device_command(
                 .din_xferp = (uintptr_t) buf,
                 .timeout = COMMAND_TIMEOUT_MSEC,
         };
-        int ret;
 
-        ret = ioctl(fd, SG_IO, &io_v4);
-        if (ret != 0) {
+        if (ioctl(fd, SG_IO, &io_v4) != 0) {
+                if (errno != EINVAL)
+                        return log_debug_errno(errno, "ioctl v4 failed: %m");
+
                 /* could be that the driver doesn't do version 4, try version 3 */
-                if (errno == EINVAL) {
-                        struct sg_io_hdr io_hdr = {
-                                .interface_id = 'S',
-                                .cmdp = (unsigned char*) cdb,
-                                .cmd_len = sizeof (cdb),
-                                .dxferp = buf,
-                                .dxfer_len = buf_len,
-                                .sbp = sense,
-                                .mx_sb_len = sizeof (sense),
-                                .dxfer_direction = SG_DXFER_FROM_DEV,
-                                .timeout = COMMAND_TIMEOUT_MSEC,
-                        };
+                struct sg_io_hdr io_hdr = {
+                        .interface_id = 'S',
+                        .cmdp = (unsigned char*) cdb,
+                        .cmd_len = sizeof (cdb),
+                        .dxferp = buf,
+                        .dxfer_len = buf_len,
+                        .sbp = sense,
+                        .mx_sb_len = sizeof (sense),
+                        .dxfer_direction = SG_DXFER_FROM_DEV,
+                        .timeout = COMMAND_TIMEOUT_MSEC,
+                };
 
-                        ret = ioctl(fd, SG_IO, &io_hdr);
-                        if (ret != 0)
-                                return ret;
-                } else
-                        return ret;
-        }
-
-        if (!(sense[0] == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c)) {
-                errno = EIO;
-                return -1;
+                if (ioctl(fd, SG_IO, &io_hdr) != 0)
+                        return log_debug_errno(errno, "ioctl v3 failed: %m");
+        } else {
+                if ((sense[0] & 0x7f) != 0x72 || desc[0] != 0x9 || desc[1] != 0x0c)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "ioctl v4 failed.");
         }
 
         return 0;
@@ -281,26 +272,25 @@ static void disk_identify_fixup_string(
                 uint8_t identify[512],
                 unsigned offset_words,
                 size_t len) {
+        assert(offset_words < 512/2);
         disk_identify_get_string(identify, offset_words,
                                  (char *) identify + offset_words * 2, len);
 }
 
-static void disk_identify_fixup_uint16 (uint8_t identify[512], unsigned offset_words) {
-        uint16_t *p;
-
-        p = (uint16_t *) identify;
-        p[offset_words] = le16toh (p[offset_words]);
+static void disk_identify_fixup_uint16(uint8_t identify[512], unsigned offset_words) {
+        assert(offset_words < 512/2);
+        unaligned_write_ne16(identify + offset_words * 2,
+                             unaligned_read_le16(identify + offset_words * 2));
 }
 
 /**
  * disk_identify:
  * @fd: File descriptor for the block device.
  * @out_identify: Return location for IDENTIFY data.
- * @out_is_packet_device: Return location for whether returned data is from a IDENTIFY PACKET DEVICE.
  *
  * Sends the IDENTIFY DEVICE or IDENTIFY PACKET DEVICE command to the
  * device represented by @fd. If successful, then the result will be
- * copied into @out_identify and @out_is_packet_device.
+ * copied into @out_identify.
  *
  * This routine is based on code from libatasmart, LGPL v2.1.
  *
@@ -309,13 +299,9 @@ static void disk_identify_fixup_uint16 (uint8_t identify[512], unsigned offset_w
  */
 static int disk_identify(int fd,
                          uint8_t out_identify[512],
-                         int *out_is_packet_device) {
-        int ret;
+                         int *ret_peripheral_device_type) {
         uint8_t inquiry_buf[36];
-        int peripheral_device_type;
-        int all_nul_bytes;
-        int n;
-        int is_packet_device = 0;
+        int peripheral_device_type, r;
 
         /* init results */
         memzero(out_identify, 512);
@@ -341,109 +327,104 @@ static int disk_identify(int fd,
          * the original bug-fix and see http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=556635
          * for the original bug-report.)
          */
-        ret = disk_scsi_inquiry_command (fd, inquiry_buf, sizeof (inquiry_buf));
-        if (ret != 0)
-                goto out;
+        r = disk_scsi_inquiry_command(fd, inquiry_buf, sizeof inquiry_buf);
+        if (r < 0)
+                return r;
 
         /* SPC-4, section 6.4.2: Standard INQUIRY data */
         peripheral_device_type = inquiry_buf[0] & 0x1f;
-        if (peripheral_device_type == 0x05)
-          {
-            is_packet_device = 1;
-            ret = disk_identify_packet_device_command(fd, out_identify, 512);
-            goto check_nul_bytes;
-          }
-        if (peripheral_device_type != 0x00) {
-                ret = -1;
-                errno = EIO;
-                goto out;
+        if (peripheral_device_type == 0x05) {
+                r = disk_identify_packet_device_command(fd, out_identify, 512);
+                if (r < 0)
+                        return r;
+
+        } else {
+                if (!IN_SET(peripheral_device_type, 0x00, 0x14))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Unsupported device type.");
+
+                /* OK, now issue the IDENTIFY DEVICE command */
+                r = disk_identify_command(fd, out_identify, 512);
+                if (r < 0)
+                        return r;
         }
 
-        /* OK, now issue the IDENTIFY DEVICE command */
-        ret = disk_identify_command(fd, out_identify, 512);
-        if (ret != 0)
-                goto out;
-
- check_nul_bytes:
          /* Check if IDENTIFY data is all NUL bytes - if so, bail */
-        all_nul_bytes = 1;
-        for (n = 0; n < 512; n++) {
+        bool all_nul_bytes = true;
+        for (size_t n = 0; n < 512; n++)
                 if (out_identify[n] != '\0') {
-                        all_nul_bytes = 0;
+                        all_nul_bytes = false;
                         break;
                 }
-        }
 
-        if (all_nul_bytes) {
-                ret = -1;
-                errno = EIO;
-                goto out;
-        }
+        if (all_nul_bytes)
+                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "IDENTIFY data is all zeroes.");
 
-out:
-        if (out_is_packet_device)
-                *out_is_packet_device = is_packet_device;
-        return ret;
+        if (ret_peripheral_device_type)
+                *ret_peripheral_device_type = peripheral_device_type;
+
+        return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int parse_argv(int argc, char *argv[]) {
+        assert(argc >= 0);
+        assert(argv);
+
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION('x', "export", NULL,
+                       "Print values as environment keys"):
+                        arg_export = true;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+                }
+
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Need exactly one DEVICE argument.");
+
+        arg_device = args[0];
+        return 1;
+}
+
+static int run(int argc, char *argv[]) {
         struct hd_driveid id;
         union {
                 uint8_t  byte[512];
                 uint16_t wyde[256];
         } identify;
-        char model[41];
-        char model_enc[256];
-        char serial[21];
-        char revision[9];
-        const char *node = NULL;
-        int export = 0;
-        _cleanup_close_ int fd = -1;
+        char model[41], model_enc[256], serial[21], revision[9];
+        _cleanup_close_ int fd = -EBADF;
         uint16_t word;
-        int is_packet_device = 0;
-        static const struct option options[] = {
-                { "export", no_argument, NULL, 'x' },
-                { "help", no_argument, NULL, 'h' },
-                {}
-        };
+        int r, peripheral_device_type = -1;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
-        for (;;) {
-                int option;
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
 
-                option = getopt_long(argc, argv, "xh", options, NULL);
-                if (option == -1)
-                        break;
-
-                switch (option) {
-                case 'x':
-                        export = 1;
-                        break;
-                case 'h':
-                        printf("Usage: ata_id [--export] [--help] <device>\n"
-                               "  -x,--export    print values as environment keys\n"
-                               "  -h,--help      print this help text\n\n");
-                        return 0;
-                }
-        }
-
-        node = argv[optind];
-        if (!node) {
-                log_error("no node specified");
-                return 1;
-        }
-
-        fd = open(node, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+        fd = open(ASSERT_PTR(arg_device), O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
         if (fd < 0) {
-                log_error("unable to open '%s'", node);
-                return 1;
+                bool ignore = ERRNO_IS_DEVICE_ABSENT_OR_EMPTY(errno);
+                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, errno,
+                               "Failed to open device node '%s'%s: %m",
+                               arg_device, ignore ? ", ignoring" : "");
+                return ignore ? 0 : -errno;
         }
 
-        if (disk_identify(fd, identify.byte, &is_packet_device) == 0) {
+        if (disk_identify(fd, identify.byte, &peripheral_device_type) >= 0) {
                 /*
                  * fix up only the fields from the IDENTIFY data that we are going to
                  * use and copy it into the hd_driveid struct for convenience
@@ -473,23 +454,21 @@ int main(int argc, char *argv[]) {
                 memcpy(&id, identify.byte, sizeof id);
         } else {
                 /* If this fails, then try HDIO_GET_IDENTITY */
-                if (ioctl(fd, HDIO_GET_IDENTITY, &id) != 0) {
-                        log_debug_errno(errno, "HDIO_GET_IDENTITY failed for '%s': %m", node);
-                        return 2;
-                }
+                if (ioctl(fd, HDIO_GET_IDENTITY, &id) != 0)
+                        return log_debug_errno(errno, "%s: HDIO_GET_IDENTITY failed: %m", arg_device);
         }
 
         memcpy(model, id.model, 40);
         model[40] = '\0';
-        udev_util_encode_string(model, model_enc, sizeof(model_enc));
-        util_replace_whitespace((char *) id.model, model, 40);
-        util_replace_chars(model, NULL);
-        util_replace_whitespace((char *) id.serial_no, serial, 20);
-        util_replace_chars(serial, NULL);
-        util_replace_whitespace((char *) id.fw_rev, revision, 8);
-        util_replace_chars(revision, NULL);
+        encode_devnode_name(model, model_enc, sizeof(model_enc));
+        udev_replace_whitespace((char *) id.model, model, 40);
+        udev_replace_chars(model, NULL);
+        udev_replace_whitespace((char *) id.serial_no, serial, 20);
+        udev_replace_chars(serial, NULL);
+        udev_replace_whitespace((char *) id.fw_rev, revision, 8);
+        udev_replace_chars(revision, NULL);
 
-        if (export) {
+        if (arg_export) {
                 /* Set this to convey the disk speaks the ATA protocol */
                 printf("ID_ATA=1\n");
 
@@ -510,11 +489,9 @@ int main(int argc, char *argv[]) {
                                 break;
                         default:
                                 printf("ID_TYPE=generic\n");
-                                break;
                         }
-                } else {
+                } else
                         printf("ID_TYPE=disk\n");
-                }
                 printf("ID_BUS=ata\n");
                 printf("ID_MODEL=%s\n", model);
                 printf("ID_MODEL_ENC=%s\n", model_enc);
@@ -522,13 +499,16 @@ int main(int argc, char *argv[]) {
                 if (serial[0] != '\0') {
                         printf("ID_SERIAL=%s_%s\n", model, serial);
                         printf("ID_SERIAL_SHORT=%s\n", serial);
-                } else {
+                } else
                         printf("ID_SERIAL=%s\n", model);
-                }
 
                 if (id.command_set_1 & (1<<5)) {
                         printf("ID_ATA_WRITE_CACHE=1\n");
                         printf("ID_ATA_WRITE_CACHE_ENABLED=%d\n", (id.cfs_enable_1 & (1<<5)) ? 1 : 0);
+                }
+                if (id.command_set_1 & (1<<6)) {
+                        printf("ID_ATA_READ_LOOKAHEAD=1\n");
+                        printf("ID_ATA_READ_LOOKAHEAD_ENABLED=%d\n", (id.cfs_enable_1 & (1<<6)) ? 1 : 0);
                 }
                 if (id.command_set_1 & (1<<10)) {
                         printf("ID_ATA_FEATURE_SET_HPA=1\n");
@@ -640,6 +620,9 @@ int main(int argc, char *argv[]) {
                 if (IN_SET(identify.wyde[0], 0x848a, 0x844a) ||
                     (identify.wyde[83] & 0xc004) == 0x4004)
                         printf("ID_ATA_CFA=1\n");
+
+                if (peripheral_device_type >= 0)
+                        printf("ID_ATA_PERIPHERAL_DEVICE_TYPE=%d\n", peripheral_device_type);
         } else {
                 if (serial[0] != '\0')
                         printf("%s_%s\n", model, serial);
@@ -649,3 +632,5 @@ int main(int argc, char *argv[]) {
 
         return 0;
 }
+
+DEFINE_MAIN_FUNCTION(run);

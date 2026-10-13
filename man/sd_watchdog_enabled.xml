@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_watchdog_enabled"
   xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -63,9 +63,9 @@
     <function>sd_watchdog_enabled()</function> will also return with
     zero.</para>
 
-    <para>If the <parameter>usec</parameter> parameter is non-NULL,
+    <para>If the <parameter>usec</parameter> parameter is non-<constant>NULL</constant>,
     <function>sd_watchdog_enabled()</function> will write the timeout
-    in µs for the watchdog logic to it.</para>
+    in μs for the watchdog logic to it.</para>
 
     <para>To enable service supervision with the watchdog logic, use
     <varname>WatchdogSec=</varname> in service files. See
@@ -93,6 +93,7 @@
     <title>Notes</title>
 
     <xi:include href="libsystemd-pkgconfig.xml" xpointer="pkgconfig-text"/>
+    <xi:include href="threads-aware.xml" xpointer="getenv"/>
 
     <para>Internally, this function parses the
     <varname>$WATCHDOG_PID</varname> and
@@ -113,7 +114,9 @@
         <listitem><para>Set by the system manager for supervised
         process for which watchdog support is enabled, and contains
         the PID of that process. See above for
-        details.</para></listitem>
+        details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -121,22 +124,29 @@
 
         <listitem><para>Set by the system manager for supervised
         process for which watchdog support is enabled, and contains
-        the watchdog timeout in µs. See above for
-        details.</para></listitem>
+        the watchdog timeout in μs. See above for
+        details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v209"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_watchdog_enabled()</function> was added in version 209.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-daemon</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>daemon</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_set_watchdog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-daemon</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>daemon</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_set_watchdog</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

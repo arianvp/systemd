@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_journal_enumerate_fields" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -91,43 +91,31 @@
   <refsect1>
     <title>Examples</title>
 
-    <para>Use the <function>SD_JOURNAL_FOREACH_FIELD</function> macro to iterate through all field names in use in the
+    <para>Use the <function>SD_JOURNAL_FOREACH_FIELD()</function> macro to iterate through all field names in use in the
     current journal.</para>
 
-    <programlisting>#include &lt;stdio.h&gt;
-#include &lt;string.h&gt;
-#include &lt;systemd/sd-journal.h&gt;
+    <programlisting><xi:include href="journal-enumerate-fields.c" parse="text" /></programlisting>
+  </refsect1>
 
-int main(int argc, char *argv[]) {
-        sd_journal *j;
-        const char *field;
-        int r;
-
-        r = sd_journal_open(&amp;j, SD_JOURNAL_LOCAL_ONLY);
-        if (r &lt; 0) {
-                fprintf(stderr, "Failed to open journal: %s\n", strerror(-r));
-                return 1;
-        }
-        SD_JOURNAL_FOREACH_FIELD(j, field)
-                printf("%s\n", field);
-        sd_journal_close(j);
-        return 0;
-}</programlisting>
-
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_journal_enumerate_fields()</function>,
+    <function>sd_journal_restart_fields()</function>, and
+    <function>SD_JOURNAL_FOREACH_FIELD()</function> were added in version 229.</para>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_open</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_query_unique</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_get_data</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_add_match</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_open</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_query_unique</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_get_data</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_add_match</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

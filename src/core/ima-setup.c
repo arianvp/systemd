@@ -1,13 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2012 Roberto Sassu - Politecnico di Torino, Italy
                                    TORSEC group — http://security.polito.it
 ***/
 
-#include <errno.h>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -23,7 +20,7 @@
 int ima_setup(void) {
 #if ENABLE_IMA
         _cleanup_fclose_ FILE *input = NULL;
-        _cleanup_close_ int imafd = -1;
+        _cleanup_close_ int imafd = -EBADF;
         unsigned lineno = 0;
         int r;
 

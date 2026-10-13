@@ -1,10 +1,9 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-if conf.get('ENABLE_VCONSOLE') == 1
-        vconsole_rules = configure_file(
-                input : '90-vconsole.rules.in',
-                output : '90-vconsole.rules',
-                configuration : substs)
-        install_data(vconsole_rules,
-                     install_dir : udevrulesdir)
-endif
+executables += [
+        libexec_template + {
+                'name' : 'systemd-vconsole-setup',
+                'conditions' : ['ENABLE_VCONSOLE'],
+                'sources' : files('vconsole-setup.c'),
+        },
+]

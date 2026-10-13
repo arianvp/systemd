@@ -1,18 +1,20 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
-#include <netinet/ip.h>
-#include <netinet/udp.h>
-#include <stdint.h>
+#include "sd-dhcp-protocol.h"  /* IWYU pragma: export */
 
-#include "macro.h"
-#include "sparse-endian.h"
+#include "dhcp-forward.h"
+#include "time-util.h"
 
-struct DHCPMessage {
+/* RFC 8925 - IPv6-Only Preferred Option for DHCPv4 3.4.
+ * MIN_V6ONLY_WAIT: The lower boundary for V6ONLY_WAIT. Value: 300 seconds */
+#define MIN_V6ONLY_WAIT_USEC (300U * USEC_PER_SEC)
+
+struct DHCPMessageHeader {
         uint8_t op;
         uint8_t htype;
         uint8_t hlen;
@@ -28,66 +30,61 @@ struct DHCPMessage {
         uint8_t sname[64];
         uint8_t file[128];
         be32_t magic;
-        uint8_t options[0];
 } _packed_;
 
-typedef struct DHCPMessage DHCPMessage;
+typedef struct DHCPMessageHeader DHCPMessageHeader;
 
-struct DHCPPacket {
-        struct iphdr ip;
-        struct udphdr udp;
-        DHCPMessage dhcp;
-} _packed_;
-
-typedef struct DHCPPacket DHCPPacket;
-
-#define DHCP_IP_SIZE            (int32_t)(sizeof(struct iphdr))
-#define DHCP_IP_UDP_SIZE        (int32_t)(sizeof(struct udphdr) + DHCP_IP_SIZE)
-#define DHCP_MESSAGE_SIZE       (int32_t)(sizeof(DHCPMessage))
-#define DHCP_DEFAULT_MIN_SIZE   576 /* the minimum internet hosts must be able to receive */
-#define DHCP_MIN_OPTIONS_SIZE   (DHCP_DEFAULT_MIN_SIZE - DHCP_IP_UDP_SIZE - DHCP_MESSAGE_SIZE)
 #define DHCP_MAGIC_COOKIE       (uint32_t)(0x63825363)
+
+/* The size of BOOTP message. The BOOTP message does not have the magic field, but has the 64-byte
+ * vendor-specific area. */
+#define BOOTP_MESSAGE_SIZE (offsetof(DHCPMessageHeader, magic) + 64)
 
 enum {
         DHCP_PORT_SERVER                        = 67,
         DHCP_PORT_CLIENT                        = 68,
 };
 
-enum DHCPState {
-        DHCP_STATE_INIT                         = 0,
-        DHCP_STATE_SELECTING                    = 1,
-        DHCP_STATE_INIT_REBOOT                  = 2,
-        DHCP_STATE_REBOOTING                    = 3,
-        DHCP_STATE_REQUESTING                   = 4,
-        DHCP_STATE_BOUND                        = 5,
-        DHCP_STATE_RENEWING                     = 6,
-        DHCP_STATE_REBINDING                    = 7,
-        DHCP_STATE_STOPPED                      = 8,
-};
-
-typedef enum DHCPState DHCPState;
-
-enum {
+typedef enum {
         BOOTREQUEST                             = 1,
         BOOTREPLY                               = 2,
-};
+        _BOOTP_MESSAGE_TYPE_MAX,
+        _BOOTP_MESSAGE_TYPE_INVALID             = -EINVAL,
+} BOOTPMessageType;
 
-enum {
-        DHCP_DISCOVER                           = 1,
-        DHCP_OFFER                              = 2,
-        DHCP_REQUEST                            = 3,
-        DHCP_DECLINE                            = 4,
-        DHCP_ACK                                = 5,
-        DHCP_NAK                                = 6,
-        DHCP_RELEASE                            = 7,
-        DHCP_INFORM                             = 8,
-        DHCP_FORCERENEW                         = 9,
-};
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(bootp_message_type, BOOTPMessageType);
 
-enum {
-        DHCP_OVERLOAD_FILE                      = 1,
-        DHCP_OVERLOAD_SNAME                     = 2,
-};
+typedef enum {
+        DHCP_DISCOVER                           = 1,  /* [RFC2132] */
+        DHCP_OFFER                              = 2,  /* [RFC2132] */
+        DHCP_REQUEST                            = 3,  /* [RFC2132] */
+        DHCP_DECLINE                            = 4,  /* [RFC2132] */
+        DHCP_ACK                                = 5,  /* [RFC2132] */
+        DHCP_NAK                                = 6,  /* [RFC2132] */
+        DHCP_RELEASE                            = 7,  /* [RFC2132] */
+        DHCP_INFORM                             = 8,  /* [RFC2132] */
+        DHCP_FORCERENEW                         = 9,  /* [RFC3203] */
+        DHCP_LEASEQUERY                         = 10, /* [RFC4388] */
+        DHCP_LEASEUNASSIGNED                    = 11, /* [RFC4388] */
+        DHCP_LEASEUNKNOWN                       = 12, /* [RFC4388] */
+        DHCP_LEASEACTIVE                        = 13, /* [RFC4388] */
+        DHCP_BULKLEASEQUERY                     = 14, /* [RFC6926] */
+        DHCP_LEASEQUERYDONE                     = 15, /* [RFC6926] */
+        DHCP_ACTIVELEASEQUERY                   = 16, /* [RFC7724] */
+        DHCP_LEASEQUERYSTATUS                   = 17, /* [RFC7724] */
+        DHCP_TLS                                = 18, /* [RFC7724] */
+        _DHCP_MESSAGE_TYPE_MAX,
+        _DHCP_MESSAGE_TYPE_INVALID              = -EINVAL,
+} DHCPMessageType;
+
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(dhcp_message_type, DHCPMessageType);
+
+typedef enum {
+        DHCP_OVERLOAD_NONE                      = 0,
+        DHCP_OVERLOAD_FILE                      = 1 << 0,
+        DHCP_OVERLOAD_SNAME                     = 1 << 1,
+        _DHCP_OVERLOAD_ALL                      = DHCP_OVERLOAD_FILE | DHCP_OVERLOAD_SNAME,
+} DHCPOptionOverload;
 
 #define DHCP_MAX_FQDN_LENGTH 255
 
@@ -97,3 +94,26 @@ enum {
         DHCP_FQDN_FLAG_E = (1 << 2),
         DHCP_FQDN_FLAG_N = (1 << 3),
 };
+
+/* For SD_DHCP_RELAY_AGENT_FLAGS sub-option. */
+enum {
+        DHCP_RELAY_AGENT_FLAG_UNICAST = 1 << 0,
+};
+
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(dhcp_option_code, int);
+
+typedef enum DHCPState {
+        DHCP_STATE_STOPPED,
+        DHCP_STATE_INIT,
+        DHCP_STATE_SELECTING,
+        DHCP_STATE_INIT_REBOOT,
+        DHCP_STATE_REBOOTING,
+        DHCP_STATE_REQUESTING,
+        DHCP_STATE_BOUND,
+        DHCP_STATE_RENEWING,
+        DHCP_STATE_REBINDING,
+        _DHCP_STATE_MAX,
+        _DHCP_STATE_INVALID                     = -EINVAL,
+} DHCPState;
+
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(dhcp_state, DHCPState);

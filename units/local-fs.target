@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -10,8 +10,9 @@
 [Unit]
 Description=Local File Systems
 Documentation=man:systemd.special(7)
+
 DefaultDependencies=no
-Conflicts=shutdown.target
 After=local-fs-pre.target
+Conflicts=shutdown.target
 OnFailure=emergency.target
 OnFailureJobMode=replace-irreversibly

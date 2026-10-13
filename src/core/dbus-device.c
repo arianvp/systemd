@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "dbus-device.h"
 #include "device.h"
-#include "unit.h"
 
 const sd_bus_vtable bus_device_vtable[] = {
         SD_BUS_VTABLE_START(0),

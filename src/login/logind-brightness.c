@@ -1,11 +1,21 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "bus-util.h"
+#include <unistd.h>
+
+#include "sd-bus.h"
+#include "sd-device.h"
+#include "sd-event.h"
+
+#include "alloc-util.h"
+#include "bus-message-util.h"
 #include "device-util.h"
+#include "event-util.h"
+#include "format-util.h"
 #include "hash-funcs.h"
-#include "logind-brightness.h"
 #include "logind.h"
+#include "logind-brightness.h"
 #include "process-util.h"
+#include "set.h"
 #include "stdio-util.h"
 
 /* Brightness and LED devices tend to be very slow to write to (often being I2C and such). Writes to the
@@ -33,8 +43,6 @@ typedef struct BrightnessWriter {
         sd_device *device;
         char *path;
 
-        pid_t child;
-
         uint32_t brightness;
         bool again;
 
@@ -44,9 +52,9 @@ typedef struct BrightnessWriter {
         sd_event_source* child_event_source;
 } BrightnessWriter;
 
-static void brightness_writer_free(BrightnessWriter *w) {
+static BrightnessWriter* brightness_writer_free(BrightnessWriter *w) {
         if (!w)
-                return;
+                return NULL;
 
         if (w->manager && w->path)
                 (void) hashmap_remove_value(w->manager->brightness_writers, w->path, w);
@@ -59,7 +67,7 @@ static void brightness_writer_free(BrightnessWriter *w) {
 
         w->child_event_source = sd_event_source_unref(w->child_event_source);
 
-        free(w);
+        return mfree(w);
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(BrightnessWriter*, brightness_writer_free);
@@ -96,15 +104,12 @@ static void brightness_writer_reply(BrightnessWriter *w, int error) {
 static int brightness_writer_fork(BrightnessWriter *w);
 
 static int on_brightness_writer_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
-        BrightnessWriter *w = userdata;
+        BrightnessWriter *w = ASSERT_PTR(userdata);
         int r;
 
         assert(s);
         assert(si);
-        assert(w);
 
-        assert(si->si_pid == w->child);
-        w->child = 0;
         w->child_event_source = sd_event_source_unref(w->child_event_source);
 
         brightness_writer_reply(w,
@@ -134,10 +139,13 @@ static int brightness_writer_fork(BrightnessWriter *w) {
 
         assert(w);
         assert(w->manager);
-        assert(w->child == 0);
         assert(!w->child_event_source);
 
-        r = safe_fork("(sd-bright)", FORK_DEATHSIG|FORK_NULL_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG, &w->child);
+        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
+        r = pidref_safe_fork(
+                        "(sd-bright)",
+                        FORK_DEATHSIG_SIGKILL|FORK_REARRANGE_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG,
+                        &pidref);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -155,9 +163,15 @@ static int brightness_writer_fork(BrightnessWriter *w) {
                 _exit(EXIT_SUCCESS);
         }
 
-        r = sd_event_add_child(w->manager->event, &w->child_event_source, w->child, WEXITED, on_brightness_writer_exit, w);
+        r = event_add_child_pidref(w->manager->event, &w->child_event_source, &pidref, WEXITED, on_brightness_writer_exit, w);
         if (r < 0)
-                return log_error_errno(r, "Failed to watch brightness writer child " PID_FMT ": %m", w->child);
+                return log_error_errno(r, "Failed to watch brightness writer child " PID_FMT ": %m", pidref.pid);
+
+        r = sd_event_source_set_child_process_own(w->child_event_source, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to take ownership of child process: %m");
+
+        pidref_done(&pidref);
 
         return 0;
 }
@@ -174,15 +188,10 @@ static int set_add_message(Set **set, sd_bus_message *message) {
         if (r <= 0)
                 return r;
 
-        r = set_ensure_allocated(set, &bus_message_hash_ops);
-        if (r < 0)
+        r = set_ensure_consume(set, &bus_message_hash_ops, sd_bus_message_ref(message));
+        if (r <= 0)
                 return r;
 
-        r = set_put(*set, message);
-        if (r < 0)
-                return r;
-
-        sd_bus_message_ref(message);
         return 1;
 }
 
@@ -213,17 +222,13 @@ int manager_write_brightness(
                 if (r < 0)
                         return log_error_errno(r, "Failed to add message to set: %m");
 
-                /* We overide any previously requested brightness here: we coalesce writes, and the newest
+                /* We override any previously requested brightness here: we coalesce writes, and the newest
                  * requested brightness is the one we'll put into effect. */
                 existing->brightness = brightness;
                 existing->again = true; /* request another iteration of the writer when the current one is
                                          * complete */
                 return 0;
         }
-
-        r = hashmap_ensure_allocated(&m->brightness_writers, &brightness_writer_hash_ops);
-        if (r < 0)
-                return log_oom();
 
         w = new(BrightnessWriter, 1);
         if (!w)
@@ -238,9 +243,12 @@ int manager_write_brightness(
         if (!w->path)
                 return log_oom();
 
-        r = hashmap_put(m->brightness_writers, w->path, w);
+        r = hashmap_ensure_put(&m->brightness_writers, &brightness_writer_hash_ops, w->path, w);
+        if (r == -ENOMEM)
+                return log_oom();
         if (r < 0)
                 return log_error_errno(r, "Failed to add brightness writer to hashmap: %m");
+
         w->manager = m;
 
         r = set_add_message(&w->current_messages, message);

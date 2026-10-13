@@ -1,5 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
+
+#include "forward.h"
 
 /*
  * Copyright © IBM Corp. 2003
@@ -17,7 +19,7 @@
  * MAX_SERIAL_LEN: the maximum length of the serial number, including
  * added prefixes such as vendor and product (model) strings.
  */
-#define MAX_SERIAL_LEN 256
+#define MAX_SERIAL_LEN 512
 
 /*
  * MAX_BUFFER_LEN: maximum buffer size and line length used while reading
@@ -29,10 +31,10 @@ struct scsi_id_device {
         char vendor[9];
         char model[17];
         char revision[5];
-        char type[33];
         char kernel[64];
         char serial[MAX_SERIAL_LEN];
         char serial_short[MAX_SERIAL_LEN];
+        unsigned type;
         int use_sg;
 
         /* Always from page 0x80 e.g. 'B3G1P8500RWT' - may not be unique */
@@ -50,7 +52,7 @@ struct scsi_id_device {
 
 int scsi_std_inquiry(struct scsi_id_device *dev_scsi, const char *devname);
 int scsi_get_serial(struct scsi_id_device *dev_scsi, const char *devname,
-                    int page_code, int len);
+                    int page_code, size_t len);
 
 /*
  * Page code values.

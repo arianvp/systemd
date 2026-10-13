@@ -1,1 +1,5 @@
-../../units/paths.target
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=Paths
+Documentation=man:systemd.special(7)

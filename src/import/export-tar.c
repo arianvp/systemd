@@ -1,33 +1,45 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
+#include "dissect-image.h"
 #include "export-tar.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "import-common.h"
+#include "log.h"
+#include "pidref.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "ratelimit.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
-#define COPY_BUFFER_SIZE (16*1024)
-
-struct TarExport {
+typedef struct TarExport {
         sd_event *event;
 
         TarExportFinished on_finished;
         void *userdata;
 
+        ImportFlags flags;
+
         char *path;
         char *temp_path;
 
-        int output_fd;
-        int tar_fd;
+        int output_fd; /* compressed tar file in the fs */
+        int tar_fd;    /* uncompressed tar stream coming from child doing the libarchive loop */
+        int tree_fd;   /* directory fd of the tree to set up */
+        int userns_fd;
 
-        ImportCompress compress;
+        Compressor *compress;
 
         sd_event_source *output_event_source;
 
@@ -38,17 +50,16 @@ struct TarExport {
         uint64_t written_compressed;
         uint64_t written_uncompressed;
 
-        pid_t tar_pid;
+        PidRef tar_pid;
 
         struct stat st;
         uint64_t quota_referenced;
 
         unsigned last_percent;
-        RateLimit progress_rate_limit;
+        RateLimit progress_ratelimit;
 
         bool eof;
-        bool tried_splice;
-};
+} TarExport;
 
 TarExport *tar_export_unref(TarExport *e) {
         if (!e)
@@ -56,17 +67,14 @@ TarExport *tar_export_unref(TarExport *e) {
 
         sd_event_source_unref(e->output_event_source);
 
-        if (e->tar_pid > 1) {
-                (void) kill_and_sigcont(e->tar_pid, SIGKILL);
-                (void) wait_for_terminate(e->tar_pid, NULL);
-        }
+        pidref_done_sigkill_wait(&e->tar_pid);
 
         if (e->temp_path) {
                 (void) btrfs_subvol_remove(e->temp_path, BTRFS_REMOVE_QUOTA);
                 free(e->temp_path);
         }
 
-        import_compress_free(&e->compress);
+        e->compress = compressor_free(e->compress);
 
         sd_event_unref(e->event);
 
@@ -93,15 +101,17 @@ int tar_export_new(
                 return -ENOMEM;
 
         *e = (TarExport) {
-                .output_fd = -1,
-                .tar_fd = -1,
+                .output_fd = -EBADF,
+                .tar_fd = -EBADF,
+                .tree_fd = -EBADF,
+                .userns_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
-                .quota_referenced = (uint64_t) -1,
-                .last_percent = (unsigned) -1,
+                .quota_referenced = UINT64_MAX,
+                .last_percent = UINT_MAX,
+                .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
+                .tar_pid = PIDREF_NULL,
         };
-
-        RATELIMIT_INIT(e->progress_rate_limit, 100 * USEC_PER_MSEC, 1);
 
         if (event)
                 e->event = sd_event_ref(event);
@@ -121,7 +131,7 @@ static void tar_export_report_progress(TarExport *e) {
         assert(e);
 
         /* Do we have any quota info? If not, we don't know anything about the progress */
-        if (e->quota_referenced == (uint64_t) -1)
+        if (e->quota_referenced == UINT64_MAX)
                 return;
 
         if (e->written_uncompressed >= e->quota_referenced)
@@ -132,11 +142,20 @@ static void tar_export_report_progress(TarExport *e) {
         if (percent == e->last_percent)
                 return;
 
-        if (!ratelimit_below(&e->progress_rate_limit))
+        if (!ratelimit_below(&e->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Exported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->quota_referenced));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -147,11 +166,13 @@ static int tar_export_finish(TarExport *e) {
         assert(e);
         assert(e->tar_fd >= 0);
 
-        if (e->tar_pid > 0) {
-                r = wait_for_terminate_and_check("tar", e->tar_pid, WAIT_LOG);
-                e->tar_pid = 0;
+        if (pidref_is_set(&e->tar_pid)) {
+                r = pidref_wait_for_terminate_and_check("tar", &e->tar_pid, WAIT_LOG);
                 if (r < 0)
                         return r;
+
+                pidref_done(&e->tar_pid);
+
                 if (r != EXIT_SUCCESS)
                         return -EPROTO;
         }
@@ -167,29 +188,8 @@ static int tar_export_process(TarExport *e) {
 
         assert(e);
 
-        if (!e->tried_splice && e->compress.type == IMPORT_COMPRESS_UNCOMPRESSED) {
-
-                l = splice(e->tar_fd, NULL, e->output_fd, NULL, COPY_BUFFER_SIZE, 0);
-                if (l < 0) {
-                        if (errno == EAGAIN)
-                                return 0;
-
-                        e->tried_splice = true;
-                } else if (l == 0) {
-                        r = tar_export_finish(e);
-                        goto finish;
-                } else {
-                        e->written_uncompressed += l;
-                        e->written_compressed += l;
-
-                        tar_export_report_progress(e);
-
-                        return 0;
-                }
-        }
-
         while (e->buffer_size <= 0) {
-                uint8_t input[COPY_BUFFER_SIZE];
+                uint8_t input[COMPRESS_PIPE_BUFFER_SIZE];
 
                 if (e->eof) {
                         r = tar_export_finish(e);
@@ -204,10 +204,10 @@ static int tar_export_process(TarExport *e) {
 
                 if (l == 0) {
                         e->eof = true;
-                        r = import_compress_finish(&e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_finish(e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 } else {
                         e->written_uncompressed += l;
-                        r = import_compress(&e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_start(e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 }
                 if (r < 0) {
                         r = log_error_errno(r, "Failed to encode: %m");
@@ -234,6 +234,9 @@ static int tar_export_process(TarExport *e) {
         return 0;
 
 finish:
+        if (r >= 0 && isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         if (e->on_finished)
                 e->on_finished(e, r, e->userdata);
         else
@@ -254,15 +257,21 @@ static int tar_export_on_defer(sd_event_source *s, void *userdata) {
         return tar_export_process(i);
 }
 
-int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType compress) {
-        _cleanup_close_ int sfd = -1;
+int tar_export_start(
+                TarExport *e,
+                const char *path,
+                int fd,
+                Compression compress,
+                ImportFlags flags) {
+
+        _cleanup_close_ int sfd = -EBADF;
         int r;
 
         assert(e);
         assert(path);
         assert(fd >= 0);
-        assert(compress < _IMPORT_COMPRESS_TYPE_MAX);
-        assert(compress != IMPORT_COMPRESS_UNKNOWN);
+        assert(compress >= 0);
+        assert(compress < _COMPRESSION_MAX);
 
         if (e->output_fd >= 0)
                 return -EBUSY;
@@ -282,9 +291,10 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
         if (r < 0)
                 return r;
 
-        e->quota_referenced = (uint64_t) -1;
+        e->flags = flags;
+        e->quota_referenced = UINT64_MAX;
 
-        if (e->st.st_ino == 256) { /* might be a btrfs subvolume? */
+        if (btrfs_might_be_subvol(&e->st)) {
                 BtrfsQuotaInfo q;
 
                 r = btrfs_subvol_get_subtree_quota_fd(sfd, 0, &q);
@@ -298,14 +308,14 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
                         return r;
 
                 /* Let's try to make a snapshot, if we can, so that the export is atomic */
-                r = btrfs_subvol_snapshot_fd(sfd, e->temp_path, BTRFS_SNAPSHOT_READ_ONLY|BTRFS_SNAPSHOT_RECURSIVE);
+                r = btrfs_subvol_snapshot_at(sfd, NULL, AT_FDCWD, e->temp_path, BTRFS_SNAPSHOT_READ_ONLY|BTRFS_SNAPSHOT_RECURSIVE);
                 if (r < 0) {
                         log_debug_errno(r, "Couldn't create snapshot %s of %s, not exporting atomically: %m", e->temp_path, path);
                         e->temp_path = mfree(e->temp_path);
                 }
         }
 
-        r = import_compress_init(&e->compress, compress);
+        r = compressor_new(&e->compress, compress);
         if (r < 0)
                 return r;
 
@@ -320,7 +330,38 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
         if (r < 0)
                 return r;
 
-        e->tar_fd = import_fork_tar_c(e->temp_path ?: e->path, &e->tar_pid);
+        const char *p = e->temp_path ?: e->path;
+
+        if (FLAGS_SET(e->flags, IMPORT_FOREIGN_UID)) {
+                r = import_make_foreign_userns(&e->userns_fd);
+                if (r < 0)
+                        return r;
+
+                _cleanup_close_ int directory_fd = open(p, O_DIRECTORY|O_CLOEXEC|O_PATH);
+                if (directory_fd < 0)
+                        return log_error_errno(r, "Failed to open '%s': %m", p);
+
+                _cleanup_close_ int mapped_fd = -EBADF;
+                r = mountfsd_mount_directory_fd(
+                                /* vl= */ NULL,
+                                directory_fd,
+                                e->userns_fd,
+                                DISSECT_IMAGE_FOREIGN_UID,
+                                &mapped_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to mount directory via mountfsd: %m");
+
+                /* Drop O_PATH */
+                e->tree_fd = fd_reopen(mapped_fd, O_DIRECTORY|O_CLOEXEC);
+                if (e->tree_fd < 0)
+                        return log_error_errno(errno, "Failed to re-open mapped '%s': %m", p);
+        } else {
+                e->tree_fd = open(p, O_DIRECTORY|O_CLOEXEC);
+                if (e->tree_fd < 0)
+                        return log_error_errno(errno, "Failed to open '%s': %m", p);
+        }
+
+        e->tar_fd = import_fork_tar_c(e->tree_fd, e->userns_fd, &e->tar_pid);
         if (e->tar_fd < 0) {
                 e->output_event_source = sd_event_source_unref(e->output_event_source);
                 return e->tar_fd;

@@ -1,32 +1,27 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
-#include <limits.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "bus-common-errors.h"
+#include "chase.h"
 #include "conf-files.h"
 #include "conf-parser.h"
-#include "def.h"
+#include "constants.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "glyph-util.h"
 #include "hashmap.h"
-#include "install-printf.h"
 #include "install.h"
-#include "locale-util.h"
+#include "install-printf.h"
 #include "log.h"
-#include "macro.h"
 #include "mkdir.h"
 #include "path-lookup.h"
 #include "path-util.h"
@@ -37,121 +32,107 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "unit-file.h"
 #include "unit-name.h"
 
 #define UNIT_FILE_FOLLOW_SYMLINK_MAX 64
 
-typedef enum SearchFlags {
-        SEARCH_LOAD                   = 1 << 0,
-        SEARCH_FOLLOW_CONFIG_SYMLINKS = 1 << 1,
-        SEARCH_DROPIN                 = 1 << 2,
-} SearchFlags;
-
 typedef struct {
+        RuntimeScope scope;
         OrderedHashmap *will_process;
         OrderedHashmap *have_processed;
 } InstallContext;
 
-typedef enum {
-        PRESET_UNKNOWN,
-        PRESET_ENABLE,
-        PRESET_DISABLE,
-} PresetAction;
-
-typedef struct {
+struct UnitFilePresetRule {
         char *pattern;
         PresetAction action;
         char **instances;
-} PresetRule;
+};
 
-typedef struct {
-        PresetRule *rules;
-        size_t n_rules;
-} Presets;
+/* NB! strings use past tense. */
+static const char *const preset_action_past_tense_table[_PRESET_ACTION_MAX] = {
+        [PRESET_UNKNOWN] = "unknown",
+        [PRESET_ENABLE]  = "enabled",
+        [PRESET_DISABLE] = "disabled",
+        [PRESET_IGNORE]  = "ignored",
+};
 
-static bool unit_file_install_info_has_rules(const UnitFileInstallInfo *i) {
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(preset_action_past_tense, PresetAction);
+
+static bool install_info_has_rules(const InstallInfo *i) {
         assert(i);
 
         return !strv_isempty(i->aliases) ||
                !strv_isempty(i->wanted_by) ||
-               !strv_isempty(i->required_by);
+               !strv_isempty(i->required_by) ||
+               !strv_isempty(i->upheld_by);
 }
 
-static bool unit_file_install_info_has_also(const UnitFileInstallInfo *i) {
+static bool install_info_has_also(const InstallInfo *i) {
         assert(i);
 
         return !strv_isempty(i->also);
 }
 
-static void presets_freep(Presets *p) {
-        size_t i;
+static void unit_file_preset_rule_done(UnitFilePresetRule *rule) {
+        assert(rule);
 
+        free(rule->pattern);
+        strv_free(rule->instances);
+}
+
+void unit_file_presets_done(UnitFilePresets *p) {
         if (!p)
                 return;
 
-        for (i = 0; i < p->n_rules; i++) {
-                free(p->rules[i].pattern);
-                strv_free(p->rules[i].instances);
-        }
+        FOREACH_ARRAY(rule, p->rules, p->n_rules)
+                unit_file_preset_rule_done(rule);
 
         free(p->rules);
         p->n_rules = 0;
 }
 
-bool unit_type_may_alias(UnitType type) {
-        return IN_SET(type,
-                      UNIT_SERVICE,
-                      UNIT_SOCKET,
-                      UNIT_TARGET,
-                      UNIT_DEVICE,
-                      UNIT_TIMER,
-                      UNIT_PATH);
-}
-
-bool unit_type_may_template(UnitType type) {
-        return IN_SET(type,
-                      UNIT_SERVICE,
-                      UNIT_SOCKET,
-                      UNIT_TARGET,
-                      UNIT_TIMER,
-                      UNIT_PATH);
-}
-
-static const char *const unit_file_type_table[_UNIT_FILE_TYPE_MAX] = {
-        [UNIT_FILE_TYPE_REGULAR] = "regular",
-        [UNIT_FILE_TYPE_SYMLINK] = "symlink",
-        [UNIT_FILE_TYPE_MASKED] = "masked",
+static const char *const install_mode_table[_INSTALL_MODE_MAX] = {
+        [INSTALL_MODE_REGULAR] = "regular",
+        [INSTALL_MODE_LINKED]  = "linked",
+        [INSTALL_MODE_ALIAS]   = "alias",
+        [INSTALL_MODE_MASKED]  = "masked",
 };
 
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(unit_file_type, UnitFileType);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(install_mode, InstallMode);
 
-static int in_search_path(const LookupPaths *p, const char *path) {
+static int in_search_path(const LookupPaths *lp, const char *path) {
         _cleanup_free_ char *parent = NULL;
-        char **i;
+        int r;
 
+        /* Check if 'path' is in lp->search_path. */
+
+        assert(lp);
         assert(path);
 
-        parent = dirname_malloc(path);
-        if (!parent)
-                return -ENOMEM;
+        r = path_extract_directory(path, &parent);
+        if (r < 0)
+                return r;
 
-        STRV_FOREACH(i, p->search_path)
-                if (path_equal(parent, *i))
-                        return true;
-
-        return false;
+        return path_strv_contains(lp->search_path, parent);
 }
 
-static const char* skip_root(const LookupPaths *p, const char *path) {
-        char *e;
+static bool underneath_search_path(const LookupPaths *lp, const char *path) {
+        /* Check if 'path' is underneath lp->search_path. */
 
-        assert(p);
+        assert(lp);
         assert(path);
 
-        if (!p->root_dir)
+        return path_startswith_strv(path, lp->search_path);
+}
+
+static const char* skip_root(const char *root_dir, const char *path) {
+        assert(path);
+
+        if (!root_dir)
                 return path;
 
-        e = path_startswith(path, p->root_dir);
+        const char *e = path_startswith(path, root_dir);
         if (!e)
                 return NULL;
 
@@ -166,303 +147,463 @@ static const char* skip_root(const LookupPaths *p, const char *path) {
         return e;
 }
 
-static int path_is_generator(const LookupPaths *p, const char *path) {
+static int path_is_generator(const LookupPaths *lp, const char *path) {
         _cleanup_free_ char *parent = NULL;
+        int r;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
-        parent = dirname_malloc(path);
-        if (!parent)
-                return -ENOMEM;
+        r = path_extract_directory(path, &parent);
+        if (r < 0)
+                return r;
 
-        return path_equal_ptr(parent, p->generator) ||
-               path_equal_ptr(parent, p->generator_early) ||
-               path_equal_ptr(parent, p->generator_late);
+        return PATH_IN_SET(parent,
+                           lp->generator,
+                           lp->generator_early,
+                           lp->generator_late);
 }
 
-static int path_is_transient(const LookupPaths *p, const char *path) {
+static int path_is_transient(const LookupPaths *lp, const char *path) {
         _cleanup_free_ char *parent = NULL;
+        int r;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
-        parent = dirname_malloc(path);
-        if (!parent)
-                return -ENOMEM;
+        r = path_extract_directory(path, &parent);
+        if (r < 0)
+                return r;
 
-        return path_equal_ptr(parent, p->transient);
+        return path_equal(parent, lp->transient);
 }
 
-static int path_is_control(const LookupPaths *p, const char *path) {
+static int path_is_control(const LookupPaths *lp, const char *path) {
         _cleanup_free_ char *parent = NULL;
+        int r;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
-        parent = dirname_malloc(path);
-        if (!parent)
-                return -ENOMEM;
+        r = path_extract_directory(path, &parent);
+        if (r < 0)
+                return r;
 
-        return path_equal_ptr(parent, p->persistent_control) ||
-               path_equal_ptr(parent, p->runtime_control);
+        return PATH_IN_SET(parent,
+                           lp->persistent_control,
+                           lp->runtime_control);
 }
 
-static int path_is_config(const LookupPaths *p, const char *path, bool check_parent) {
+static int path_is_config(const LookupPaths *lp, const char *path, bool check_parent) {
         _cleanup_free_ char *parent = NULL;
+        int r;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
         /* Note that we do *not* have generic checks for /etc or /run in place, since with
          * them we couldn't discern configuration from transient or generated units */
 
         if (check_parent) {
-                parent = dirname_malloc(path);
-                if (!parent)
-                        return -ENOMEM;
+                r = path_extract_directory(path, &parent);
+                if (r < 0)
+                        return r;
 
                 path = parent;
         }
 
-        return path_equal_ptr(path, p->persistent_config) ||
-               path_equal_ptr(path, p->runtime_config);
+        return PATH_IN_SET(path,
+                           lp->persistent_config,
+                           lp->runtime_config);
 }
 
-static int path_is_runtime(const LookupPaths *p, const char *path, bool check_parent) {
+static int path_is_runtime(const LookupPaths *lp, const char *path, bool check_parent) {
         _cleanup_free_ char *parent = NULL;
         const char *rpath;
+        int r;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
         /* Everything in /run is considered runtime. On top of that we also add
          * explicit checks for the various runtime directories, as safety net. */
 
-        rpath = skip_root(p, path);
+        rpath = skip_root(lp->root_dir, path);
         if (rpath && path_startswith(rpath, "/run"))
                 return true;
 
         if (check_parent) {
-                parent = dirname_malloc(path);
-                if (!parent)
-                        return -ENOMEM;
+                r = path_extract_directory(path, &parent);
+                if (r < 0)
+                        return r;
 
                 path = parent;
         }
 
-        return path_equal_ptr(path, p->runtime_config) ||
-               path_equal_ptr(path, p->generator) ||
-               path_equal_ptr(path, p->generator_early) ||
-               path_equal_ptr(path, p->generator_late) ||
-               path_equal_ptr(path, p->transient) ||
-               path_equal_ptr(path, p->runtime_control);
+        return PATH_IN_SET(path,
+                           lp->runtime_config,
+                           lp->generator,
+                           lp->generator_early,
+                           lp->generator_late,
+                           lp->transient,
+                           lp->runtime_control);
 }
 
-static int path_is_vendor(const LookupPaths *p, const char *path) {
+static int path_is_vendor_or_generator(const LookupPaths *lp, const char *path) {
         const char *rpath;
 
-        assert(p);
+        assert(lp);
         assert(path);
 
-        rpath = skip_root(p, path);
+        rpath = skip_root(lp->root_dir, path);
         if (!rpath)
                 return 0;
 
         if (path_startswith(rpath, "/usr"))
                 return true;
 
-#if HAVE_SPLIT_USR
-        if (path_startswith(rpath, "/lib"))
+        if (path_is_generator(lp, rpath))
                 return true;
-#endif
 
-        return path_equal(rpath, SYSTEM_DATA_UNIT_PATH);
+        return path_equal(rpath, SYSTEM_DATA_UNIT_DIR);
 }
 
-int unit_file_changes_add(
-                UnitFileChange **changes,
+static const char* config_path_from_flags(const LookupPaths *lp, UnitFileFlags flags) {
+        assert(lp);
+
+        if (FLAGS_SET(flags, UNIT_FILE_PORTABLE))
+                return FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_attached : lp->persistent_attached;
+        else
+                return FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp->runtime_config : lp->persistent_config;
+}
+
+InstallChangeType install_changes_add(
+                InstallChange **changes,
                 size_t *n_changes,
-                UnitFileChangeType type,
+                InstallChangeType type, /* INSTALL_CHANGE_SYMLINK, _UNLINK, _IS_MASKED, _IS_DANGLING, … if positive or errno if negative */
                 const char *path,
                 const char *source) {
 
         _cleanup_free_ char *p = NULL, *s = NULL;
-        UnitFileChange *c;
+        int r;
 
-        assert(path);
         assert(!changes == !n_changes);
+        assert(INSTALL_CHANGE_TYPE_VALID(type));
+
+        /* Message formatting requires <path> to be set. */
+        assert(path);
+
+        /* Register a change or error. Note that the return value may be the error
+         * that was passed in, or -ENOMEM generated internally. */
 
         if (!changes)
-                return 0;
+                return type;
 
-        c = reallocarray(*changes, *n_changes + 1, sizeof(UnitFileChange));
-        if (!c)
-                return -ENOMEM;
-        *changes = c;
-
-        p = strdup(path);
-        if (source)
-                s = strdup(source);
-
-        if (!p || (source && !s))
+        if (!GREEDY_REALLOC(*changes, *n_changes + 1))
                 return -ENOMEM;
 
-        path_simplify(p, false);
-        if (s)
-                path_simplify(s, false);
+        r = path_simplify_alloc(path, &p);
+        if (r < 0)
+                return r;
 
-        c[*n_changes] = (UnitFileChange) { type, p, s };
-        p = s = NULL;
-        (*n_changes) ++;
+        r = path_simplify_alloc(source, &s);
+        if (r < 0)
+                return r;
+
+        (*changes)[(*n_changes)++] = (InstallChange) {
+                .type = type,
+                .path = TAKE_PTR(p),
+                .source = TAKE_PTR(s),
+        };
+
+        return type;
+}
+
+static void install_change_done(InstallChange *change) {
+        assert(change);
+
+        change->path = mfree(change->path);
+        change->source = mfree(change->source);
+}
+
+DEFINE_ARRAY_FREE_FUNC(install_changes_free, InstallChange, install_change_done);
+
+static void install_change_dump_success(const InstallChange *change) {
+        assert(change);
+        assert(change->path);
+
+        switch (change->type) {
+
+        case INSTALL_CHANGE_SYMLINK:
+                return log_info("Created symlink '%s' %s '%s'.",
+                                change->path, glyph(GLYPH_ARROW_RIGHT), change->source);
+
+        case INSTALL_CHANGE_UNLINK:
+                return log_info("Removed '%s'.", change->path);
+
+        case INSTALL_CHANGE_IS_MASKED:
+                return log_info("Unit %s is masked, ignoring.", change->path);
+
+        case INSTALL_CHANGE_IS_MASKED_GENERATOR:
+                return log_info("Unit %s is masked via a generator and cannot be unmasked, skipping.", change->path);
+
+        case INSTALL_CHANGE_IS_DANGLING:
+                return log_info("Unit %s is an alias to a non-existent unit, ignoring.", change->path);
+
+        case INSTALL_CHANGE_DESTINATION_NOT_PRESENT:
+                return log_warning("Unit %s is added as a dependency to a non-existent unit %s.",
+                                   change->source, change->path);
+
+        case INSTALL_CHANGE_AUXILIARY_FAILED:
+                return log_warning("Failed to enable auxiliary unit %s, ignoring.", change->path);
+
+        default:
+                assert_not_reached();
+        }
+}
+
+/* Generated/transient/missing/invalid units when applying presets.
+ * Coordinate with install_change_dump_error() below. */
+static bool ERRNO_IS_NEG_UNIT_ISSUE(intmax_t r) {
+        return IN_SET(r,
+                      -EEXIST,
+                      -ERFKILL,
+                      -EADDRNOTAVAIL,
+                      -ETXTBSY,
+                      -EBADSLT,
+                      -EIDRM,
+                      -EUCLEAN,
+                      -ELOOP,
+                      -EXDEV,
+                      -ENOENT,
+                      -ENOLINK,
+                      -EUNATCH);
+}
+
+int install_change_dump_error(const InstallChange *change, char **ret_errmsg, const char **ret_bus_error) {
+        char *m;
+        const char *bus_error;
+
+        /* Returns 0:   known error and ret_errmsg formatted
+         *         < 0: non-recognizable error */
+
+        assert(change);
+        assert(change->path);
+        assert(change->type < 0);
+        assert(ret_errmsg);
+
+        switch (change->type) {
+
+        case -EEXIST:
+                m = strjoin("File '", change->path, "' already exists",
+                            change->source ? " and is a symlink to " : NULL, change->source);
+                bus_error = BUS_ERROR_UNIT_EXISTS;
+                break;
+
+        case -ERFKILL:
+                m = strjoin("Unit ", change->path, " is masked");
+                bus_error = BUS_ERROR_UNIT_MASKED;
+                break;
+
+        case -EADDRNOTAVAIL:
+                m = strjoin("Unit ", change->path, " is transient or generated");
+                bus_error = BUS_ERROR_UNIT_GENERATED;
+                break;
+
+        case -ETXTBSY:
+                m = strjoin("File '", change->path, "' is under the systemd unit hierarchy already");
+                bus_error = BUS_ERROR_UNIT_BAD_PATH;
+                break;
+
+        case -EBADSLT:
+                m = strjoin("Invalid specifier in unit ", change->path);
+                bus_error = BUS_ERROR_BAD_UNIT_SETTING;
+                break;
+
+        case -EIDRM:
+                m = strjoin("Refusing to operate on template unit ", change->source,
+                            " when destination unit ", change->path, " is a non-template unit");
+                bus_error = BUS_ERROR_BAD_UNIT_SETTING;
+                break;
+
+        case -EUCLEAN:
+                m = strjoin("Invalid unit name ", change->path);
+                bus_error = BUS_ERROR_BAD_UNIT_SETTING;
+                break;
+
+        case -ELOOP:
+                m = strjoin("Refusing to operate on linked unit file ", change->path);
+                bus_error = BUS_ERROR_UNIT_LINKED;
+                break;
+
+        case -EXDEV:
+                if (change->source)
+                        m = strjoin("Cannot alias ", change->source, " as ", change->path);
+                else
+                        m = strjoin("Invalid unit reference ", change->path);
+                bus_error = BUS_ERROR_BAD_UNIT_SETTING;
+                break;
+
+        case -ENOENT:
+                m = strjoin("Unit ", change->path, " does not exist");
+                bus_error = BUS_ERROR_NO_SUCH_UNIT;
+                break;
+
+        case -ENOLINK:
+                m = strjoin("Unit ", change->path, " is an unresolvable alias");
+                bus_error = BUS_ERROR_NO_SUCH_UNIT;
+                break;
+
+        case -EUNATCH:
+                m = strjoin("Cannot resolve specifiers in unit ", change->path);
+                bus_error = BUS_ERROR_BAD_UNIT_SETTING;
+                break;
+
+        default:
+                return change->type;
+        }
+        if (!m)
+                return -ENOMEM;
+
+        *ret_errmsg = m;
+        if (ret_bus_error)
+                *ret_bus_error = bus_error;
+
         return 0;
 }
 
-void unit_file_changes_free(UnitFileChange *changes, size_t n_changes) {
-        size_t i;
+int install_changes_dump(
+                int error,
+                const char *verb,
+                const InstallChange *changes,
+                size_t n_changes,
+                bool quiet) {
 
-        assert(changes || n_changes == 0);
+        bool err_logged = false;
+        int r;
 
-        for (i = 0; i < n_changes; i++) {
-                free(changes[i].path);
-                free(changes[i].source);
-        }
-
-        free(changes);
-}
-
-void unit_file_dump_changes(int r, const char *verb, const UnitFileChange *changes, size_t n_changes, bool quiet) {
-        size_t i;
-        bool logged = false;
-
-        assert(changes || n_changes == 0);
         /* If verb is not specified, errors are not allowed! */
-        assert(verb || r >= 0);
+        assert(verb || error >= 0);
+        assert(changes || n_changes == 0);
 
-        for (i = 0; i < n_changes; i++) {
-                assert(verb || changes[i].type >= 0);
+        /* An error is returned if 'error' contains an error or if any of the changes failed. */
 
-                switch(changes[i].type) {
-                case UNIT_FILE_SYMLINK:
+        FOREACH_ARRAY(i, changes, n_changes)
+                if (i->type >= 0) {
                         if (!quiet)
-                                log_info("Created symlink %s %s %s.",
-                                         changes[i].path,
-                                         special_glyph(SPECIAL_GLYPH_ARROW),
-                                         changes[i].source);
-                        break;
-                case UNIT_FILE_UNLINK:
-                        if (!quiet)
-                                log_info("Removed %s.", changes[i].path);
-                        break;
-                case UNIT_FILE_IS_MASKED:
-                        if (!quiet)
-                                log_info("Unit %s is masked, ignoring.", changes[i].path);
-                        break;
-                case UNIT_FILE_IS_DANGLING:
-                        if (!quiet)
-                                log_info("Unit %s is an alias to a unit that is not present, ignoring.",
-                                         changes[i].path);
-                        break;
-                case -EEXIST:
-                        if (changes[i].source)
-                                log_error_errno(changes[i].type,
-                                                "Failed to %s unit, file %s already exists and is a symlink to %s.",
-                                                verb, changes[i].path, changes[i].source);
+                                install_change_dump_success(i);
+                } else {
+                        _cleanup_free_ char *err_message = NULL;
+
+                        assert(verb);
+
+                        r = install_change_dump_error(i, &err_message, /* ret_bus_error= */ NULL);
+                        if (r == -ENOMEM)
+                                return log_oom();
+                        if (r < 0)
+                                RET_GATHER(error,
+                                           log_error_errno(r, "Failed to %s unit %s: %m", verb, i->path));
                         else
-                                log_error_errno(changes[i].type,
-                                                "Failed to %s unit, file %s already exists.",
-                                                verb, changes[i].path);
-                        logged = true;
-                        break;
-                case -ERFKILL:
-                        log_error_errno(changes[i].type, "Failed to %s unit, unit %s is masked.",
-                                        verb, changes[i].path);
-                        logged = true;
-                        break;
-                case -EADDRNOTAVAIL:
-                        log_error_errno(changes[i].type, "Failed to %s unit, unit %s is transient or generated.",
-                                        verb, changes[i].path);
-                        logged = true;
-                        break;
-                case -ELOOP:
-                        log_error_errno(changes[i].type, "Failed to %s unit, refusing to operate on linked unit file %s",
-                                        verb, changes[i].path);
-                        logged = true;
-                        break;
+                                RET_GATHER(error,
+                                           log_error_errno(i->type, "Failed to %s unit: %s", verb, err_message));
 
-                case -ENOENT:
-                        log_error_errno(changes[i].type, "Failed to %s unit, unit %s does not exist.", verb, changes[i].path);
-                        logged = true;
-                        break;
-
-                default:
-                        assert(changes[i].type < 0);
-                        log_error_errno(changes[i].type, "Failed to %s unit, file %s: %m.",
-                                        verb, changes[i].path);
-                        logged = true;
+                        err_logged = true;
                 }
-        }
 
-        if (r < 0 && !logged)
-                log_error_errno(r, "Failed to %s: %m.", verb);
+        if (error < 0 && !err_logged)
+                log_error_errno(error, "Failed to %s units: %m.", verb);
+
+        return error;
 }
 
 /**
- * Checks if two paths or symlinks from wd are the same, when root is the root of the filesystem.
- * wc should be the full path in the host file system.
+ * Checks if two symlink targets (starting from src) are equivalent as far as the unit enablement logic is
+ * concerned. If the target is in the unit search path, then anything with the same name is equivalent.
+ * If outside the unit search path, paths must be identical.
  */
-static bool chroot_symlinks_same(const char *root, const char *wd, const char *a, const char *b) {
-        assert(path_is_absolute(wd));
+static int chroot_unit_symlinks_equivalent(
+                const LookupPaths *lp,
+                const char *src,
+                const char *target_a,
+                const char *target_b) {
+
+        assert(lp);
+        assert(src);
+        assert(target_a);
+        assert(target_b);
 
         /* This will give incorrect results if the paths are relative and go outside
          * of the chroot. False negatives are possible. */
 
-        if (!root)
-                root = "/";
+        const char *root = lp->root_dir ?: "/";
+        _cleanup_free_ char *dirname = NULL;
+        int r;
 
-        a = strjoina(path_is_absolute(a) ? root : wd, "/", a);
-        b = strjoina(path_is_absolute(b) ? root : wd, "/", b);
-        return path_equal_or_files_same(a, b, 0);
+        if (!path_is_absolute(target_a) || !path_is_absolute(target_b)) {
+                r = path_extract_directory(src, &dirname);
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_free_ char *a = path_join(path_is_absolute(target_a) ? root : dirname, target_a);
+        _cleanup_free_ char *b = path_join(path_is_absolute(target_b) ? root : dirname, target_b);
+        if (!a || !b)
+                return log_oom();
+
+        r = path_equal_or_inode_same(a, b, 0);
+        if (r != 0)
+                return r;
+
+        _cleanup_free_ char *a_name = NULL, *b_name = NULL;
+        r = path_extract_filename(a, &a_name);
+        if (r < 0)
+                return r;
+        r = path_extract_filename(b, &b_name);
+        if (r < 0)
+                return r;
+
+        return streq(a_name, b_name) &&
+               path_startswith_strv(a, lp->search_path) &&
+               path_startswith_strv(b, lp->search_path);
 }
 
 static int create_symlink(
-                const LookupPaths *paths,
+                const LookupPaths *lp,
                 const char *old_path,
                 const char *new_path,
                 bool force,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_free_ char *dest = NULL, *dirname = NULL;
+        _cleanup_free_ char *dest = NULL;
         const char *rp;
         int r;
 
         assert(old_path);
         assert(new_path);
 
-        rp = skip_root(paths, old_path);
+        rp = skip_root(lp->root_dir, old_path);
         if (rp)
                 old_path = rp;
 
-        /* Actually create a symlink, and remember that we did. Is
-         * smart enough to check if there's already a valid symlink in
-         * place.
+        /* Actually create a symlink, and remember that we did. This function is
+         * smart enough to check if there's already a valid symlink in place.
          *
-         * Returns 1 if a symlink was created or already exists and points to
-         * the right place, or negative on error.
+         * Returns 1 if a symlink was created or already exists and points to the
+         * right place, or negative on error.
          */
 
-        mkdir_parents_label(new_path, 0755);
+        (void) mkdir_parents_label(new_path, 0755);
 
         if (symlink(old_path, new_path) >= 0) {
-                unit_file_changes_add(changes, n_changes, UNIT_FILE_SYMLINK, new_path, old_path);
+                r = install_changes_add(changes, n_changes, INSTALL_CHANGE_SYMLINK, new_path, old_path);
+                if (r < 0)
+                        return r;
                 return 1;
         }
 
-        if (errno != EEXIST) {
-                unit_file_changes_add(changes, n_changes, -errno, new_path, NULL);
-                return -errno;
-        }
+        if (errno != EEXIST)
+                return install_changes_add(changes, n_changes, -errno, new_path, NULL);
 
         r = readlink_malloc(new_path, &dest);
         if (r < 0) {
@@ -470,32 +611,28 @@ static int create_symlink(
                 if (r == -EINVAL)
                         r = -EEXIST;
 
-                unit_file_changes_add(changes, n_changes, r, new_path, NULL);
-                return r;
+                return install_changes_add(changes, n_changes, r, new_path, NULL);
         }
 
-        dirname = dirname_malloc(new_path);
-        if (!dirname)
-                return -ENOMEM;
-
-        if (chroot_symlinks_same(paths->root_dir, dirname, dest, old_path)) {
-                log_debug("Symlink %s → %s already exists", new_path, dest);
+        if (chroot_unit_symlinks_equivalent(lp, new_path, dest, old_path)) {
+                log_debug("Symlink %s %s %s already exists",
+                          new_path, glyph(GLYPH_ARROW_RIGHT), dest);
                 return 1;
         }
 
-        if (!force) {
-                unit_file_changes_add(changes, n_changes, -EEXIST, new_path, dest);
-                return -EEXIST;
-        }
+        if (!force)
+                return install_changes_add(changes, n_changes, -EEXIST, new_path, dest);
 
         r = symlink_atomic(old_path, new_path);
-        if (r < 0) {
-                unit_file_changes_add(changes, n_changes, r, new_path, NULL);
-                return r;
-        }
+        if (r < 0)
+                return install_changes_add(changes, n_changes, r, new_path, NULL);
 
-        unit_file_changes_add(changes, n_changes, UNIT_FILE_UNLINK, new_path, NULL);
-        unit_file_changes_add(changes, n_changes, UNIT_FILE_SYMLINK, new_path, old_path);
+        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, new_path, NULL);
+        if (r < 0)
+                return r;
+        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_SYMLINK, new_path, old_path);
+        if (r < 0)
+                return r;
 
         return 1;
 }
@@ -507,17 +644,16 @@ static int mark_symlink_for_removal(
         char *n;
         int r;
 
+        assert(remove_symlinks_to);
         assert(p);
 
-        r = set_ensure_allocated(remove_symlinks_to, &path_hash_ops);
+        r = set_ensure_allocated(remove_symlinks_to, &path_hash_ops_free);
         if (r < 0)
                 return r;
 
-        n = strdup(p);
-        if (!n)
-                return -ENOMEM;
-
-        path_simplify(n, false);
+        r = path_simplify_alloc(p, &n);
+        if (r < 0)
+                return r;
 
         r = set_consume(*remove_symlinks_to, n);
         if (r == -EEXIST)
@@ -536,12 +672,11 @@ static int remove_marked_symlinks_fd(
                 const LookupPaths *lp,
                 bool dry_run,
                 bool *restart,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
-        int r = 0;
+        int r, ret = 0;
 
         assert(remove_symlinks_to);
         assert(fd >= 0);
@@ -558,40 +693,33 @@ static int remove_marked_symlinks_fd(
 
         rewinddir(d);
 
-        FOREACH_DIRENT(de, d, return -errno) {
-
-                dirent_ensure_type(d, de);
-
+        FOREACH_DIRENT(de, d, return -errno)
                 if (de->d_type == DT_DIR) {
+                        _cleanup_close_ int nfd = -EBADF;
                         _cleanup_free_ char *p = NULL;
-                        int nfd, q;
 
-                        nfd = openat(fd, de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                        nfd = RET_NERRNO(openat(fd, de->d_name, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW));
                         if (nfd < 0) {
-                                if (errno == ENOENT)
-                                        continue;
-
-                                if (r == 0)
-                                        r = -errno;
+                                if (nfd != -ENOENT)
+                                        RET_GATHER(ret, nfd);
                                 continue;
                         }
 
                         p = path_make_absolute(de->d_name, path);
-                        if (!p) {
-                                safe_close(nfd);
+                        if (!p)
                                 return -ENOMEM;
-                        }
 
                         /* This will close nfd, regardless whether it succeeds or not */
-                        q = remove_marked_symlinks_fd(remove_symlinks_to, nfd, p, config_path, lp, dry_run, restart, changes, n_changes);
-                        if (q < 0 && r == 0)
-                                r = q;
+                        RET_GATHER(ret, remove_marked_symlinks_fd(remove_symlinks_to,
+                                                                  TAKE_FD(nfd), p,
+                                                                  config_path, lp,
+                                                                  dry_run,
+                                                                  restart,
+                                                                  changes, n_changes));
 
                 } else if (de->d_type == DT_LNK) {
-                        _cleanup_free_ char *p = NULL, *dest = NULL;
-                        const char *rp;
+                        _cleanup_free_ char *p = NULL;
                         bool found;
-                        int q;
 
                         if (!unit_name_is_valid(de->d_name, UNIT_NAME_ANY))
                                 continue;
@@ -599,53 +727,72 @@ static int remove_marked_symlinks_fd(
                         p = path_make_absolute(de->d_name, path);
                         if (!p)
                                 return -ENOMEM;
-                        path_simplify(p, false);
+                        path_simplify(p);
 
-                        q = readlink_malloc(p, &dest);
-                        if (q == -ENOENT)
-                                continue;
-                        if (q < 0) {
-                                if (r == 0)
-                                        r = q;
-                                continue;
+                        /* We remove all links pointing to a file or path that is marked, as well as all
+                         * files sharing the same name as a file that is marked, and files sharing the same
+                         * name after the instance has been removed. Do path chasing only if we don't already
+                         * know that we want to remove the symlink. */
+                        found = set_contains(remove_symlinks_to, de->d_name);
+
+                        if (!found) {
+                                _cleanup_free_ char *template = NULL;
+
+                                r = unit_name_template(de->d_name, &template);
+                                if (r < 0 && r != -EINVAL)
+                                        return r;
+                                if (r >= 0)
+                                        found = set_contains(remove_symlinks_to, template);
                         }
 
-                        /* We remove all links pointing to a file or path that is marked, as well as all files sharing
-                         * the same name as a file that is marked. */
+                        if (!found) {
+                                _cleanup_free_ char *dest = NULL, *dest_name = NULL;
 
-                        found = set_contains(remove_symlinks_to, dest) ||
-                                set_contains(remove_symlinks_to, basename(dest)) ||
-                                set_contains(remove_symlinks_to, de->d_name);
+                                r = chase(p, lp->root_dir, CHASE_NONEXISTENT, &dest, NULL);
+                                if (r == -ENOENT)
+                                        continue;
+                                if (r < 0) {
+                                        log_debug_errno(r, "Failed to resolve symlink \"%s\": %m", p);
+                                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, p, NULL));
+                                        continue;
+                                }
+
+                                r = path_extract_filename(dest, &dest_name);
+                                if (r < 0)
+                                        return r;
+
+                                found = set_contains(remove_symlinks_to, dest) ||
+                                        set_contains(remove_symlinks_to, dest_name);
+                        }
 
                         if (!found)
                                 continue;
 
                         if (!dry_run) {
                                 if (unlinkat(fd, de->d_name, 0) < 0 && errno != ENOENT) {
-                                        if (r == 0)
-                                                r = -errno;
-                                        unit_file_changes_add(changes, n_changes, -errno, p, NULL);
+                                        RET_GATHER(ret, install_changes_add(changes, n_changes, -errno, p, NULL));
                                         continue;
                                 }
 
                                 (void) rmdir_parents(p, config_path);
                         }
 
-                        unit_file_changes_add(changes, n_changes, UNIT_FILE_UNLINK, p, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, p, NULL);
+                        if (r < 0)
+                                return r;
 
                         /* Now, remember the full path (but with the root prefix removed) of
                          * the symlink we just removed, and remove any symlinks to it, too. */
 
-                        rp = skip_root(lp, p);
-                        q = mark_symlink_for_removal(&remove_symlinks_to, rp ?: p);
-                        if (q < 0)
-                                return q;
-                        if (q > 0 && !dry_run)
+                        const char *rp = skip_root(lp->root_dir, p);
+                        r = mark_symlink_for_removal(&remove_symlinks_to, rp ?: p);
+                        if (r < 0)
+                                return r;
+                        if (r > 0 && !dry_run)
                                 *restart = true;
                 }
-        }
 
-        return r;
+        return ret;
 }
 
 static int remove_marked_symlinks(
@@ -653,17 +800,17 @@ static int remove_marked_symlinks(
                 const char *config_path,
                 const LookupPaths *lp,
                 bool dry_run,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         bool restart;
         int r = 0;
 
         assert(config_path);
         assert(lp);
 
-        if (set_size(remove_symlinks_to) <= 0)
+        if (set_isempty(remove_symlinks_to))
                 return 0;
 
         fd = open(config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC);
@@ -671,7 +818,7 @@ static int remove_marked_symlinks(
                 return errno == ENOENT ? 0 : -errno;
 
         do {
-                int q, cfd;
+                int cfd;
                 restart = false;
 
                 cfd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
@@ -679,16 +826,22 @@ static int remove_marked_symlinks(
                         return -errno;
 
                 /* This takes possession of cfd and closes it */
-                q = remove_marked_symlinks_fd(remove_symlinks_to, cfd, config_path, config_path, lp, dry_run, &restart, changes, n_changes);
-                if (r == 0)
-                        r = q;
+                RET_GATHER(r, remove_marked_symlinks_fd(remove_symlinks_to,
+                                                        cfd, config_path,
+                                                        config_path, lp,
+                                                        dry_run,
+                                                        &restart,
+                                                        changes, n_changes));
         } while (restart);
 
         return r;
 }
 
-static int is_symlink_with_known_name(const UnitFileInstallInfo *i, const char *name) {
+static int is_symlink_with_known_name(const InstallInfo *i, const char *name) {
         int r;
+
+        assert(i);
+        assert(name);
 
         if (streq(name, i->name))
                 return true;
@@ -712,206 +865,205 @@ static int is_symlink_with_known_name(const UnitFileInstallInfo *i, const char *
         return false;
 }
 
-static int find_symlinks_fd(
+static int find_symlinks_in_directory(
+                DIR *dir,
+                const char *dir_path,
                 const char *root_dir,
-                const UnitFileInstallInfo *i,
-                bool match_aliases,
-                bool ignore_same_name,
-                int fd,
-                const char *path,
-                const char *config_path,
-                bool *same_name_link) {
-
-        _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
-        int r = 0;
-
-        assert(i);
-        assert(fd >= 0);
-        assert(path);
-        assert(config_path);
-        assert(same_name_link);
-
-        d = fdopendir(fd);
-        if (!d) {
-                safe_close(fd);
-                return -errno;
-        }
-
-        FOREACH_DIRENT(de, d, return -errno) {
-
-                dirent_ensure_type(d, de);
-
-                if (de->d_type == DT_DIR) {
-                        _cleanup_free_ char *p = NULL;
-                        int nfd, q;
-
-                        nfd = openat(fd, de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-                        if (nfd < 0) {
-                                if (errno == ENOENT)
-                                        continue;
-
-                                if (r == 0)
-                                        r = -errno;
-                                continue;
-                        }
-
-                        p = path_make_absolute(de->d_name, path);
-                        if (!p) {
-                                safe_close(nfd);
-                                return -ENOMEM;
-                        }
-
-                        /* This will close nfd, regardless whether it succeeds or not */
-                        q = find_symlinks_fd(root_dir, i, match_aliases, ignore_same_name, nfd,
-                                             p, config_path, same_name_link);
-                        if (q > 0)
-                                return 1;
-                        if (r == 0)
-                                r = q;
-
-                } else if (de->d_type == DT_LNK) {
-                        _cleanup_free_ char *p = NULL, *dest = NULL;
-                        bool found_path = false, found_dest, b = false;
-                        int q;
-
-                        /* Acquire symlink name */
-                        p = path_make_absolute(de->d_name, path);
-                        if (!p)
-                                return -ENOMEM;
-
-                        /* Acquire symlink destination */
-                        q = readlink_malloc(p, &dest);
-                        if (q == -ENOENT)
-                                continue;
-                        if (q < 0) {
-                                if (r == 0)
-                                        r = q;
-                                continue;
-                        }
-
-                        /* Make absolute */
-                        if (!path_is_absolute(dest)) {
-                                char *x;
-
-                                x = prefix_root(root_dir, dest);
-                                if (!x)
-                                        return -ENOMEM;
-
-                                free_and_replace(dest, x);
-                        }
-
-                        assert(unit_name_is_valid(i->name, UNIT_NAME_ANY));
-                        if (!ignore_same_name)
-                                /* Check if the symlink itself matches what we are looking for.
-                                 *
-                                 * If ignore_same_name is specified, we are in one of the directories which
-                                 * have lower priority than the unit file, and even if a file or symlink with
-                                 * this name was found, we should ignore it. */
-                                 found_path = streq(de->d_name, i->name);
-
-                        /* Check if what the symlink points to matches what we are looking for */
-                        found_dest = streq(basename(dest), i->name);
-
-                        if (found_path && found_dest) {
-                                _cleanup_free_ char *t = NULL;
-
-                                /* Filter out same name links in the main
-                                 * config path */
-                                t = path_make_absolute(i->name, config_path);
-                                if (!t)
-                                        return -ENOMEM;
-
-                                b = path_equal(t, p);
-                        }
-
-                        if (b)
-                                *same_name_link = true;
-                        else if (found_path || found_dest) {
-                                if (!match_aliases)
-                                        return 1;
-
-                                /* Check if symlink name is in the set of names used by [Install] */
-                                q = is_symlink_with_known_name(i, de->d_name);
-                                if (q < 0)
-                                        return q;
-                                if (q > 0)
-                                        return 1;
-                        }
-                }
-        }
-
-        return r;
-}
-
-static int find_symlinks(
-                const char *root_dir,
-                const UnitFileInstallInfo *i,
+                const InstallInfo *info,
+                bool ignore_destination,
                 bool match_name,
                 bool ignore_same_name,
                 const char *config_path,
                 bool *same_name_link) {
 
-        int fd;
+        int r, ret = 0;
+
+        assert(dir);
+        assert(dir_path);
+        assert(info);
+        assert(unit_name_is_valid(info->name, UNIT_NAME_ANY));
+        assert(config_path);
+        assert(same_name_link);
+
+        FOREACH_DIRENT(de, dir, return -errno) {
+                bool found_path = false, found_dest = false, b = false;
+
+                if (de->d_type != DT_LNK)
+                        continue;
+
+                if (!ignore_destination) {
+                        _cleanup_free_ char *dest = NULL;
+
+                        /* Acquire symlink destination */
+                        r = readlinkat_malloc(dirfd(dir), de->d_name, &dest);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        RET_GATHER(ret, r);
+                                continue;
+                        }
+
+                        /* Check if what the symlink points to matches what we are looking for */
+                        found_dest = path_equal_filename(dest, info->name);
+                }
+
+                /* Check if the symlink itself matches what we are looking for.
+                 *
+                 * If ignore_destination is specified, we only look at the source name.
+                 *
+                 * If ignore_same_name is specified, we are in one of the directories which
+                 * have lower priority than the unit file, and even if a file or symlink with
+                 * this name was found, we should ignore it. */
+
+                if (ignore_destination || !ignore_same_name)
+                        found_path = streq(de->d_name, info->name);
+
+                if (!found_path && ignore_destination) {
+                        _cleanup_free_ char *template = NULL;
+
+                        r = unit_name_template(de->d_name, &template);
+                        if (r < 0 && r != -EINVAL)
+                                return r;
+                        if (r >= 0)
+                                found_dest = streq(template, info->name);
+                }
+
+                if (found_path && found_dest) {
+                        _cleanup_free_ char *p = NULL, *t = NULL;
+
+                        /* Filter out same name links in the main config path */
+                        p = path_make_absolute(de->d_name, dir_path);
+                        t = path_make_absolute(info->name, config_path);
+                        if (!p || !t)
+                                return -ENOMEM;
+
+                        b = path_equal(p, t);
+                }
+
+                if (b)
+                        *same_name_link = true;
+                else if (found_path || found_dest) {
+                        if (!match_name)
+                                return 1;
+
+                        /* Check if symlink name is in the set of names used by [Install] */
+                        r = is_symlink_with_known_name(info, de->d_name);
+                        if (r != 0)
+                                return r;
+                }
+        }
+
+        return ret;
+}
+
+static int find_symlinks(
+                const char *root_dir,
+                const InstallInfo *i,
+                bool match_name,
+                bool ignore_same_name,
+                const char *config_path,
+                bool *same_name_link) {
+
+        _cleanup_closedir_ DIR *config_dir = NULL;
+        int r;
 
         assert(i);
         assert(config_path);
         assert(same_name_link);
 
-        fd = open(config_path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC);
-        if (fd < 0) {
+        config_dir = opendir(config_path);
+        if (!config_dir) {
                 if (IN_SET(errno, ENOENT, ENOTDIR, EACCES))
                         return 0;
                 return -errno;
         }
 
-        /* This takes possession of fd and closes it */
-        return find_symlinks_fd(root_dir, i, match_name, ignore_same_name, fd,
-                                config_path, config_path, same_name_link);
+        FOREACH_DIRENT(de, config_dir, return -errno) {
+                const char *suffix;
+                _cleanup_free_ const char *path = NULL;
+                _cleanup_closedir_ DIR *d = NULL;
+
+                if (de->d_type != DT_DIR)
+                        continue;
+
+                suffix = strrchr(de->d_name, '.');
+                if (!STRPTR_IN_SET(suffix, ".wants", ".requires", ".upholds"))
+                        continue;
+
+                path = path_join(config_path, de->d_name);
+                if (!path)
+                        return -ENOMEM;
+
+                d = opendir(path);
+                if (!d) {
+                        log_error_errno(errno, "Failed to open directory \"%s\" while scanning for symlinks, ignoring: %m", path);
+                        continue;
+                }
+
+                r = find_symlinks_in_directory(d, path, root_dir, i,
+                                               /* ignore_destination= */ true,
+                                               /* match_name= */ match_name,
+                                               /* ignore_same_name= */ ignore_same_name,
+                                               config_path,
+                                               same_name_link);
+                if (r > 0)
+                        return 1;
+                if (r < 0)
+                        log_debug_errno(r, "Failed to look up symlinks in \"%s\": %m", path);
+        }
+
+        /* We didn't find any suitable symlinks in .wants, .requires or .upholds directories,
+         * let's look for linked unit files in this directory. */
+        rewinddir(config_dir);
+        return find_symlinks_in_directory(config_dir, config_path, root_dir, i,
+                                          /* ignore_destination= */ false,
+                                          /* match_name= */ match_name,
+                                          /* ignore_same_name= */ ignore_same_name,
+                                          config_path,
+                                          same_name_link);
 }
 
 static int find_symlinks_in_scope(
-                UnitFileScope scope,
-                const LookupPaths *paths,
-                const UnitFileInstallInfo *i,
+                RuntimeScope scope,
+                const LookupPaths *lp,
+                const InstallInfo *info,
                 bool match_name,
                 UnitFileState *state) {
 
         bool same_name_link_runtime = false, same_name_link_config = false;
         bool enabled_in_runtime = false, enabled_at_all = false;
         bool ignore_same_name = false;
-        char **p;
         int r;
 
-        assert(paths);
-        assert(i);
+        assert(lp);
+        assert(info);
+        assert(state);
 
-        /* As we iterate over the list of search paths in paths->search_path, we may encounter "same name"
+        /* As we iterate over the list of search paths in lp->search_path, we may encounter "same name"
          * symlinks. The ones which are "below" (i.e. have lower priority) than the unit file itself are
          * effectively masked, so we should ignore them. */
 
-        STRV_FOREACH(p, paths->search_path)  {
+        STRV_FOREACH(p, lp->search_path)  {
                 bool same_name_link = false;
 
-                r = find_symlinks(paths->root_dir, i, match_name, ignore_same_name, *p, &same_name_link);
+                r = find_symlinks(lp->root_dir, info, match_name, ignore_same_name, *p, &same_name_link);
                 if (r < 0)
                         return r;
                 if (r > 0) {
                         /* We found symlinks in this dir? Yay! Let's see where precisely it is enabled. */
 
-                        if (path_equal_ptr(*p, paths->persistent_config)) {
+                        if (path_equal(*p, lp->persistent_config)) {
                                 /* This is the best outcome, let's return it immediately. */
                                 *state = UNIT_FILE_ENABLED;
                                 return 1;
                         }
 
                         /* look for global enablement of user units */
-                        if (scope == UNIT_FILE_USER && path_is_user_config_dir(*p)) {
+                        if (scope == RUNTIME_SCOPE_USER && path_is_user_config_dir(*p)) {
                                 *state = UNIT_FILE_ENABLED;
                                 return 1;
                         }
 
-                        r = path_is_runtime(paths, *p, false);
+                        r = path_is_runtime(lp, *p, false);
                         if (r < 0)
                                 return r;
                         if (r > 0)
@@ -920,10 +1072,10 @@ static int find_symlinks_in_scope(
                                 enabled_at_all = true;
 
                 } else if (same_name_link) {
-                        if (path_equal_ptr(*p, paths->persistent_config))
+                        if (path_equal(*p, lp->persistent_config))
                                 same_name_link_config = true;
                         else {
-                                r = path_is_runtime(paths, *p, false);
+                                r = path_is_runtime(lp, *p, false);
                                 if (r < 0)
                                         return r;
                                 if (r > 0)
@@ -933,7 +1085,7 @@ static int find_symlinks_in_scope(
 
                 /* Check if next iteration will be "below" the unit file (either a regular file
                  * or a symlink), and hence should be ignored */
-                if (!ignore_same_name && path_startswith(i->path, *p))
+                if (!ignore_same_name && path_startswith(info->path, *p))
                         ignore_same_name = true;
         }
 
@@ -946,7 +1098,7 @@ static int find_symlinks_in_scope(
          * outside of runtime and configuration directory, then we consider it statically enabled. Note we do that only
          * for instance, not for regular names, as those are merely aliases, while instances explicitly instantiate
          * something, and hence are a much stronger concept. */
-        if (enabled_at_all && unit_name_is_valid(i->name, UNIT_NAME_INSTANCE)) {
+        if (enabled_at_all && unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
                 *state = UNIT_FILE_STATIC;
                 return 1;
         }
@@ -965,89 +1117,104 @@ static int find_symlinks_in_scope(
         return 0;
 }
 
-static void install_info_free(UnitFileInstallInfo *i) {
-
+static void install_info_clear(InstallInfo *i) {
         if (!i)
                 return;
 
-        free(i->name);
-        free(i->path);
-        strv_free(i->aliases);
-        strv_free(i->wanted_by);
-        strv_free(i->required_by);
-        strv_free(i->also);
-        free(i->default_instance);
-        free(i->symlink_target);
-        free(i);
+        i->name = mfree(i->name);
+        i->path = mfree(i->path);
+        i->root = mfree(i->root);
+        i->aliases = strv_free(i->aliases);
+        i->wanted_by = strv_free(i->wanted_by);
+        i->required_by = strv_free(i->required_by);
+        i->upheld_by = strv_free(i->upheld_by);
+        i->also = strv_free(i->also);
+        i->default_instance = mfree(i->default_instance);
+        i->symlink_target = mfree(i->symlink_target);
 }
 
-static void install_context_done(InstallContext *c) {
-        assert(c);
-
-        c->will_process = ordered_hashmap_free_with_destructor(c->will_process, install_info_free);
-        c->have_processed = ordered_hashmap_free_with_destructor(c->have_processed, install_info_free);
+static InstallInfo* install_info_free(InstallInfo *i) {
+        install_info_clear(i);
+        return mfree(i);
 }
 
-static UnitFileInstallInfo *install_info_find(InstallContext *c, const char *name) {
-        UnitFileInstallInfo *i;
+DEFINE_TRIVIAL_CLEANUP_FUNC(InstallInfo*, install_info_free);
 
-        i = ordered_hashmap_get(c->have_processed, name);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                install_info_hash_ops,
+                char, string_hash_func, string_compare_func,
+                InstallInfo, install_info_free);
+
+static void install_context_done(InstallContext *ctx) {
+        assert(ctx);
+
+        ctx->will_process = ordered_hashmap_free(ctx->will_process);
+        ctx->have_processed = ordered_hashmap_free(ctx->have_processed);
+}
+
+static InstallInfo *install_info_find(InstallContext *ctx, const char *name) {
+        InstallInfo *i;
+
+        i = ordered_hashmap_get(ctx->have_processed, name);
         if (i)
                 return i;
 
-        return ordered_hashmap_get(c->will_process, name);
+        return ordered_hashmap_get(ctx->will_process, name);
 }
 
 static int install_info_may_process(
-                const UnitFileInstallInfo *i,
-                const LookupPaths *paths,
-                UnitFileChange **changes,
+                const InstallInfo *i,
+                const LookupPaths *lp,
+                InstallChange **changes,
                 size_t *n_changes) {
         assert(i);
-        assert(paths);
+        assert(lp);
 
         /* Checks whether the loaded unit file is one we should process, or is masked,
          * transient or generated and thus not subject to enable/disable operations. */
 
-        if (i->type == UNIT_FILE_TYPE_MASKED) {
-                unit_file_changes_add(changes, n_changes, -ERFKILL, i->path, NULL);
-                return -ERFKILL;
-        }
-        if (path_is_generator(paths, i->path) ||
-            path_is_transient(paths, i->path)) {
-                unit_file_changes_add(changes, n_changes, -EADDRNOTAVAIL, i->path, NULL);
-                return -EADDRNOTAVAIL;
-        }
+        if (i->install_mode == INSTALL_MODE_MASKED)
+                return install_changes_add(changes, n_changes, -ERFKILL, i->path, NULL);
+        if (path_is_generator(lp, i->path) ||
+            path_is_transient(lp, i->path))
+                return install_changes_add(changes, n_changes, -EADDRNOTAVAIL, i->path, NULL);
 
         return 0;
 }
 
 /**
- * Adds a new UnitFileInstallInfo entry under name in the InstallContext.will_process
+ * Adds a new InstallInfo entry under name in the InstallContext.will_process
  * hashmap, or retrieves the existing one if already present.
  *
  * Returns negative on error, 0 if the unit was already known, 1 otherwise.
  */
 static int install_info_add(
-                InstallContext *c,
+                InstallContext *ctx,
                 const char *name,
                 const char *path,
+                const char *root,
                 bool auxiliary,
-                UnitFileInstallInfo **ret) {
+                InstallInfo **ret) {
 
-        UnitFileInstallInfo *i = NULL;
+        _cleanup_free_ char *name_alloc = NULL;
         int r;
 
-        assert(c);
-        assert(name || path);
+        assert(ctx);
 
-        if (!name)
-                name = basename(path);
+        if (!name) {
+                assert(path);
+
+                r = path_extract_filename(path, &name_alloc);
+                if (r < 0)
+                        return r;
+
+                name = name_alloc;
+        }
 
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
-        i = install_info_find(c, name);
+        InstallInfo *i = install_info_find(ctx, name);
         if (i) {
                 i->auxiliary = i->auxiliary && auxiliary;
 
@@ -1056,45 +1223,39 @@ static int install_info_add(
                 return 0;
         }
 
-        r = ordered_hashmap_ensure_allocated(&c->will_process, &string_hash_ops);
-        if (r < 0)
-                return r;
-
-        i = new(UnitFileInstallInfo, 1);
-        if (!i)
+        _cleanup_(install_info_freep) InstallInfo *new_info = new(InstallInfo, 1);
+        if (!new_info)
                 return -ENOMEM;
 
-        *i = (UnitFileInstallInfo) {
-                .type = _UNIT_FILE_TYPE_INVALID,
+        *new_info = (InstallInfo) {
+                .install_mode = _INSTALL_MODE_INVALID,
                 .auxiliary = auxiliary,
         };
 
-        i->name = strdup(name);
-        if (!i->name) {
-                r = -ENOMEM;
-                goto fail;
+        if (name_alloc)
+                new_info->name = TAKE_PTR(name_alloc);
+        else {
+                new_info->name = strdup(name);
+                if (!new_info->name)
+                        return -ENOMEM;
         }
 
-        if (path) {
-                i->path = strdup(path);
-                if (!i->path) {
-                        r = -ENOMEM;
-                        goto fail;
-                }
-        }
-
-        r = ordered_hashmap_put(c->will_process, i->name, i);
+        r = strdup_to(&new_info->root, root);
         if (r < 0)
-                goto fail;
+                return r;
+
+        r = strdup_to(&new_info->path, path);
+        if (r < 0)
+                return r;
+
+        r = ordered_hashmap_ensure_put(&ctx->will_process, &install_info_hash_ops, new_info->name, new_info);
+        if (r < 0)
+                return r;
+        i = TAKE_PTR(new_info);
 
         if (ret)
                 *ret = i;
-
         return 1;
-
-fail:
-        install_info_free(i);
-        return r;
 }
 
 static int config_parse_alias(
@@ -1138,8 +1299,8 @@ static int config_parse_also(
                 void *data,
                 void *userdata) {
 
-        UnitFileInstallInfo *info = userdata, *alsoinfo = NULL;
-        InstallContext *c = data;
+        InstallInfo *info = ASSERT_PTR(userdata);
+        InstallContext *ctx = ASSERT_PTR(data);
         int r;
 
         assert(unit);
@@ -1156,14 +1317,12 @@ static int config_parse_also(
                 if (r == 0)
                         break;
 
-                r = install_full_printf(info, word, &printed);
+                r = install_name_printf(ctx->scope, info, word, &printed);
                 if (r < 0)
-                        return r;
+                        return log_syntax(unit, LOG_WARNING, filename, line, r,
+                                          "Failed to resolve unit name in Also=\"%s\": %m", word);
 
-                if (!unit_name_is_valid(printed, UNIT_NAME_ANY))
-                        return -EINVAL;
-
-                r = install_info_add(c, printed, NULL, true, &alsoinfo);
+                r = install_info_add(ctx, printed, NULL, info->root, /* auxiliary= */ true, NULL);
                 if (r < 0)
                         return r;
 
@@ -1189,7 +1348,8 @@ static int config_parse_default_instance(
                 void *data,
                 void *userdata) {
 
-        UnitFileInstallInfo *i = data;
+        InstallContext *ctx = ASSERT_PTR(data);
+        InstallInfo *info = ASSERT_PTR(userdata);
         _cleanup_free_ char *printed = NULL;
         int r;
 
@@ -1206,19 +1366,24 @@ static int config_parse_default_instance(
                 return log_syntax(unit, LOG_WARNING, filename, line, 0,
                                   "DefaultInstance= only makes sense for template units, ignoring.");
 
-        r = install_full_printf(i, rvalue, &printed);
+        r = install_name_printf(ctx->scope, info, rvalue, &printed);
         if (r < 0)
-                return r;
+                return log_syntax(unit, LOG_WARNING, filename, line, r,
+                                  "Failed to resolve instance name in DefaultInstance=\"%s\": %m", rvalue);
 
-        if (!unit_instance_is_valid(printed))
-                return -EINVAL;
+        if (isempty(printed))
+                printed = mfree(printed);
 
-        return free_and_replace(i->default_instance, printed);
+        if (printed && !unit_instance_is_valid(printed))
+                return log_syntax(unit, LOG_WARNING, filename, line, SYNTHETIC_ERRNO(EINVAL),
+                                  "Invalid DefaultInstance= value \"%s\".", printed);
+
+        return free_and_replace(info->default_instance, printed);
 }
 
 static int unit_file_load(
-                InstallContext *c,
-                UnitFileInstallInfo *info,
+                InstallContext *ctx,
+                InstallInfo *info,
                 const char *path,
                 const char *root_dir,
                 SearchFlags flags) {
@@ -1227,14 +1392,15 @@ static int unit_file_load(
                 { "Install", "Alias",           config_parse_alias,            0, &info->aliases           },
                 { "Install", "WantedBy",        config_parse_strv,             0, &info->wanted_by         },
                 { "Install", "RequiredBy",      config_parse_strv,             0, &info->required_by       },
+                { "Install", "UpheldBy",        config_parse_strv,             0, &info->upheld_by         },
                 { "Install", "DefaultInstance", config_parse_default_instance, 0, info                     },
-                { "Install", "Also",            config_parse_also,             0, c                        },
+                { "Install", "Also",            config_parse_also,             0, ctx                      },
                 {}
         };
 
         UnitType type;
         _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
         int r;
 
@@ -1249,17 +1415,16 @@ static int unit_file_load(
                         return -EINVAL;
                 if (unit_name_is_valid(info->name, UNIT_NAME_TEMPLATE|UNIT_NAME_INSTANCE) && !unit_type_may_template(type))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Unit type %s cannot be templated.", unit_type_to_string(type));
+                                               "%s: unit type %s cannot be templated, ignoring.", path, unit_type_to_string(type));
 
                 if (!(flags & SEARCH_LOAD)) {
-                        r = lstat(path, &st);
-                        if (r < 0)
+                        if (lstat(path, &st) < 0)
                                 return -errno;
 
                         if (null_or_empty(&st))
-                                info->type = UNIT_FILE_TYPE_MASKED;
+                                info->install_mode = INSTALL_MODE_MASKED;
                         else if (S_ISREG(st.st_mode))
-                                info->type = UNIT_FILE_TYPE_REGULAR;
+                                info->install_mode = INSTALL_MODE_REGULAR;
                         else if (S_ISLNK(st.st_mode))
                                 return -ELOOP;
                         else if (S_ISDIR(st.st_mode))
@@ -1279,7 +1444,7 @@ static int unit_file_load(
                 if (!(flags & SEARCH_LOAD))
                         return 0;
 
-                fd = chase_symlinks_and_open(path, root_dir, 0, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
+                fd = chase_and_open(path, root_dir, 0, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
                 if (fd < 0)
                         return fd;
         }
@@ -1289,7 +1454,7 @@ static int unit_file_load(
 
         if (null_or_empty(&st)) {
                 if ((flags & SEARCH_DROPIN) == 0)
-                        info->type = UNIT_FILE_TYPE_MASKED;
+                        info->install_mode = INSTALL_MODE_MASKED;
 
                 return 0;
         }
@@ -1298,102 +1463,80 @@ static int unit_file_load(
         if (r < 0)
                 return r;
 
-        f = fdopen(fd, "r");
+        f = take_fdopen(&fd, "r");
         if (!f)
                 return -errno;
-        fd = -1;
 
-        /* c is only needed if we actually load the file (it's referenced from items[] btw, in case you wonder.) */
-        assert(c);
+        /* ctx is only needed if we actually load the file (it's referenced from items[] btw, in case you wonder.) */
+        assert(ctx);
 
         r = config_parse(info->name, path, f,
-                         NULL,
+                         "Install\0"
+                         "-Unit\0"
+                         "-Automount\0"
+                         "-Device\0"
+                         "-Mount\0"
+                         "-Path\0"
+                         "-Scope\0"
+                         "-Service\0"
+                         "-Slice\0"
+                         "-Socket\0"
+                         "-Swap\0"
+                         "-Target\0"
+                         "-Timer\0",
                          config_item_table_lookup, items,
-                         CONFIG_PARSE_RELAXED|CONFIG_PARSE_ALLOW_INCLUDE, info);
+                         0, info,
+                         NULL);
         if (r < 0)
-                return log_debug_errno(r, "Failed to parse %s: %m", info->name);
+                return log_debug_errno(r, "Failed to parse \"%s\": %m", info->name);
 
         if ((flags & SEARCH_DROPIN) == 0)
-                info->type = UNIT_FILE_TYPE_REGULAR;
+                info->install_mode = INSTALL_MODE_REGULAR;
 
         return
                 (int) strv_length(info->aliases) +
                 (int) strv_length(info->wanted_by) +
-                (int) strv_length(info->required_by);
+                (int) strv_length(info->required_by) +
+                (int) strv_length(info->upheld_by);
 }
 
 static int unit_file_load_or_readlink(
-                InstallContext *c,
-                UnitFileInstallInfo *info,
+                InstallContext *ctx,
+                InstallInfo *info,
                 const char *path,
-                const char *root_dir,
+                const LookupPaths *lp,
                 SearchFlags flags) {
-
-        _cleanup_free_ char *target = NULL;
         int r;
 
-        r = unit_file_load(c, info, path, root_dir, flags);
+        r = unit_file_load(ctx, info, path, lp->root_dir, flags);
         if (r != -ELOOP || (flags & SEARCH_DROPIN))
                 return r;
 
-        /* This is a symlink, let's read it. */
-
-        r = readlink_malloc(path, &target);
+        /* This is a symlink, let's read and verify it. */
+        r = unit_file_resolve_symlink(lp->root_dir, lp->search_path,
+                                      NULL, AT_FDCWD, path,
+                                      true, &info->symlink_target);
         if (r < 0)
                 return r;
+        bool outside_search_path = r > 0;
 
-        if (path_equal(target, "/dev/null"))
-                info->type = UNIT_FILE_TYPE_MASKED;
-        else {
-                const char *bn;
-                UnitType a, b;
-
-                bn = basename(target);
-
-                if (unit_name_is_valid(info->name, UNIT_NAME_PLAIN)) {
-
-                        if (!unit_name_is_valid(bn, UNIT_NAME_PLAIN))
-                                return -EINVAL;
-
-                } else if (unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
-
-                        if (!unit_name_is_valid(bn, UNIT_NAME_INSTANCE|UNIT_NAME_TEMPLATE))
-                                return -EINVAL;
-
-                } else if (unit_name_is_valid(info->name, UNIT_NAME_TEMPLATE)) {
-
-                        if (!unit_name_is_valid(bn, UNIT_NAME_TEMPLATE))
-                                return -EINVAL;
-                } else
-                        return -EINVAL;
-
-                /* Enforce that the symlink destination does not
-                 * change the unit file type. */
-
-                a = unit_name_to_type(info->name);
-                b = unit_name_to_type(bn);
-                if (a < 0 || b < 0 || a != b)
-                        return -EINVAL;
-
-                if (path_is_absolute(target))
-                        /* This is an absolute path, prefix the root so that we always deal with fully qualified paths */
-                        info->symlink_target = prefix_root(root_dir, target);
-                else
-                        /* This is a relative path, take it relative to the dir the symlink is located in. */
-                        info->symlink_target = file_in_same_dir(path, target);
-                if (!info->symlink_target)
-                        return -ENOMEM;
-
-                info->type = UNIT_FILE_TYPE_SYMLINK;
-        }
+        r = null_or_empty_path_with_root(info->symlink_target, lp->root_dir);
+        if (r < 0 && r != -ENOENT)
+                return log_debug_errno(r, "Failed to stat %s: %m", info->symlink_target);
+        if (r > 0)
+                info->install_mode = INSTALL_MODE_MASKED;
+        else if (outside_search_path)
+                info->install_mode = INSTALL_MODE_LINKED;
+        else
+                info->install_mode = INSTALL_MODE_ALIAS;
 
         return 0;
 }
 
 static int unit_file_search(
-                InstallContext *c,
-                UnitFileInstallInfo *info,
-                const LookupPaths *paths,
+                InstallContext *ctx,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 SearchFlags flags) {
 
         const char *dropin_dir_name = NULL, *dropin_template_dir_name = NULL;
@@ -1401,34 +1544,33 @@ static int unit_file_search(
         _cleanup_free_ char *template = NULL;
         bool found_unit = false;
         int r, result;
-        char **p;
 
         assert(info);
-        assert(paths);
+        assert(lp);
 
         /* Was this unit already loaded? */
-        if (info->type != _UNIT_FILE_TYPE_INVALID)
+        if (info->install_mode != _INSTALL_MODE_INVALID)
                 return 0;
 
         if (info->path)
-                return unit_file_load_or_readlink(c, info, info->path, paths->root_dir, flags);
+                return unit_file_load_or_readlink(ctx, info, info->path, lp, flags);
 
         assert(info->name);
 
-        if (unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
+        if (!FLAGS_SET(flags, SEARCH_IGNORE_TEMPLATE) && unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
                 r = unit_name_template(info->name, &template);
                 if (r < 0)
                         return r;
         }
 
-        STRV_FOREACH(p, paths->search_path) {
+        STRV_FOREACH(p, lp->search_path) {
                 _cleanup_free_ char *path = NULL;
 
-                path = strjoin(*p, "/", info->name);
+                path = path_join(*p, info->name);
                 if (!path)
                         return -ENOMEM;
 
-                r = unit_file_load_or_readlink(c, info, path, paths->root_dir, flags);
+                r = unit_file_load_or_readlink(ctx, info, path, lp, flags);
                 if (r >= 0) {
                         info->path = TAKE_PTR(path);
                         result = r;
@@ -1444,14 +1586,14 @@ static int unit_file_search(
                  * enablement was requested.  We will check if it is
                  * possible to load template unit file. */
 
-                STRV_FOREACH(p, paths->search_path) {
+                STRV_FOREACH(p, lp->search_path) {
                         _cleanup_free_ char *path = NULL;
 
-                        path = strjoin(*p, "/", template);
+                        path = path_join(*p, template);
                         if (!path)
                                 return -ENOMEM;
 
-                        r = unit_file_load_or_readlink(c, info, path, paths->root_dir, flags);
+                        r = unit_file_load_or_readlink(ctx, info, path, lp, flags);
                         if (r >= 0) {
                                 info->path = TAKE_PTR(path);
                                 result = r;
@@ -1467,13 +1609,13 @@ static int unit_file_search(
                                        "Cannot find unit %s%s%s.",
                                        info->name, template ? " or " : "", strempty(template));
 
-        if (info->type == UNIT_FILE_TYPE_MASKED)
+        if (info->install_mode == INSTALL_MODE_MASKED)
                 return result;
 
         /* Search for drop-in directories */
 
         dropin_dir_name = strjoina(info->name, ".d");
-        STRV_FOREACH(p, paths->search_path) {
+        STRV_FOREACH(p, lp->search_path) {
                 char *path;
 
                 path = path_join(*p, dropin_dir_name);
@@ -1487,7 +1629,7 @@ static int unit_file_search(
 
         if (template) {
                 dropin_template_dir_name = strjoina(template, ".d");
-                STRV_FOREACH(p, paths->search_path) {
+                STRV_FOREACH(p, lp->search_path) {
                         char *path;
 
                         path = path_join(*p, dropin_template_dir_name);
@@ -1507,39 +1649,38 @@ static int unit_file_search(
                 return log_debug_errno(r, "Failed to get list of conf files: %m");
 
         STRV_FOREACH(p, files) {
-                r = unit_file_load_or_readlink(c, info, *p, paths->root_dir, flags | SEARCH_DROPIN);
+                r = unit_file_load_or_readlink(ctx, info, *p, lp, flags | SEARCH_DROPIN);
                 if (r < 0)
-                        return log_debug_errno(r, "Failed to load conf file %s: %m", *p);
+                        return log_debug_errno(r, "Failed to load conf file \"%s\": %m", *p);
         }
 
         return result;
 }
 
 static int install_info_follow(
-                InstallContext *c,
-                UnitFileInstallInfo *i,
-                const char *root_dir,
+                InstallContext *ctx,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 SearchFlags flags,
                 bool ignore_different_name) {
 
-        assert(c);
-        assert(i);
+        assert(ctx);
+        assert(info);
 
-        if (i->type != UNIT_FILE_TYPE_SYMLINK)
+        if (!IN_SET(info->install_mode, INSTALL_MODE_ALIAS, INSTALL_MODE_LINKED))
                 return -EINVAL;
-        if (!i->symlink_target)
+        if (!info->symlink_target)
                 return -EINVAL;
 
-        /* If the basename doesn't match, the caller should add a
-         * complete new entry for this. */
+        /* If the basename doesn't match, the caller should add a complete new entry for this. */
 
-        if (!ignore_different_name && !streq(basename(i->symlink_target), i->name))
+        if (!ignore_different_name && !path_equal_filename(info->symlink_target, info->name))
                 return -EXDEV;
 
-        free_and_replace(i->path, i->symlink_target);
-        i->type = _UNIT_FILE_TYPE_INVALID;
+        free_and_replace(info->path, info->symlink_target);
+        info->install_mode = _INSTALL_MODE_INVALID;
 
-        return unit_file_load_or_readlink(c, i, i->path, root_dir, flags);
+        return unit_file_load_or_readlink(ctx, info, info->path, lp, flags);
 }
 
 /**
@@ -1547,53 +1688,54 @@ static int install_info_follow(
  * target, maybe more than once. Propagate the instance name if present.
  */
 static int install_info_traverse(
-                UnitFileScope scope,
-                InstallContext *c,
-                const LookupPaths *paths,
-                UnitFileInstallInfo *start,
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                InstallInfo *start,
                 SearchFlags flags,
-                UnitFileInstallInfo **ret) {
+                InstallInfo **ret) {
 
-        UnitFileInstallInfo *i;
+        InstallInfo *i;
         unsigned k = 0;
         int r;
 
-        assert(paths);
+        assert(ctx);
+        assert(lp);
         assert(start);
-        assert(c);
 
-        r = unit_file_search(c, start, paths, flags);
+        r = unit_file_search(ctx, start, lp, flags);
         if (r < 0)
                 return r;
 
         i = start;
-        while (i->type == UNIT_FILE_TYPE_SYMLINK) {
+        while (IN_SET(i->install_mode, INSTALL_MODE_ALIAS, INSTALL_MODE_LINKED)) {
                 /* Follow the symlink */
 
                 if (++k > UNIT_FILE_FOLLOW_SYMLINK_MAX)
                         return -ELOOP;
 
-                if (!(flags & SEARCH_FOLLOW_CONFIG_SYMLINKS)) {
-                        r = path_is_config(paths, i->path, true);
+                if (!FLAGS_SET(flags, SEARCH_FOLLOW_CONFIG_SYMLINKS)) {
+                        r = path_is_config(lp, i->path, true);
                         if (r < 0)
                                 return r;
                         if (r > 0)
                                 return -ELOOP;
                 }
 
-                r = install_info_follow(c, i, paths->root_dir, flags, false);
-                if (r == -EXDEV) {
-                        _cleanup_free_ char *buffer = NULL;
+                r = install_info_follow(ctx, i, lp, flags,
+                                        /* If linked, don't look at the target name */
+                                        /* ignore_different_name= */ i->install_mode == INSTALL_MODE_LINKED);
+                if (r == -EXDEV && i->symlink_target) {
+                        _cleanup_free_ char *target_name = NULL, *unit_instance = NULL;
                         const char *bn;
 
-                        /* Target has a different name, create a new
-                         * install info object for that, and continue
-                         * with that. */
+                        /* Target is an alias, create a new install info object and continue with that. */
 
-                        bn = basename(i->symlink_target);
+                        r = path_extract_filename(i->symlink_target, &target_name);
+                        if (r < 0)
+                                return r;
 
                         if (unit_name_is_valid(i->name, UNIT_NAME_INSTANCE) &&
-                            unit_name_is_valid(bn, UNIT_NAME_TEMPLATE)) {
+                            unit_name_is_valid(target_name, UNIT_NAME_TEMPLATE)) {
 
                                 _cleanup_free_ char *instance = NULL;
 
@@ -1601,36 +1743,35 @@ static int install_info_traverse(
                                 if (r < 0)
                                         return r;
 
-                                r = unit_name_replace_instance(bn, instance, &buffer);
+                                r = unit_name_replace_instance(target_name, instance, &unit_instance);
                                 if (r < 0)
                                         return r;
 
-                                if (streq(buffer, i->name)) {
+                                if (streq(unit_instance, i->name)) {
+                                        /* We filled in the instance, and the target stayed the same? If so,
+                                         * then let's honour the link as it is. */
 
-                                        /* We filled in the instance, and the target stayed the same? If so, then let's
-                                         * honour the link as it is. */
-
-                                        r = install_info_follow(c, i, paths->root_dir, flags, true);
+                                        r = install_info_follow(ctx, i, lp, flags, true);
                                         if (r < 0)
                                                 return r;
 
                                         continue;
                                 }
 
-                                bn = buffer;
-                        }
+                                bn = unit_instance;
+                        } else
+                                bn = target_name;
 
-                        r = install_info_add(c, bn, NULL, false, &i);
+                        r = install_info_add(ctx, bn, NULL, lp->root_dir, /* auxiliary= */ false, &i);
                         if (r < 0)
                                 return r;
 
                         /* Try again, with the new target we found. */
-                        r = unit_file_search(c, i, paths, flags);
+                        r = unit_file_search(ctx, i, lp, flags);
                         if (r == -ENOENT)
                                 /* Translate error code to highlight this specific case */
                                 return -ENOLINK;
                 }
-
                 if (r < 0)
                         return r;
         }
@@ -1646,163 +1787,329 @@ static int install_info_traverse(
  * or the name (otherwise). root_dir is prepended to the path.
  */
 static int install_info_add_auto(
-                InstallContext *c,
-                const LookupPaths *paths,
+                InstallContext *ctx,
+                const LookupPaths *lp,
                 const char *name_or_path,
-                UnitFileInstallInfo **ret) {
+                InstallInfo **ret) {
 
-        assert(c);
+        assert(ctx);
         assert(name_or_path);
 
         if (path_is_absolute(name_or_path)) {
-                const char *pp;
+                _cleanup_free_ char *pp = path_join(lp->root_dir, name_or_path);
+                if (!pp)
+                        return -ENOMEM;
 
-                pp = prefix_roota(paths->root_dir, name_or_path);
-
-                return install_info_add(c, NULL, pp, false, ret);
+                return install_info_add(ctx, NULL, pp, lp->root_dir, /* auxiliary= */ false, ret);
         } else
-                return install_info_add(c, name_or_path, NULL, false, ret);
+                return install_info_add(ctx, name_or_path, NULL, lp->root_dir, /* auxiliary= */ false, ret);
 }
 
 static int install_info_discover(
-                UnitFileScope scope,
-                InstallContext *c,
-                const LookupPaths *paths,
-                const char *name,
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                const char *name_or_path,
                 SearchFlags flags,
-                UnitFileInstallInfo **ret,
-                UnitFileChange **changes,
+                InstallInfo **ret,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        UnitFileInstallInfo *i;
+        InstallInfo *info;
         int r;
 
-        assert(c);
-        assert(paths);
-        assert(name);
+        assert(ctx);
+        assert(lp);
+        assert(name_or_path);
 
-        r = install_info_add_auto(c, paths, name, &i);
+        r = install_info_add_auto(ctx, lp, name_or_path, &info);
         if (r >= 0)
-                r = install_info_traverse(scope, c, paths, i, flags, ret);
+                r = install_info_traverse(ctx, lp, info, flags, ret);
 
         if (r < 0)
-                unit_file_changes_add(changes, n_changes, r, name, NULL);
+                return install_changes_add(changes, n_changes, r, name_or_path, NULL);
+
         return r;
 }
 
 static int install_info_discover_and_check(
-                        UnitFileScope scope,
-                        InstallContext *c,
-                        const LookupPaths *paths,
-                        const char *name,
-                        SearchFlags flags,
-                        UnitFileInstallInfo **ret,
-                        UnitFileChange **changes,
-                        size_t *n_changes) {
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                const char *name_or_path,
+                SearchFlags flags,
+                InstallInfo **ret,
+                InstallChange **changes,
+                size_t *n_changes) {
 
         int r;
 
-        r = install_info_discover(scope, c, paths, name, flags, ret, changes, n_changes);
+        POINTER_MAY_BE_NULL(ret);
+
+        r = install_info_discover(ctx, lp, name_or_path, flags, ret, changes, n_changes);
         if (r < 0)
                 return r;
 
-        return install_info_may_process(ret ? *ret : NULL, paths, changes, n_changes);
+        return install_info_may_process(ret ? *ret : NULL, lp, changes, n_changes);
+}
+
+int unit_file_verify_alias(
+                const InstallInfo *info,
+                const char *dst,
+                char **ret_dst,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_free_ char *dst_updated = NULL;
+        int r;
+
+        assert(ret_dst);
+
+        /* Verify that dst is a valid either a valid alias or a valid .wants/.requires symlink for the target
+         * unit *i. Return negative on error or if not compatible, zero on success.
+         *
+         * ret_dst is set in cases where "instance propagation" happens, i.e. when the instance part is
+         * inserted into dst. It is not normally set, even on success, so that the caller can easily
+         * distinguish the case where instance propagation occurred.
+         *
+         * Returns:
+         * -EXDEV when the alias doesn't match the unit,
+         * -EUCLEAN when the name is invalid,
+         * -ELOOP when the alias it to the unit itself.
+         */
+
+        const char *path_alias = strrchr(dst, '/');
+        if (path_alias) {
+                /* This branch covers legacy Alias= function of creating .wants and .requires symlinks. */
+                _cleanup_free_ char *dir = NULL;
+                char *p;
+
+                path_alias++; /* skip over slash */
+
+                r = path_extract_directory(dst, &dir);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to extract parent directory from '%s': %m", dst);
+
+                p = endswith(dir, ".wants");
+                if (!p)
+                        p = endswith(dir, ".requires");
+                if (!p) {
+                        r = install_changes_add(changes, n_changes, -EXDEV, dst, NULL);
+                        if (r != -EXDEV)
+                                return r;
+
+                        return log_debug_errno(SYNTHETIC_ERRNO(EXDEV), "Invalid path \"%s\" in alias.", dir);
+                }
+
+                *p = '\0'; /* dir should now be a unit name */
+
+                UnitNameFlags type = unit_name_classify(dir);
+                if (type < 0) {
+                        r = install_changes_add(changes, n_changes, -EXDEV, dst, NULL);
+                        if (r != -EXDEV)
+                                return r;
+                        return log_debug_errno(SYNTHETIC_ERRNO(EXDEV),
+                                               "Invalid unit name component \"%s\" in alias.", dir);
+                }
+
+                const bool instance_propagation = type == UNIT_NAME_TEMPLATE;
+
+                /* That's the name we want to use for verification. */
+                r = unit_symlink_name_compatible(path_alias, info->name, instance_propagation);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to verify alias validity: %m");
+                if (r == 0) {
+                        r = install_changes_add(changes, n_changes, -EXDEV, dst, info->name);
+                        if (r != -EXDEV)
+                                return r;
+
+                        return log_debug_errno(SYNTHETIC_ERRNO(EXDEV),
+                                               "Invalid unit \"%s\" symlink \"%s\".",
+                                               info->name, dst);
+                }
+
+        } else {
+                /* If the symlink target has an instance set and the symlink source doesn't, we "propagate
+                 * the instance", i.e. instantiate the symlink source with the target instance. */
+                if (unit_name_is_valid(dst, UNIT_NAME_TEMPLATE)) {
+                        _cleanup_free_ char *inst = NULL;
+
+                        UnitNameFlags type = unit_name_to_instance(info->name, &inst);
+                        if (type < 0) {
+                                r = install_changes_add(changes, n_changes, -EUCLEAN, info->name, NULL);
+                                if (r != -EUCLEAN)
+                                        return r;
+                                return log_debug_errno(type, "Failed to extract instance name from \"%s\": %m", info->name);
+                        }
+
+                        if (type == UNIT_NAME_INSTANCE) {
+                                r = unit_name_replace_instance(dst, inst, &dst_updated);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to build unit name from %s+%s: %m",
+                                                               dst, inst);
+                        }
+                }
+
+                r = unit_validate_alias_symlink_or_warn(LOG_DEBUG, dst_updated ?: dst, info->name);
+                if (r == -ELOOP)  /* -ELOOP means self-alias, which we (quietly) ignore */
+                        return r;
+                if (r < 0)
+                        return install_changes_add(changes, n_changes,
+                                                   r == -EINVAL ? -EXDEV : r,
+                                                   dst_updated ?: dst,
+                                                   info->name);
+        }
+
+        *ret_dst = TAKE_PTR(dst_updated);
+        return 0;
 }
 
 static int install_info_symlink_alias(
-                UnitFileInstallInfo *i,
-                const LookupPaths *paths,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 const char *config_path,
                 bool force,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        char **s;
-        int r = 0, q;
+        int r, ret = 0;
 
-        assert(i);
-        assert(paths);
+        assert(info);
+        assert(lp);
         assert(config_path);
 
-        STRV_FOREACH(s, i->aliases) {
-                _cleanup_free_ char *alias_path = NULL, *dst = NULL;
+        STRV_FOREACH(s, info->aliases) {
+                _cleanup_free_ char *alias_path = NULL, *alias_target = NULL, *dst = NULL, *dst_updated = NULL;
 
-                q = install_full_printf(i, *s, &dst);
-                if (q < 0)
-                        return q;
+                r = install_name_printf(scope, info, *s, &dst);
+                if (r < 0) {
+                        RET_GATHER(ret, install_changes_add(changes, n_changes, r, *s, NULL));
+                        continue;
+                }
 
-                alias_path = path_make_absolute(dst, config_path);
+                r = unit_file_verify_alias(info, dst, &dst_updated, changes, n_changes);
+                if (r < 0) {
+                        if (r != -ELOOP)
+                                RET_GATHER(ret, r);
+                        continue;
+                }
+
+                alias_path = path_make_absolute(dst_updated ?: dst, config_path);
                 if (!alias_path)
                         return -ENOMEM;
 
-                q = create_symlink(paths, i->path, alias_path, force, changes, n_changes);
-                if (r == 0)
-                        r = q;
+                r = in_search_path(lp, info->path);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        /* The unit path itself is outside of the search path. To
+                         * correctly apply the alias, we need the alias symlink to
+                         * point to the symlink that was created in the search path. */
+                        alias_target = path_join(config_path, info->name);
+                        if (!alias_target)
+                                return -ENOMEM;
+                }
+
+                bool broken;
+                r = chase(alias_path, lp->root_dir, CHASE_NONEXISTENT, /* ret_path= */ NULL, /* ret_fd= */ NULL);
+                if (r < 0 && r != -ENOENT) {
+                        RET_GATHER(ret, r);
+                        continue;
+                }
+                broken = r == 0; /* symlink target does not exist? */
+
+                r = create_symlink(lp, alias_target ?: info->path, alias_path, force || broken, changes, n_changes);
+                if (r == -EEXIST && FLAGS_SET(file_flags, UNIT_FILE_IGNORE_AUXILIARY_FAILURE))
+                        /* We cannot realize the alias because a conflicting alias exists.
+                         * Do not propagate this as error. */
+                        continue;
+                if (r != 0 && ret >= 0)
+                        ret = r;
         }
 
-        return r;
+        return ret;
 }
 
 static int install_info_symlink_wants(
-                UnitFileInstallInfo *i,
-                const LookupPaths *paths,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 const char *config_path,
                 char **list,
                 const char *suffix,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_free_ char *buf = NULL;
-        const char *n;
-        char **s;
-        int r = 0, q;
+        _cleanup_(install_info_clear) InstallInfo instance = {
+                .install_mode = _INSTALL_MODE_INVALID,
+        };
 
-        assert(i);
-        assert(paths);
+        UnitNameFlags valid_dst_type = UNIT_NAME_ANY;
+        const char *n;
+        int r, q;
+
+        assert(info);
+        assert(lp);
         assert(config_path);
 
         if (strv_isempty(list))
                 return 0;
 
-        if (unit_name_is_valid(i->name, UNIT_NAME_TEMPLATE)) {
-                UnitFileInstallInfo instance = {
-                        .type = _UNIT_FILE_TYPE_INVALID,
-                };
-                _cleanup_free_ char *path = NULL;
+        if (unit_name_is_valid(info->name, UNIT_NAME_PLAIN | UNIT_NAME_INSTANCE))
+                /* Not a template unit. Use the name directly. */
+                n = info->name;
 
-                /* If this is a template, and we have no instance, don't do anything */
-                if (!i->default_instance)
-                        return 1;
+        else if (info->default_instance) {
+                /* If this is a template, and we have a default instance, use it. */
 
-                r = unit_name_replace_instance(i->name, i->default_instance, &buf);
+                r = unit_name_replace_instance(info->name, info->default_instance, &instance.name);
                 if (r < 0)
                         return r;
 
-                instance.name = buf;
-                r = unit_file_search(NULL, &instance, paths, SEARCH_FOLLOW_CONFIG_SYMLINKS);
+                r = unit_file_search(NULL, &instance, lp, SEARCH_FOLLOW_CONFIG_SYMLINKS);
                 if (r < 0)
                         return r;
 
-                path = TAKE_PTR(instance.path);
+                if (instance.install_mode == INSTALL_MODE_MASKED)
+                        return install_changes_add(changes, n_changes, -ERFKILL, instance.path, NULL);
 
-                if (instance.type == UNIT_FILE_TYPE_MASKED) {
-                        unit_file_changes_add(changes, n_changes, -ERFKILL, path, NULL);
-                        return -ERFKILL;
-                }
+                n = instance.name;
 
-                n = buf;
-        } else
-                n = i->name;
+        } else {
+                /* We have a template, but no instance yet. When used with an instantiated unit, we will get
+                 * the instance from that unit. Cannot be used with non-instance units. */
 
+                valid_dst_type = UNIT_NAME_INSTANCE | UNIT_NAME_TEMPLATE;
+                n = info->name;
+        }
+
+        r = 0;
         STRV_FOREACH(s, list) {
                 _cleanup_free_ char *path = NULL, *dst = NULL;
 
-                q = install_full_printf(i, *s, &dst);
-                if (q < 0)
-                        return q;
+                q = install_name_printf(scope, info, *s, &dst);
+                if (q < 0) {
+                        RET_GATHER(r, install_changes_add(changes, n_changes, q, *s, NULL));
+                        continue;
+                }
 
-                if (!unit_name_is_valid(dst, UNIT_NAME_ANY)) {
-                        r = -EINVAL;
+                if (!unit_name_is_valid(dst, valid_dst_type)) {
+                        /* Generate a proper error here: EUCLEAN if the name is generally bad, EIDRM if the
+                         * template status doesn't match. If we are doing presets don't bother reporting the
+                         * error. This also covers cases like 'systemctl preset serial-getty@.service', which
+                         * has no DefaultInstance, so there is nothing we can do. At the same time,
+                         * 'systemctl enable serial-getty@.service' should fail, the user should specify an
+                         * instance like in 'systemctl enable serial-getty@ttyS0.service'.
+                         */
+                        if (FLAGS_SET(file_flags, UNIT_FILE_IGNORE_AUXILIARY_FAILURE))
+                                continue;
+
+                        if (unit_name_is_valid(dst, UNIT_NAME_ANY))
+                                RET_GATHER(r, install_changes_add(changes, n_changes, -EIDRM, dst, n));
+                        else
+                                RET_GATHER(r, install_changes_add(changes, n_changes, -EUCLEAN, dst, NULL));
+
                         continue;
                 }
 
@@ -1810,120 +2117,142 @@ static int install_info_symlink_wants(
                 if (!path)
                         return -ENOMEM;
 
-                q = create_symlink(paths, i->path, path, true, changes, n_changes);
-                if (r == 0)
+                q = create_symlink(lp, info->path, path, /* force= */ true, changes, n_changes);
+                if (q != 0 && r >= 0)
                         r = q;
+
+                if (unit_file_exists(scope, lp, dst) == 0) {
+                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_DESTINATION_NOT_PRESENT, dst, info->path);
+                        if (q < 0)
+                                return q;
+                }
         }
 
         return r;
 }
 
 static int install_info_symlink_link(
-                UnitFileInstallInfo *i,
-                const LookupPaths *paths,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 const char *config_path,
                 bool force,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         _cleanup_free_ char *path = NULL;
         int r;
 
-        assert(i);
-        assert(paths);
+        assert(info);
+        assert(lp);
         assert(config_path);
-        assert(i->path);
+        assert(info->path);
 
-        r = in_search_path(paths, i->path);
+        r = in_search_path(lp, info->path);
         if (r < 0)
                 return r;
         if (r > 0)
                 return 0;
 
-        path = strjoin(config_path, "/", i->name);
+        path = path_join(config_path, info->name);
         if (!path)
                 return -ENOMEM;
 
-        return create_symlink(paths, i->path, path, force, changes, n_changes);
+        return create_symlink(lp, info->path, path, force, changes, n_changes);
 }
 
 static int install_info_apply(
-                UnitFileInstallInfo *i,
-                const LookupPaths *paths,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
+                InstallInfo *info,
+                const LookupPaths *lp,
                 const char *config_path,
-                bool force,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         int r, q;
 
-        assert(i);
-        assert(paths);
+        assert(info);
+        assert(lp);
         assert(config_path);
 
-        if (i->type != UNIT_FILE_TYPE_REGULAR)
+        if (info->install_mode != INSTALL_MODE_REGULAR)
                 return 0;
 
-        r = install_info_symlink_alias(i, paths, config_path, force, changes, n_changes);
+        bool force = file_flags & UNIT_FILE_FORCE;
 
-        q = install_info_symlink_wants(i, paths, config_path, i->wanted_by, ".wants/", changes, n_changes);
-        if (r == 0)
-                r = q;
-
-        q = install_info_symlink_wants(i, paths, config_path, i->required_by, ".requires/", changes, n_changes);
-        if (r == 0)
-                r = q;
-
-        q = install_info_symlink_link(i, paths, config_path, force, changes, n_changes);
+        r = install_info_symlink_link(info, lp, config_path, force, changes, n_changes);
         /* Do not count links to the unit file towards the "carries_install_info" count */
-        if (r == 0 && q < 0)
+        if (r < 0)
+                /* If linking of the file failed, do not try to create other symlinks,
+                 * because they might would pointing to a non-existent or wrong unit. */
+                return r;
+
+        r = install_info_symlink_alias(scope, file_flags, info, lp, config_path, force, changes, n_changes);
+
+        q = install_info_symlink_wants(scope, file_flags, info, lp, config_path, info->wanted_by, ".wants/", changes, n_changes);
+        if (q != 0 && r >= 0)
+                r = q;
+
+        q = install_info_symlink_wants(scope, file_flags, info, lp, config_path, info->required_by, ".requires/", changes, n_changes);
+        if (q != 0 && r >= 0)
+                r = q;
+
+        q = install_info_symlink_wants(scope, file_flags, info, lp, config_path, info->upheld_by, ".upholds/", changes, n_changes);
+        if (q != 0 && r >= 0)
                 r = q;
 
         return r;
 }
 
 static int install_context_apply(
-                UnitFileScope scope,
-                InstallContext *c,
-                const LookupPaths *paths,
+                InstallContext *ctx,
+                const LookupPaths *lp,
+                UnitFileFlags file_flags,
                 const char *config_path,
-                bool force,
                 SearchFlags flags,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        UnitFileInstallInfo *i;
+        InstallInfo *i;
         int r;
 
-        assert(c);
-        assert(paths);
+        assert(ctx);
+        assert(lp);
         assert(config_path);
 
-        if (ordered_hashmap_isempty(c->will_process))
+        if (ordered_hashmap_isempty(ctx->will_process))
                 return 0;
 
-        r = ordered_hashmap_ensure_allocated(&c->have_processed, &string_hash_ops);
+        r = ordered_hashmap_ensure_allocated(&ctx->have_processed, &install_info_hash_ops);
         if (r < 0)
                 return r;
 
         r = 0;
-        while ((i = ordered_hashmap_first(c->will_process))) {
+        while ((i = ordered_hashmap_first(ctx->will_process))) {
                 int q;
 
-                q = ordered_hashmap_move_one(c->have_processed, c->will_process, i->name);
+                q = ordered_hashmap_move_one(ctx->have_processed, ctx->will_process, i->name);
                 if (q < 0)
                         return q;
 
-                q = install_info_traverse(scope, c, paths, i, flags, NULL);
+                q = install_info_traverse(ctx, lp, i, flags, NULL);
                 if (q < 0) {
-                        unit_file_changes_add(changes, n_changes, r, i->name, NULL);
-                        return q;
+                        if (i->auxiliary) {
+                                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_AUXILIARY_FAILED, i->name, NULL);
+                                if (q < 0)
+                                        return q;
+                                continue;
+                        }
+
+                        return install_changes_add(changes, n_changes, q, i->name, NULL);
                 }
 
                 /* We can attempt to process a masked unit when a different unit
                  * that we were processing specifies it in Also=. */
-                if (i->type == UNIT_FILE_TYPE_MASKED) {
-                        unit_file_changes_add(changes, n_changes, UNIT_FILE_IS_MASKED, i->path, NULL);
+                if (i->install_mode == INSTALL_MODE_MASKED) {
+                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path, NULL);
+                        if (q < 0)
+                                return q;
                         if (r >= 0)
                                 /* Assume that something *could* have been enabled here,
                                  * avoid "empty [Install] section" warning. */
@@ -1931,10 +2260,10 @@ static int install_context_apply(
                         continue;
                 }
 
-                if (i->type != UNIT_FILE_TYPE_REGULAR)
+                if (i->install_mode != INSTALL_MODE_REGULAR)
                         continue;
 
-                q = install_info_apply(i, paths, config_path, force, changes, n_changes);
+                q = install_info_apply(ctx->scope, file_flags, i, lp, config_path, changes, n_changes);
                 if (r >= 0) {
                         if (q < 0)
                                 r = q;
@@ -1947,58 +2276,66 @@ static int install_context_apply(
 }
 
 static int install_context_mark_for_removal(
-                UnitFileScope scope,
-                InstallContext *c,
-                const LookupPaths *paths,
+                InstallContext *ctx,
+                const LookupPaths *lp,
                 Set **remove_symlinks_to,
                 const char *config_path,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        UnitFileInstallInfo *i;
+        InstallInfo *i;
         int r;
 
-        assert(c);
-        assert(paths);
+        assert(ctx);
+        assert(lp);
         assert(config_path);
 
         /* Marks all items for removal */
 
-        if (ordered_hashmap_isempty(c->will_process))
+        if (ordered_hashmap_isempty(ctx->will_process))
                 return 0;
 
-        r = ordered_hashmap_ensure_allocated(&c->have_processed, &string_hash_ops);
+        r = ordered_hashmap_ensure_allocated(&ctx->have_processed, &install_info_hash_ops);
         if (r < 0)
                 return r;
 
-        while ((i = ordered_hashmap_first(c->will_process))) {
+        while ((i = ordered_hashmap_first(ctx->will_process))) {
 
-                r = ordered_hashmap_move_one(c->have_processed, c->will_process, i->name);
+                r = ordered_hashmap_move_one(ctx->have_processed, ctx->will_process, i->name);
                 if (r < 0)
                         return r;
 
-                r = install_info_traverse(scope, c, paths, i, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, NULL);
+                r = install_info_traverse(ctx, lp, i, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, NULL);
                 if (r == -ENOLINK) {
                         log_debug_errno(r, "Name %s leads to a dangling symlink, removing name.", i->name);
-                        unit_file_changes_add(changes, n_changes, UNIT_FILE_IS_DANGLING, i->path ?: i->name, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_DANGLING, i->path ?: i->name, NULL);
+                        if (r < 0)
+                                return r;
                 } else if (r == -ENOENT) {
-
                         if (i->auxiliary)  /* some unit specified in Also= or similar is missing */
                                 log_debug_errno(r, "Auxiliary unit of %s not found, removing name.", i->name);
                         else {
                                 log_debug_errno(r, "Unit %s not found, removing name.", i->name);
-                                unit_file_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
+                                r = install_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
+                                /* In case there's no unit, we still want to remove any leftover symlink, even if
+                                 * the unit might have been removed already, hence treating ENOENT as non-fatal. */
+                                if (r != -ENOENT)
+                                        return r;
                         }
-
                 } else if (r < 0) {
                         log_debug_errno(r, "Failed to find unit %s, removing name: %m", i->name);
-                        unit_file_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
-                } else if (i->type == UNIT_FILE_TYPE_MASKED) {
+                        int k = install_changes_add(changes, n_changes, r, i->path ?: i->name, NULL);
+                        if (k != r)
+                                return k;
+                } else if (i->install_mode == INSTALL_MODE_MASKED) {
                         log_debug("Unit file %s is masked, ignoring.", i->name);
-                        unit_file_changes_add(changes, n_changes, UNIT_FILE_IS_MASKED, i->path ?: i->name, NULL);
+                        r = install_changes_add(changes, n_changes, INSTALL_CHANGE_IS_MASKED, i->path ?: i->name, NULL);
+                        if (r < 0)
+                                return r;
                         continue;
-                } else if (i->type != UNIT_FILE_TYPE_REGULAR) {
-                        log_debug("Unit %s has type %s, ignoring.", i->name, unit_file_type_to_string(i->type) ?: "invalid");
+                } else if (i->install_mode != INSTALL_MODE_REGULAR) {
+                        log_debug("Unit %s has install mode %s, ignoring.",
+                                  i->name, install_mode_to_string(i->install_mode) ?: "invalid");
                         continue;
                 }
 
@@ -2011,88 +2348,106 @@ static int install_context_mark_for_removal(
 }
 
 int unit_file_mask(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *names,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         const char *config_path;
-        char **i;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = (flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
-        STRV_FOREACH(i, files) {
-                _cleanup_free_ char *path = NULL;
-                int q;
+        r = 0;
 
-                if (!unit_name_is_valid(*i, UNIT_NAME_ANY)) {
-                        if (r == 0)
-                                r = -EINVAL;
+        STRV_FOREACH(name, names) {
+                _cleanup_free_ char *path = NULL;
+
+                if (!unit_name_is_valid(*name, UNIT_NAME_ANY)) {
+                        RET_GATHER(r, -EINVAL);
                         continue;
                 }
 
-                path = path_make_absolute(*i, config_path);
+                path = path_make_absolute(*name, config_path);
                 if (!path)
                         return -ENOMEM;
 
-                q = create_symlink(&paths, "/dev/null", path, !!(flags & UNIT_FILE_FORCE), changes, n_changes);
-                if (q < 0 && r >= 0)
-                        r = q;
+                RET_GATHER(r, create_symlink(&lp, "/dev/null", path, flags & UNIT_FILE_FORCE, changes, n_changes));
         }
 
         return r;
 }
 
 int unit_file_unmask(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *names,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_set_free_free_ Set *remove_symlinks_to = NULL;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_set_free_ Set *remove_symlinks_to = NULL;
         _cleanup_strv_free_ char **todo = NULL;
-        size_t n_todo = 0, n_allocated = 0;
         const char *config_path;
-        char **i;
-        bool dry_run;
+        size_t n_todo = 0;
         int r, q;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = (flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
-        dry_run = !!(flags & UNIT_FILE_DRY_RUN);
+        bool dry_run = flags & UNIT_FILE_DRY_RUN;
 
-        STRV_FOREACH(i, files) {
-                _cleanup_free_ char *path = NULL;
-
-                if (!unit_name_is_valid(*i, UNIT_NAME_ANY))
+        STRV_FOREACH(name, names) {
+                if (!unit_name_is_valid(*name, UNIT_NAME_ANY))
                         return -EINVAL;
 
-                path = path_make_absolute(*i, config_path);
+                /* If root_dir is set, we don't care about kernel command line or generators.
+                 * But if it is not set, we need to check for interference. */
+                if (!root_dir) {
+                        _cleanup_(install_info_clear) InstallInfo info = {
+                                .name = *name,  /* We borrow *name temporarily… */
+                                .install_mode = _INSTALL_MODE_INVALID,
+                        };
+
+                        r = unit_file_search(NULL, &info, &lp, 0);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        log_debug_errno(r, "Failed to look up unit %s, ignoring: %m", info.name);
+                        } else if (info.install_mode == INSTALL_MODE_MASKED &&
+                                   path_is_generator(&lp, info.path)) {
+                                r = install_changes_add(changes, n_changes,
+                                                        INSTALL_CHANGE_IS_MASKED_GENERATOR, info.name, info.path);
+                                if (r < 0) {
+                                        TAKE_PTR(info.name); /* Return the borrowed name before bailing */
+                                        return r;
+                                }
+                        }
+
+                        TAKE_PTR(info.name);  /* … and give it back here */
+                }
+
+                _cleanup_free_ char *path = path_make_absolute(*name, config_path);
                 if (!path)
                         return -ENOMEM;
 
@@ -2104,10 +2459,10 @@ int unit_file_unmask(
                 if (r == 0)
                         continue;
 
-                if (!GREEDY_REALLOC0(todo, n_allocated, n_todo + 2))
+                if (!GREEDY_REALLOC0(todo, n_todo + 2))
                         return -ENOMEM;
 
-                todo[n_todo] = strdup(*i);
+                todo[n_todo] = strdup(*name);
                 if (!todo[n_todo])
                         return -ENOMEM;
 
@@ -2126,203 +2481,206 @@ int unit_file_unmask(
                         return -ENOMEM;
 
                 if (!dry_run && unlink(path) < 0) {
-                        if (errno != ENOENT) {
-                                if (r >= 0)
-                                        r = -errno;
-                                unit_file_changes_add(changes, n_changes, -errno, path, NULL);
-                        }
+                        if (errno != ENOENT)
+                                RET_GATHER(r, install_changes_add(changes, n_changes, -errno, path, NULL));
 
                         continue;
                 }
 
-                unit_file_changes_add(changes, n_changes, UNIT_FILE_UNLINK, path, NULL);
+                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, path, NULL);
+                if (q < 0)
+                        return q;
 
-                rp = skip_root(&paths, path);
+                rp = skip_root(lp.root_dir, path);
                 q = mark_symlink_for_removal(&remove_symlinks_to, rp ?: path);
                 if (q < 0)
                         return q;
         }
 
-        q = remove_marked_symlinks(remove_symlinks_to, config_path, &paths, dry_run, changes, n_changes);
-        if (r >= 0)
-                r = q;
+        RET_GATHER(r, remove_marked_symlinks(remove_symlinks_to, config_path, &lp, dry_run, changes, n_changes));
 
         return r;
 }
 
 int unit_file_link(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *files,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_strv_free_ char **todo = NULL;
-        size_t n_todo = 0, n_allocated = 0;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_ordered_hashmap_free_ OrderedHashmap *todo = NULL;
         const char *config_path;
-        char **i;
-        int r, q;
+        int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+        assert(changes);
+        assert(n_changes);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = FLAGS_SET(flags, UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
-        STRV_FOREACH(i, files) {
-                _cleanup_free_ char *full = NULL;
-                struct stat st;
-                char *fn;
+        STRV_FOREACH(file, files) {
+                _cleanup_free_ char *fn = NULL, *path = NULL, *full = NULL;
 
-                if (!path_is_absolute(*i))
-                        return -EINVAL;
+                if (ordered_hashmap_contains(todo, *file))
+                        continue;
 
-                fn = basename(*i);
+                if (!path_is_absolute(*file))
+                        return install_changes_add(changes, n_changes, -EINVAL, *file, NULL);
+
+                r = path_extract_filename(*file, &fn);
+                if (r < 0)
+                        return install_changes_add(changes, n_changes, r, *file, NULL);
+
                 if (!unit_name_is_valid(fn, UNIT_NAME_ANY))
-                        return -EINVAL;
+                        return install_changes_add(changes, n_changes, -EUCLEAN, *file, NULL);
 
-                full = prefix_root(paths.root_dir, *i);
+                full = path_join(lp.root_dir, *file);
                 if (!full)
                         return -ENOMEM;
 
-                if (lstat(full, &st) < 0)
-                        return -errno;
-                r = stat_verify_regular(&st);
+                r = verify_regular_at(AT_FDCWD, full, /* follow= */ false);
                 if (r < 0)
-                        return r;
+                        return install_changes_add(changes, n_changes, r, *file, NULL);
 
-                q = in_search_path(&paths, *i);
-                if (q < 0)
-                        return q;
-                if (q > 0)
+                r = in_search_path(&lp, *file);
+                if (r < 0)
+                        return install_changes_add(changes, n_changes, r, *file, NULL);
+                if (r > 0)
+                        /* A silent noop if the file is already in the search path. */
                         continue;
 
-                if (!GREEDY_REALLOC0(todo, n_allocated, n_todo + 2))
+                if (underneath_search_path(&lp, *file))
+                        return install_changes_add(changes, n_changes, -ETXTBSY, *file, NULL);
+
+                path = strdup(*file);
+                if (!path)
                         return -ENOMEM;
 
-                todo[n_todo] = strdup(*i);
-                if (!todo[n_todo])
-                        return -ENOMEM;
+                r = ordered_hashmap_ensure_put(&todo, &path_hash_ops_free_free, path, fn);
+                if (r < 0)
+                        return r;
+                assert(r > 0);
 
-                n_todo++;
+                TAKE_PTR(path);
+                TAKE_PTR(fn);
         }
 
-        strv_uniq(todo);
-
         r = 0;
-        STRV_FOREACH(i, todo) {
+
+        const char *fn, *path;
+        ORDERED_HASHMAP_FOREACH_KEY(fn, path, todo) {
                 _cleanup_free_ char *new_path = NULL;
 
-                new_path = path_make_absolute(basename(*i), config_path);
+                new_path = path_make_absolute(fn, config_path);
                 if (!new_path)
                         return -ENOMEM;
 
-                q = create_symlink(&paths, *i, new_path, !!(flags & UNIT_FILE_FORCE), changes, n_changes);
-                if (q < 0 && r >= 0)
-                        r = q;
+                RET_GATHER(r, create_symlink(&lp, path, new_path, FLAGS_SET(flags, UNIT_FILE_FORCE), changes, n_changes));
         }
 
         return r;
 }
 
-static int path_shall_revert(const LookupPaths *paths, const char *path) {
+static int path_shall_revert(const LookupPaths *lp, const char *path) {
         int r;
 
-        assert(paths);
+        assert(lp);
         assert(path);
 
         /* Checks whether the path is one where the drop-in directories shall be removed. */
 
-        r = path_is_config(paths, path, true);
+        r = path_is_config(lp, path, true);
         if (r != 0)
                 return r;
 
-        r = path_is_control(paths, path);
+        r = path_is_control(lp, path);
         if (r != 0)
                 return r;
 
-        return path_is_transient(paths, path);
+        return path_is_transient(lp, path);
 }
 
 int unit_file_revert(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *names,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_set_free_free_ Set *remove_symlinks_to = NULL;
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
+        _cleanup_set_free_ Set *remove_symlinks_to = NULL;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         _cleanup_strv_free_ char **todo = NULL;
-        size_t n_todo = 0, n_allocated = 0;
-        char **i;
+        size_t n_todo = 0;
         int r, q;
 
         /* Puts a unit file back into vendor state. This means:
          *
-         * a) we remove all drop-in snippets added by the user ("config"), add to transient units ("transient"), and
-         *    added via "systemctl set-property" ("control"), but not if the drop-in is generated ("generated").
+         * a) we remove all drop-in snippets added by the user ("config"), add to transient units
+         *    ("transient"), and added via "systemctl set-property" ("control"), but not if the drop-in is
+         *    generated ("generated").
          *
-         * c) if there's a vendor unit file (i.e. one in /usr) we remove any configured overriding unit files (i.e. in
-         *    "config", but not in "transient" or "control" or even "generated").
+         * c) if there's a vendor unit file (i.e. one in /usr) we remove any configured overriding unit files
+         *    (i.e. in "config", but not in "transient" or "control" or even "generated").
          *
          * We remove all that in both the runtime and the persistent directories, if that applies.
          */
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(i, files) {
+        STRV_FOREACH(name, names) {
                 bool has_vendor = false;
-                char **p;
 
-                if (!unit_name_is_valid(*i, UNIT_NAME_ANY))
+                if (!unit_name_is_valid(*name, UNIT_NAME_ANY))
                         return -EINVAL;
 
-                STRV_FOREACH(p, paths.search_path) {
+                STRV_FOREACH(p, lp.search_path) {
                         _cleanup_free_ char *path = NULL, *dropin = NULL;
                         struct stat st;
 
-                        path = path_make_absolute(*i, *p);
+                        path = path_make_absolute(*name, *p);
                         if (!path)
                                 return -ENOMEM;
 
-                        r = lstat(path, &st);
+                        r = RET_NERRNO(lstat(path, &st));
                         if (r < 0) {
-                                if (errno != ENOENT)
-                                        return -errno;
+                                if (r != -ENOENT)
+                                        return install_changes_add(changes, n_changes, r, path, NULL);
                         } else if (S_ISREG(st.st_mode)) {
                                 /* Check if there's a vendor version */
-                                r = path_is_vendor(&paths, path);
+                                r = path_is_vendor_or_generator(&lp, path);
                                 if (r < 0)
-                                        return r;
+                                        return install_changes_add(changes, n_changes, r, path, NULL);
                                 if (r > 0)
                                         has_vendor = true;
                         }
 
-                        dropin = strappend(path, ".d");
+                        dropin = strjoin(path, ".d");
                         if (!dropin)
                                 return -ENOMEM;
 
-                        r = lstat(dropin, &st);
+                        r = RET_NERRNO(lstat(dropin, &st));
                         if (r < 0) {
-                                if (errno != ENOENT)
-                                        return -errno;
+                                if (r != -ENOENT)
+                                        return install_changes_add(changes, n_changes, r, dropin, NULL);
                         } else if (S_ISDIR(st.st_mode)) {
                                 /* Remove the drop-ins */
-                                r = path_shall_revert(&paths, dropin);
+                                r = path_shall_revert(&lp, dropin);
                                 if (r < 0)
-                                        return r;
+                                        return install_changes_add(changes, n_changes, r, dropin, NULL);
                                 if (r > 0) {
-                                        if (!GREEDY_REALLOC0(todo, n_allocated, n_todo + 2))
+                                        if (!GREEDY_REALLOC0(todo, n_todo + 2))
                                                 return -ENOMEM;
 
                                         todo[n_todo++] = TAKE_PTR(dropin);
@@ -2334,24 +2692,24 @@ int unit_file_revert(
                         continue;
 
                 /* OK, there's a vendor version, hence drop all configuration versions */
-                STRV_FOREACH(p, paths.search_path) {
+                STRV_FOREACH(p, lp.search_path) {
                         _cleanup_free_ char *path = NULL;
                         struct stat st;
 
-                        path = path_make_absolute(*i, *p);
+                        path = path_make_absolute(*name, *p);
                         if (!path)
                                 return -ENOMEM;
 
-                        r = lstat(path, &st);
+                        r = RET_NERRNO(lstat(path, &st));
                         if (r < 0) {
-                                if (errno != ENOENT)
-                                        return -errno;
+                                if (r != -ENOENT)
+                                        return install_changes_add(changes, n_changes, r, path, NULL);
                         } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
-                                r = path_is_config(&paths, path, true);
+                                r = path_is_config(&lp, path, true);
                                 if (r < 0)
-                                        return r;
+                                        return install_changes_add(changes, n_changes, r, path, NULL);
                                 if (r > 0) {
-                                        if (!GREEDY_REALLOC0(todo, n_allocated, n_todo + 2))
+                                        if (!GREEDY_REALLOC0(todo, n_todo + 2))
                                                 return -ENOMEM;
 
                                         todo[n_todo++] = TAKE_PTR(path);
@@ -2366,7 +2724,6 @@ int unit_file_revert(
         STRV_FOREACH(i, todo) {
                 _cleanup_strv_free_ char **fs = NULL;
                 const char *rp;
-                char **j;
 
                 (void) get_files_in_directory(*i, &fs);
 
@@ -2379,26 +2736,30 @@ int unit_file_revert(
                 STRV_FOREACH(j, fs) {
                         _cleanup_free_ char *t = NULL;
 
-                        t = strjoin(*i, "/", *j);
+                        t = path_join(*i, *j);
                         if (!t)
                                 return -ENOMEM;
 
-                        unit_file_changes_add(changes, n_changes, UNIT_FILE_UNLINK, t, NULL);
+                        q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, t, NULL);
+                        if (q < 0)
+                                return q;
                 }
 
-                unit_file_changes_add(changes, n_changes, UNIT_FILE_UNLINK, *i, NULL);
+                q = install_changes_add(changes, n_changes, INSTALL_CHANGE_UNLINK, *i, NULL);
+                if (q < 0)
+                        return q;
 
-                rp = skip_root(&paths, *i);
+                rp = skip_root(lp.root_dir, *i);
                 q = mark_symlink_for_removal(&remove_symlinks_to, rp ?: *i);
                 if (q < 0)
                         return q;
         }
 
-        q = remove_marked_symlinks(remove_symlinks_to, paths.runtime_config, &paths, false, changes, n_changes);
+        q = remove_marked_symlinks(remove_symlinks_to, lp.runtime_config, &lp, false, changes, n_changes);
         if (r >= 0)
                 r = q;
 
-        q = remove_marked_symlinks(remove_symlinks_to, paths.persistent_config, &paths, false, changes, n_changes);
+        q = remove_marked_symlinks(remove_symlinks_to, lp.persistent_config, &lp, false, changes, n_changes);
         if (r >= 0)
                 r = q;
 
@@ -2406,65 +2767,65 @@ int unit_file_revert(
 }
 
 int unit_file_add_dependency(
-                UnitFileScope scope,
-                UnitFileFlags flags,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
                 const char *root_dir,
-                char **files,
+                char * const *names,
                 const char *target,
                 UnitDependency dep,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(install_context_done) InstallContext c = {};
-        UnitFileInstallInfo *i, *target_info;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        InstallInfo *info, *target_info;
         const char *config_path;
-        char **f;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
         assert(target);
-
-        if (!IN_SET(dep, UNIT_WANTS, UNIT_REQUIRES))
-                return -EINVAL;
+        assert(IN_SET(dep, UNIT_WANTS, UNIT_REQUIRES));
 
         if (!unit_name_is_valid(target, UNIT_NAME_ANY))
-                return -EINVAL;
+                return install_changes_add(changes, n_changes, -EUCLEAN, target, NULL);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = (file_flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
-        r = install_info_discover_and_check(scope, &c, &paths, target, SEARCH_FOLLOW_CONFIG_SYMLINKS,
+        r = install_info_discover_and_check(&ctx, &lp, target, SEARCH_FOLLOW_CONFIG_SYMLINKS,
                                             &target_info, changes, n_changes);
         if (r < 0)
                 return r;
 
-        assert(target_info->type == UNIT_FILE_TYPE_REGULAR);
+        assert(target_info->install_mode == INSTALL_MODE_REGULAR);
 
-        STRV_FOREACH(f, files) {
+        STRV_FOREACH(name, names) {
                 char ***l;
 
-                r = install_info_discover_and_check(scope, &c, &paths, *f, SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                                    &i, changes, n_changes);
+                r = install_info_discover_and_check(&ctx, &lp, *name,
+                                                    SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                                    &info, changes, n_changes);
                 if (r < 0)
                         return r;
 
-                assert(i->type == UNIT_FILE_TYPE_REGULAR);
+                assert(info->install_mode == INSTALL_MODE_REGULAR);
 
                 /* We didn't actually load anything from the unit
                  * file, but instead just add in our new symlink to
                  * create. */
 
                 if (dep == UNIT_WANTS)
-                        l = &i->wanted_by;
+                        l = &info->wanted_by;
+                else if (dep == UNIT_REQUIRES)
+                        l = &info->required_by;
                 else
-                        l = &i->required_by;
+                        l = &info->upheld_by;
 
                 strv_free(*l);
                 *l = strv_new(target_info->name);
@@ -2472,137 +2833,256 @@ int unit_file_add_dependency(
                         return -ENOMEM;
         }
 
-        return install_context_apply(scope, &c, &paths, config_path, !!(flags & UNIT_FILE_FORCE), SEARCH_FOLLOW_CONFIG_SYMLINKS, changes, n_changes);
+        return install_context_apply(&ctx, &lp, file_flags, config_path,
+                                     SEARCH_FOLLOW_CONFIG_SYMLINKS, changes, n_changes);
 }
 
-int unit_file_enable(
-                UnitFileScope scope,
+static int do_unit_file_enable(
+                const LookupPaths *lp,
+                RuntimeScope scope,
                 UnitFileFlags flags,
-                const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                const char *config_path,
+                char * const *names_or_paths,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(install_context_done) InstallContext c = {};
-        const char *config_path;
-        UnitFileInstallInfo *i;
-        char **f;
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        InstallInfo *info;
         int r;
 
-        assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
-        if (r < 0)
-                return r;
-
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
-        if (!config_path)
-                return -ENXIO;
-
-        STRV_FOREACH(f, files) {
-                r = install_info_discover_and_check(scope, &c, &paths, *f, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                                    &i, changes, n_changes);
+        STRV_FOREACH(name, names_or_paths) {
+                r = install_info_discover_and_check(&ctx, lp, *name,
+                                                    SEARCH_LOAD | SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                                    &info, changes, n_changes);
                 if (r < 0)
                         return r;
 
-                assert(i->type == UNIT_FILE_TYPE_REGULAR);
+                assert(info->install_mode == INSTALL_MODE_REGULAR);
         }
 
         /* This will return the number of symlink rules that were
            supposed to be created, not the ones actually created. This
-           is useful to determine whether the passed files had any
+           is useful to determine whether the passed units had any
            installation data at all. */
 
-        return install_context_apply(scope, &c, &paths, config_path, !!(flags & UNIT_FILE_FORCE), SEARCH_LOAD, changes, n_changes);
+        return install_context_apply(&ctx, lp, flags, config_path,
+                                     SEARCH_LOAD, changes, n_changes);
 }
 
-int unit_file_disable(
-                UnitFileScope scope,
+int unit_file_enable(
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *names_or_paths,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(install_context_done) InstallContext c = {};
-        _cleanup_set_free_free_ Set *remove_symlinks_to = NULL;
-        const char *config_path;
-        char **i;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        const char *config_path = config_path_from_flags(&lp, flags);
         if (!config_path)
                 return -ENXIO;
 
-        STRV_FOREACH(i, files) {
-                if (!unit_name_is_valid(*i, UNIT_NAME_ANY))
-                        return -EINVAL;
+        return do_unit_file_enable(&lp, scope, flags, config_path, names_or_paths, changes, n_changes);
+}
 
-                r = install_info_add(&c, *i, NULL, false, NULL);
+static int do_unit_file_disable(
+                const LookupPaths *lp,
+                RuntimeScope scope,
+                UnitFileFlags flags,
+                const char *config_path,
+                char * const *names,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        bool has_install_info = false;
+        int r;
+
+        assert(changes);
+        assert(n_changes);
+
+        STRV_FOREACH(name, names) {
+                InstallInfo *info;
+
+                if (!unit_name_is_valid(*name, UNIT_NAME_ANY))
+                        return install_changes_add(changes, n_changes, -EUCLEAN, *name, NULL);
+
+                r = install_info_add(&ctx, *name, NULL, lp->root_dir, /* auxiliary= */ false, &info);
+                if (r >= 0)
+                        r = install_info_traverse(&ctx, lp, info, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, NULL);
+                if (r < 0) {
+                        r = install_changes_add(changes, n_changes, r, *name, NULL);
+                        /* In case there's no unit, we still want to remove any leftover symlink, even if
+                         * the unit might have been removed already, hence treating ENOENT as non-fatal. */
+                        if (r != -ENOENT)
+                                return r;
+                }
+
+                /* If we enable multiple units, some with install info and others without,
+                 * the "empty [Install] section" warning is not shown. Let's make the behavior
+                 * of disable align with that. */
+                has_install_info = has_install_info || install_info_has_rules(info) || install_info_has_also(info);
+        }
+
+        _cleanup_set_free_ Set *remove_symlinks_to = NULL;
+        r = install_context_mark_for_removal(&ctx, lp, &remove_symlinks_to, config_path, changes, n_changes);
+        if (r >= 0)
+                r = remove_marked_symlinks(remove_symlinks_to, config_path, lp, flags & UNIT_FILE_DRY_RUN, changes, n_changes);
+        if (r < 0)
+                return r;
+
+        /* The warning is shown only if it's a no-op */
+        return install_changes_have_modification(*changes, *n_changes) || has_install_info;
+}
+
+int unit_file_disable(
+                RuntimeScope scope,
+                UnitFileFlags flags,
+                const char *root_dir,
+                char * const *files,
+                InstallChange **changes,
+                size_t *n_changes) {
+
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        int r;
+
+        assert(scope >= 0);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (r < 0)
+                return r;
+
+        const char *config_path = config_path_from_flags(&lp, flags);
+        if (!config_path)
+                return -ENXIO;
+
+        return do_unit_file_disable(&lp, scope, flags, config_path, files, changes, n_changes);
+}
+
+static int normalize_linked_files(
+                RuntimeScope scope,
+                const LookupPaths *lp,
+                char * const *names_or_paths,
+                char ***ret_names,
+                char ***ret_files) {
+
+        /* This is similar to normalize_filenames()/normalize_names() in src/systemctl/,
+         * but operates on real unit names. For each argument we look up the actual path
+         * where the unit is found. This way linked units can be re-enabled successfully. */
+
+        _cleanup_strv_free_ char **files = NULL, **names = NULL;
+        int r;
+
+        assert(lp);
+        assert(ret_names);
+        assert(ret_files);
+
+        STRV_FOREACH(a, names_or_paths) {
+                _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+                InstallInfo *i = NULL;
+                _cleanup_free_ char *n = NULL;
+
+                r = path_extract_filename(*a, &n);
+                if (r < 0)
+                        return r;
+                if (r == O_DIRECTORY)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EISDIR),
+                                               "Unexpected path to a directory \"%s\", refusing.", *a);
+
+                if (!is_path(*a) && !unit_name_is_valid(*a, UNIT_NAME_INSTANCE)) {
+                        r = install_info_discover(&ctx, lp, n, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS, &i, NULL, NULL);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to discover unit \"%s\", operating on name: %m", n);
+                }
+
+                r = strv_consume(&names, TAKE_PTR(n));
+                if (r < 0)
+                        return r;
+
+                const char *p = NULL;
+                if (i && i->path && i->root)
+                        /* Use startswith here, because we know that paths are normalized, and
+                         * path_startswith() would give us a relative path, but we need an absolute path
+                         * relative to i->root.
+                         *
+                         * In other words: /var/tmp/instroot.1234/etc/systemd/system/frobnicator.service
+                         * is replaced by /etc/systemd/system/frobnicator.service, which is "absolute"
+                         * in a sense, but only makes sense "relative" to /var/tmp/instroot.1234/.
+                         */
+                        p = startswith(i->path, i->root);
+
+                r = strv_extend(&files, p ?: *a);
                 if (r < 0)
                         return r;
         }
 
-        r = install_context_mark_for_removal(scope, &c, &paths, &remove_symlinks_to, config_path, changes, n_changes);
-        if (r < 0)
-                return r;
-
-        return remove_marked_symlinks(remove_symlinks_to, config_path, &paths, !!(flags & UNIT_FILE_DRY_RUN), changes, n_changes);
+        *ret_names = TAKE_PTR(names);
+        *ret_files = TAKE_PTR(files);
+        return 0;
 }
 
 int unit_file_reenable(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
-                char **files,
-                UnitFileChange **changes,
+                char * const *names_or_paths,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        char **n;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_strv_free_ char **names = NULL, **files = NULL;
         int r;
-        size_t l, i;
+
+        assert(scope >= 0);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
+        if (r < 0)
+                return r;
+
+        const char *config_path = config_path_from_flags(&lp, flags);
+        if (!config_path)
+                return -ENXIO;
+
+        r = normalize_linked_files(scope, &lp, names_or_paths, &names, &files);
+        if (r < 0)
+                return r;
 
         /* First, we invoke the disable command with only the basename... */
-        l = strv_length(files);
-        n = newa(char*, l+1);
-        for (i = 0; i < l; i++)
-                n[i] = basename(files[i]);
-        n[i] = NULL;
-
-        r = unit_file_disable(scope, flags, root_dir, n, changes, n_changes);
+        r = do_unit_file_disable(&lp, scope, flags, config_path, names, changes, n_changes);
         if (r < 0)
                 return r;
 
         /* But the enable command with the full name */
-        return unit_file_enable(scope, flags, root_dir, files, changes, n_changes);
+        return do_unit_file_enable(&lp, scope, flags, config_path, files, changes, n_changes);
 }
 
 int unit_file_set_default(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 UnitFileFlags flags,
                 const char *root_dir,
                 const char *name,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(install_context_done) InstallContext c = {};
-        UnitFileInstallInfo *i;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        InstallInfo *info;
         const char *new_path;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
         assert(name);
 
         if (unit_name_to_type(name) != UNIT_TARGET) /* this also validates the name */
@@ -2610,95 +3090,92 @@ int unit_file_set_default(
         if (streq(name, SPECIAL_DEFAULT_TARGET))
                 return -EINVAL;
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        r = install_info_discover_and_check(scope, &c, &paths, name, 0, &i, changes, n_changes);
+        r = install_info_discover_and_check(&ctx, &lp, name, 0, &info, changes, n_changes);
         if (r < 0)
                 return r;
 
-        new_path = strjoina(paths.persistent_config, "/" SPECIAL_DEFAULT_TARGET);
-        return create_symlink(&paths, i->path, new_path, !!(flags & UNIT_FILE_FORCE), changes, n_changes);
+        new_path = strjoina(lp.persistent_config, "/" SPECIAL_DEFAULT_TARGET);
+        return create_symlink(&lp, info->path, new_path, flags & UNIT_FILE_FORCE, changes, n_changes);
 }
 
 int unit_file_get_default(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 const char *root_dir,
-                char **name) {
+                char **ret) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(install_context_done) InstallContext c = {};
-        UnitFileInstallInfo *i;
-        char *n;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        InstallInfo *info;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(name);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+        assert(ret);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        r = install_info_discover(scope, &c, &paths, SPECIAL_DEFAULT_TARGET, SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                  &i, NULL, NULL);
-        if (r < 0)
-                return r;
-        r = install_info_may_process(i, &paths, NULL, 0);
+        r = install_info_discover(&ctx, &lp, SPECIAL_DEFAULT_TARGET, SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                  &info, NULL, NULL);
         if (r < 0)
                 return r;
 
-        n = strdup(i->name);
-        if (!n)
-                return -ENOMEM;
-
-        *name = n;
-        return 0;
+        return strdup_to(ret, info->name);
 }
 
 int unit_file_lookup_state(
-                UnitFileScope scope,
-                const LookupPaths *paths,
+                RuntimeScope scope,
+                const LookupPaths *lp,
                 const char *name,
                 UnitFileState *ret) {
 
-        _cleanup_(install_context_done) InstallContext c = {};
-        UnitFileInstallInfo *i;
+        _cleanup_(install_context_done) InstallContext ctx = { .scope = scope };
+        InstallInfo *info;
         UnitFileState state;
         int r;
 
-        assert(paths);
+        assert(lp);
         assert(name);
 
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
-        r = install_info_discover(scope, &c, paths, name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                  &i, NULL, NULL);
+        r = install_info_discover(&ctx, lp, name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                  &info, NULL, NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to discover unit %s: %m", name);
 
-        assert(IN_SET(i->type, UNIT_FILE_TYPE_REGULAR, UNIT_FILE_TYPE_MASKED));
-        log_debug("Found unit %s at %s (%s)", name, strna(i->path),
-                  i->type == UNIT_FILE_TYPE_REGULAR ? "regular file" : "mask");
+        assert(IN_SET(info->install_mode, INSTALL_MODE_REGULAR, INSTALL_MODE_MASKED));
+        log_debug("Found unit %s at %s (%s)", name, strna(info->path),
+                  info->install_mode == INSTALL_MODE_REGULAR ? "regular file" : "mask");
 
         /* Shortcut things, if the caller just wants to know if this unit exists. */
         if (!ret)
                 return 0;
 
-        switch (i->type) {
+        switch (info->install_mode) {
 
-        case UNIT_FILE_TYPE_MASKED:
-                r = path_is_runtime(paths, i->path, true);
+        case INSTALL_MODE_MASKED:
+                r = path_is_runtime(lp, info->path, true);
                 if (r < 0)
                         return r;
 
                 state = r > 0 ? UNIT_FILE_MASKED_RUNTIME : UNIT_FILE_MASKED;
                 break;
 
-        case UNIT_FILE_TYPE_REGULAR:
-                r = path_is_generator(paths, i->path);
+        case INSTALL_MODE_REGULAR:
+                /* Check if the name we were querying is actually an alias */
+                if (!path_equal_filename(name, info->path) && !unit_name_is_valid(info->name, UNIT_NAME_INSTANCE)) {
+                        state = UNIT_FILE_ALIAS;
+                        break;
+                }
+
+                r = path_is_generator(lp, info->path);
                 if (r < 0)
                         return r;
                 if (r > 0) {
@@ -2706,7 +3183,7 @@ int unit_file_lookup_state(
                         break;
                 }
 
-                r = path_is_transient(paths, i->path);
+                r = path_is_transient(lp, info->path);
                 if (r < 0)
                         return r;
                 if (r > 0) {
@@ -2717,7 +3194,7 @@ int unit_file_lookup_state(
                 /* Check if any of the Alias= symlinks have been created.
                  * We ignore other aliases, and only check those that would
                  * be created by systemctl enable for this unit. */
-                r = find_symlinks_in_scope(scope, paths, i, true, &state);
+                r = find_symlinks_in_scope(scope, lp, info, true, &state);
                 if (r < 0)
                         return r;
                 if (r > 0)
@@ -2725,15 +3202,15 @@ int unit_file_lookup_state(
 
                 /* Check if the file is known under other names. If it is,
                  * it might be in use. Report that as UNIT_FILE_INDIRECT. */
-                r = find_symlinks_in_scope(scope, paths, i, false, &state);
+                r = find_symlinks_in_scope(scope, lp, info, false, &state);
                 if (r < 0)
                         return r;
                 if (r > 0)
                         state = UNIT_FILE_INDIRECT;
                 else {
-                        if (unit_file_install_info_has_rules(i))
+                        if (install_info_has_rules(info))
                                 state = UNIT_FILE_DISABLED;
-                        else if (unit_file_install_info_has_also(i))
+                        else if (install_info_has_also(info))
                                 state = UNIT_FILE_INDIRECT;
                         else
                                 state = UNIT_FILE_STATIC;
@@ -2742,7 +3219,7 @@ int unit_file_lookup_state(
                 break;
 
         default:
-                assert_not_reached("Unexpect unit file type.");
+                assert_not_reached();
         }
 
         *ret = state;
@@ -2750,40 +3227,67 @@ int unit_file_lookup_state(
 }
 
 int unit_file_get_state(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 const char *root_dir,
                 const char *name,
                 UnitFileState *ret) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
         assert(name);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        return unit_file_lookup_state(scope, &paths, name, ret);
+        return unit_file_lookup_state(scope, &lp, name, ret);
 }
 
-int unit_file_exists(UnitFileScope scope, const LookupPaths *paths, const char *name) {
-        _cleanup_(install_context_done) InstallContext c = {};
+int unit_file_exists_full(
+                RuntimeScope scope,
+                const LookupPaths *lp,
+                SearchFlags flags,
+                const char *name,
+                char **ret_path) {
+
+        _cleanup_(install_context_done) InstallContext c = {
+                .scope = scope,
+        };
         int r;
 
-        assert(paths);
+        assert(lp);
         assert(name);
 
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
-        r = install_info_discover(scope, &c, paths, name, 0, NULL, NULL, NULL);
-        if (r == -ENOENT)
+        InstallInfo *info = NULL;
+        r = install_info_discover(
+                        &c,
+                        lp,
+                        name,
+                        flags,
+                        ret_path ? &info : NULL,
+                        /* changes= */ NULL,
+                        /* n_changes= */ NULL);
+        if (r == -ENOENT) {
+                if (ret_path)
+                        *ret_path = NULL;
                 return 0;
+        }
         if (r < 0)
                 return r;
+
+        if (ret_path) {
+                assert(info);
+
+                r = strdup_to(ret_path, info->path);
+                if (r < 0)
+                        return r;
+        }
 
         return 1;
 }
@@ -2821,33 +3325,50 @@ static int split_pattern_into_name_and_instances(const char *pattern, char **out
         return 0;
 }
 
-static int presets_find_config(UnitFileScope scope, const char *root_dir, char ***files) {
-        static const char* const system_dirs[] = {CONF_PATHS("systemd/system-preset"), NULL};
-        static const char* const user_dirs[] = {CONF_PATHS_USR("systemd/user-preset"), NULL};
+static int presets_find_config(RuntimeScope scope, const char *root_dir, char ***ret) {
+        static const char* const initrd_dirs[] = { CONF_PATHS("systemd/initrd-preset"), NULL };
+        static const char* const system_dirs[] = { CONF_PATHS("systemd/system-preset"), NULL };
+        static const char* const user_dirs[] = { CONF_PATHS("systemd/user-preset"), NULL };
         const char* const* dirs;
-
-        assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-
-        if (scope == UNIT_FILE_SYSTEM)
-                dirs = system_dirs;
-        else if (IN_SET(scope, UNIT_FILE_GLOBAL, UNIT_FILE_USER))
-                dirs = user_dirs;
-        else
-                assert_not_reached("Invalid unit file scope");
-
-        return conf_files_list_strv(files, ".preset", root_dir, 0, dirs);
-}
-
-static int read_presets(UnitFileScope scope, const char *root_dir, Presets *presets) {
-        _cleanup_(presets_freep) Presets ps = {};
-        size_t n_allocated = 0;
-        _cleanup_strv_free_ char **files = NULL;
-        char **p;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+
+        if (scope == RUNTIME_SCOPE_SYSTEM) {
+                r = chase_and_access("/etc/initrd-release", root_dir, CHASE_PREFIX_ROOT, F_OK, /* ret_path= */ NULL);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                /* Make sure that we fall back to the system preset directories if we're operating on a root
+                 * directory without initrd preset directories. This makes sure that we don't regress when
+                 * using a newer systemctl to operate on a root directory with an older version of systemd
+                 * installed that doesn't yet known about initrd preset directories. */
+                if (r >= 0)
+                        STRV_FOREACH(d, initrd_dirs) {
+                                r = chase_and_access(*d, root_dir, CHASE_PREFIX_ROOT, F_OK, /* ret_path= */ NULL);
+                                if (r >= 0)
+                                        return conf_files_list_strv(ret, ".preset", root_dir, 0, initrd_dirs);
+                                if (r != -ENOENT)
+                                        return r;
+                        }
+
+                dirs = system_dirs;
+        } else if (IN_SET(scope, RUNTIME_SCOPE_GLOBAL, RUNTIME_SCOPE_USER))
+                dirs = user_dirs;
+        else
+                assert_not_reached();
+
+        return conf_files_list_strv(ret, ".preset", root_dir, 0, dirs);
+}
+
+static int read_presets(RuntimeScope scope, const char *root_dir, UnitFilePresets *presets) {
+        _cleanup_(unit_file_presets_done) UnitFilePresets ps = {};
+        _cleanup_strv_free_ char **files = NULL;
+        int r;
+
+        assert(scope >= 0);
+        assert(scope < _RUNTIME_SCOPE_MAX);
         assert(presets);
 
         r = presets_find_config(scope, root_dir, &files);
@@ -2855,7 +3376,7 @@ static int read_presets(UnitFileScope scope, const char *root_dir, Presets *pres
                 return r;
 
         STRV_FOREACH(p, files) {
-                _cleanup_fclose_ FILE *f;
+                _cleanup_fclose_ FILE *f = NULL;
                 int n = 0;
 
                 f = fopen(*p, "re");
@@ -2868,26 +3389,23 @@ static int read_presets(UnitFileScope scope, const char *root_dir, Presets *pres
 
                 for (;;) {
                         _cleanup_free_ char *line = NULL;
-                        PresetRule rule = {};
+                        _cleanup_(unit_file_preset_rule_done) UnitFilePresetRule rule = {};
                         const char *parameter;
-                        char *l;
 
-                        r = read_line(f, LONG_LINE_MAX, &line);
+                        r = read_stripped_line(f, LONG_LINE_MAX, &line);
                         if (r < 0)
                                 return r;
                         if (r == 0)
                                 break;
 
-                        l = strstrip(line);
                         n++;
 
-                        if (isempty(l))
+                        if (isempty(line))
                                 continue;
-                        if (strchr(COMMENTS, *l))
+                        if (strchr(COMMENTS, line[0]))
                                 continue;
 
-                        parameter = first_word(l, "enable");
-                        if (parameter) {
+                        if ((parameter = first_word(line, "enable"))) {
                                 char *unit_name;
                                 char **instances = NULL;
 
@@ -2898,32 +3416,42 @@ static int read_presets(UnitFileScope scope, const char *root_dir, Presets *pres
                                         continue;
                                 }
 
-                                rule = (PresetRule) {
+                                rule = (UnitFilePresetRule) {
                                         .pattern = unit_name,
                                         .action = PRESET_ENABLE,
                                         .instances = instances,
                                 };
-                        }
 
-                        parameter = first_word(l, "disable");
-                        if (parameter) {
+                        } else if ((parameter = first_word(line, "disable"))) {
                                 char *pattern;
 
                                 pattern = strdup(parameter);
                                 if (!pattern)
                                         return -ENOMEM;
 
-                                rule = (PresetRule) {
+                                rule = (UnitFilePresetRule) {
                                         .pattern = pattern,
                                         .action = PRESET_DISABLE,
                                 };
-                        }
 
-                        if (rule.action) {
-                                if (!GREEDY_REALLOC(ps.rules, n_allocated, ps.n_rules + 1))
+                        } else if ((parameter = first_word(line, "ignore"))) {
+                                char *pattern;
+
+                                pattern = strdup(parameter);
+                                if (!pattern)
                                         return -ENOMEM;
 
-                                ps.rules[ps.n_rules++] = rule;
+                                rule = (UnitFilePresetRule) {
+                                        .pattern = pattern,
+                                        .action = PRESET_IGNORE,
+                                };
+                        }
+
+                        if (rule.action != 0) {
+                                if (!GREEDY_REALLOC(ps.rules, ps.n_rules + 1))
+                                        return -ENOMEM;
+
+                                ps.rules[ps.n_rules++] = TAKE_STRUCT(rule);
                                 continue;
                         }
 
@@ -2931,19 +3459,21 @@ static int read_presets(UnitFileScope scope, const char *root_dir, Presets *pres
                 }
         }
 
-        *presets = ps;
-        ps = (Presets){};
+        ps.initialized = true;
+        *presets = TAKE_STRUCT(ps);
 
         return 0;
 }
 
 static int pattern_match_multiple_instances(
-                        const PresetRule rule,
+                        const UnitFilePresetRule rule,
                         const char *unit_name,
                         char ***ret) {
 
         _cleanup_free_ char *templated_name = NULL;
         int r;
+
+        assert(unit_name);
 
         /* If no ret is needed or the rule itself does not have instances
          * initialized, we return not matching */
@@ -2958,20 +3488,16 @@ static int pattern_match_multiple_instances(
 
         /* Compose a list of specified instances when unit name is a template  */
         if (unit_name_is_valid(unit_name, UNIT_NAME_TEMPLATE)) {
-                _cleanup_free_ char *prefix = NULL;
                 _cleanup_strv_free_ char **out_strv = NULL;
-                char **iter;
-
-                r = unit_name_to_prefix(unit_name, &prefix);
-                if (r < 0)
-                        return r;
 
                 STRV_FOREACH(iter, rule.instances) {
                         _cleanup_free_ char *name = NULL;
-                        r = unit_name_build(prefix, *iter, ".service", &name);
+
+                        r = unit_name_replace_instance(unit_name, *iter, &name);
                         if (r < 0)
                                 return r;
-                        r = strv_extend(&out_strv, name);
+
+                        r = strv_consume(&out_strv, TAKE_PTR(name));
                         if (r < 0)
                                 return r;
                 }
@@ -2986,83 +3512,97 @@ static int pattern_match_multiple_instances(
                 if (r < 0)
                         return r;
 
-                if (strv_find(rule.instances, instance_name))
+                if (strv_contains(rule.instances, instance_name))
                         return 1;
         }
         return 0;
 }
 
-static int query_presets(const char *name, const Presets presets, char ***instance_name_list) {
+static int query_presets(const char *name, const UnitFilePresets *presets, char ***instance_name_list) {
         PresetAction action = PRESET_UNKNOWN;
-        size_t i;
-        char **s;
+
+        assert(name);
+        assert(presets);
+        POINTER_MAY_BE_NULL(instance_name_list);
+
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
-        for (i = 0; i < presets.n_rules; i++)
-                if (pattern_match_multiple_instances(presets.rules[i], name, instance_name_list) > 0 ||
-                    fnmatch(presets.rules[i].pattern, name, FNM_NOESCAPE) == 0) {
-                        action = presets.rules[i].action;
+        FOREACH_ARRAY(i, presets->rules, presets->n_rules)
+                if (pattern_match_multiple_instances(*i, name, instance_name_list) > 0 ||
+                    fnmatch(i->pattern, name, FNM_NOESCAPE) == 0) {
+                        action = i->action;
                         break;
                 }
 
         switch (action) {
+
         case PRESET_UNKNOWN:
                 log_debug("Preset files don't specify rule for %s. Enabling.", name);
-                return 1;
+                return PRESET_ENABLE;
+
         case PRESET_ENABLE:
                 if (instance_name_list && *instance_name_list)
                         STRV_FOREACH(s, *instance_name_list)
                                 log_debug("Preset files say enable %s.", *s);
                 else
                         log_debug("Preset files say enable %s.", name);
-                return 1;
+                return PRESET_ENABLE;
+
         case PRESET_DISABLE:
                 log_debug("Preset files say disable %s.", name);
-                return 0;
+                return PRESET_DISABLE;
+
+        case PRESET_IGNORE:
+                log_debug("Preset files say ignore %s.", name);
+                return PRESET_IGNORE;
+
         default:
-                assert_not_reached("invalid preset action");
+                assert_not_reached();
         }
 }
 
-int unit_file_query_preset(UnitFileScope scope, const char *root_dir, const char *name) {
-        _cleanup_(presets_freep) Presets presets = {};
+PresetAction unit_file_query_preset(RuntimeScope scope, const char *root_dir, const char *name, UnitFilePresets *cached) {
+        _cleanup_(unit_file_presets_done) UnitFilePresets tmp = {};
         int r;
 
-        r = read_presets(scope, root_dir, &presets);
-        if (r < 0)
-                return r;
+        if (!cached)
+                cached = &tmp;
+        if (!cached->initialized) {
+                r = read_presets(scope, root_dir, cached);
+                if (r < 0)
+                        return r;
+        }
 
-        return query_presets(name, presets, NULL);
+        return query_presets(name, cached, NULL);
 }
 
 static int execute_preset(
-                UnitFileScope scope,
+                UnitFileFlags file_flags,
                 InstallContext *plus,
                 InstallContext *minus,
-                const LookupPaths *paths,
+                const LookupPaths *lp,
                 const char *config_path,
-                char **files,
+                char * const *files,
                 UnitFilePresetMode mode,
-                bool force,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         int r;
 
         assert(plus);
         assert(minus);
-        assert(paths);
+        assert(lp);
         assert(config_path);
 
         if (mode != UNIT_FILE_PRESET_ENABLE_ONLY) {
-                _cleanup_set_free_free_ Set *remove_symlinks_to = NULL;
+                _cleanup_set_free_ Set *remove_symlinks_to = NULL;
 
-                r = install_context_mark_for_removal(scope, minus, paths, &remove_symlinks_to, config_path, changes, n_changes);
+                r = install_context_mark_for_removal(minus, lp, &remove_symlinks_to, config_path, changes, n_changes);
                 if (r < 0)
                         return r;
 
-                r = remove_marked_symlinks(remove_symlinks_to, config_path, paths, false, changes, n_changes);
+                r = remove_marked_symlinks(remove_symlinks_to, config_path, lp, false, changes, n_changes);
         } else
                 r = 0;
 
@@ -3070,7 +3610,10 @@ static int execute_preset(
                 int q;
 
                 /* Returns number of symlinks that where supposed to be installed. */
-                q = install_context_apply(scope, plus, paths, config_path, force, SEARCH_LOAD, changes, n_changes);
+                q = install_context_apply(plus, lp,
+                                          file_flags | UNIT_FILE_IGNORE_AUXILIARY_FAILURE,
+                                          config_path,
+                                          SEARCH_LOAD, changes, n_changes);
                 if (r >= 0) {
                         if (q < 0)
                                 r = q;
@@ -3083,29 +3626,30 @@ static int execute_preset(
 }
 
 static int preset_prepare_one(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 InstallContext *plus,
                 InstallContext *minus,
-                LookupPaths *paths,
+                LookupPaths *lp,
                 const char *name,
-                Presets presets,
-                UnitFileChange **changes,
+                const UnitFilePresets *presets,
+                InstallChange **changes,
                 size_t *n_changes) {
 
-        _cleanup_(install_context_done) InstallContext tmp = {};
+        _cleanup_(install_context_done) InstallContext tmp = { .scope = scope };
         _cleanup_strv_free_ char **instance_name_list = NULL;
-        UnitFileInstallInfo *i;
+        InstallInfo *info;
         int r;
 
         if (install_info_find(plus, name) || install_info_find(minus, name))
                 return 0;
 
-        r = install_info_discover(scope, &tmp, paths, name, SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                  &i, changes, n_changes);
+        r = install_info_discover(&tmp, lp, name, SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                  &info, changes, n_changes);
         if (r < 0)
                 return r;
-        if (!streq(name, i->name)) {
-                log_debug("Skipping %s because it is an alias for %s.", name, i->name);
+
+        if (!streq(name, info->name)) {
+                log_debug("Skipping %s because it is an alias for %s.", name, info->name);
                 return 0;
         }
 
@@ -3113,54 +3657,52 @@ static int preset_prepare_one(
         if (r < 0)
                 return r;
 
-        if (r > 0) {
-                if (instance_name_list) {
-                        char **s;
+        if (r == PRESET_ENABLE) {
+                if (instance_name_list)
                         STRV_FOREACH(s, instance_name_list) {
-                                r = install_info_discover_and_check(scope, plus, paths, *s, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                                                    &i, changes, n_changes);
+                                r = install_info_discover_and_check(plus, lp, *s, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                                                    &info, changes, n_changes);
                                 if (r < 0)
                                         return r;
                         }
-                } else {
-                        r = install_info_discover_and_check(scope, plus, paths, name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                                            &i, changes, n_changes);
+                else {
+                        r = install_info_discover_and_check(plus, lp, name, SEARCH_LOAD|SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                                            &info, changes, n_changes);
                         if (r < 0)
                                 return r;
                 }
 
-        } else
-                r = install_info_discover(scope, minus, paths, name, SEARCH_FOLLOW_CONFIG_SYMLINKS,
-                                          &i, changes, n_changes);
+        } else if (r == PRESET_DISABLE)
+                r = install_info_discover(minus, lp, name, SEARCH_FOLLOW_CONFIG_SYMLINKS,
+                                          &info, changes, n_changes);
 
         return r;
 }
 
 int unit_file_preset(
-                UnitFileScope scope,
-                UnitFileFlags flags,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
                 const char *root_dir,
-                char **files,
+                char * const *names,
                 UnitFilePresetMode mode,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(presets_freep) Presets presets = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path;
-        char **i;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(mode < _UNIT_FILE_PRESET_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+        assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = (file_flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
@@ -3168,39 +3710,38 @@ int unit_file_preset(
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(i, files) {
-                r = preset_prepare_one(scope, &plus, &minus, &paths, *i, presets, changes, n_changes);
-                if (r < 0)
+        STRV_FOREACH(name, names) {
+                r = preset_prepare_one(scope, &plus, &minus, &lp, *name, &presets, changes, n_changes);
+                if (r < 0 && !ERRNO_IS_NEG_UNIT_ISSUE(r))
                         return r;
         }
 
-        return execute_preset(scope, &plus, &minus, &paths, config_path, files, mode, !!(flags & UNIT_FILE_FORCE), changes, n_changes);
+        return execute_preset(file_flags, &plus, &minus, &lp, config_path, names, mode, changes, n_changes);
 }
 
 int unit_file_preset_all(
-                UnitFileScope scope,
-                UnitFileFlags flags,
+                RuntimeScope scope,
+                UnitFileFlags file_flags,
                 const char *root_dir,
                 UnitFilePresetMode mode,
-                UnitFileChange **changes,
+                InstallChange **changes,
                 size_t *n_changes) {
 
         _cleanup_(install_context_done) InstallContext plus = {}, minus = {};
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_(presets_freep) Presets presets = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         const char *config_path = NULL;
-        char **i;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(mode < _UNIT_FILE_PRESET_MAX);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+        assert(mode < _UNIT_FILE_PRESET_MODE_MAX);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        config_path = (flags & UNIT_FILE_RUNTIME) ? paths.runtime_config : paths.persistent_config;
+        config_path = (file_flags & UNIT_FILE_RUNTIME) ? lp.runtime_config : lp.persistent_config;
         if (!config_path)
                 return -ENXIO;
 
@@ -3208,89 +3749,77 @@ int unit_file_preset_all(
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(i, paths.search_path) {
+        STRV_FOREACH(i, lp.search_path) {
                 _cleanup_closedir_ DIR *d = NULL;
-                struct dirent *de;
 
                 d = opendir(*i);
                 if (!d) {
                         if (errno == ENOENT)
                                 continue;
 
-                        return -errno;
+                        return log_debug_errno(errno, "Failed to opendir %s: %m", *i);
                 }
 
-                FOREACH_DIRENT(de, d, return -errno) {
+                FOREACH_DIRENT(de, d,
+                               return log_debug_errno(errno, "Failed to read directory %s: %m", *i)) {
 
                         if (!unit_name_is_valid(de->d_name, UNIT_NAME_ANY))
                                 continue;
 
-                        dirent_ensure_type(d, de);
-
                         if (!IN_SET(de->d_type, DT_LNK, DT_REG))
                                 continue;
 
-                        /* we don't pass changes[] in, because we want to handle errors on our own */
-                        r = preset_prepare_one(scope, &plus, &minus, &paths, de->d_name, presets, NULL, 0);
-                        if (r == -ERFKILL)
-                                r = unit_file_changes_add(changes, n_changes,
-                                                          UNIT_FILE_IS_MASKED, de->d_name, NULL);
-                        else if (r == -ENOLINK)
-                                r = unit_file_changes_add(changes, n_changes,
-                                                          UNIT_FILE_IS_DANGLING, de->d_name, NULL);
-                        else if (r == -EADDRNOTAVAIL) /* Ignore generated/transient units when applying preset */
-                                continue;
-                        if (r < 0)
+                        r = preset_prepare_one(scope, &plus, &minus, &lp, de->d_name, &presets, changes, n_changes);
+                        if (r < 0 && !ERRNO_IS_NEG_UNIT_ISSUE(r))
                                 return r;
                 }
         }
 
-        return execute_preset(scope, &plus, &minus, &paths, config_path, NULL, mode, !!(flags & UNIT_FILE_FORCE), changes, n_changes);
+        return execute_preset(file_flags, &plus, &minus, &lp, config_path, NULL, mode, changes, n_changes);
 }
 
-static void unit_file_list_free_one(UnitFileList *f) {
+static UnitFileList* unit_file_list_free(UnitFileList *f) {
         if (!f)
-                return;
+                return NULL;
 
         free(f->path);
-        free(f);
+        return mfree(f);
 }
 
-Hashmap* unit_file_list_free(Hashmap *h) {
-        return hashmap_free_with_destructor(h, unit_file_list_free_one);
-}
+DEFINE_TRIVIAL_CLEANUP_FUNC(UnitFileList*, unit_file_list_free);
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(UnitFileList*, unit_file_list_free_one);
+DEFINE_PRIVATE_HASH_OPS_FULL(unit_file_list_hash_ops_free_free,
+                             char, string_hash_func, string_compare_func, free,
+                             UnitFileList, unit_file_list_free);
 
 int unit_file_get_list(
-                UnitFileScope scope,
+                RuntimeScope scope,
                 const char *root_dir,
-                Hashmap *h,
-                char **states,
-                char **patterns) {
+                char * const *states,
+                char * const *patterns,
+                Hashmap **ret) {
 
-        _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        char **i;
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
+        _cleanup_hashmap_free_ Hashmap *h = NULL;
         int r;
 
         assert(scope >= 0);
-        assert(scope < _UNIT_FILE_SCOPE_MAX);
-        assert(h);
+        assert(scope < _RUNTIME_SCOPE_MAX);
+        assert(ret);
 
-        r = lookup_paths_init(&paths, scope, 0, root_dir);
+        r = lookup_paths_init(&lp, scope, 0, root_dir);
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(i, paths.search_path) {
+        STRV_FOREACH(dirname, lp.search_path) {
                 _cleanup_closedir_ DIR *d = NULL;
-                struct dirent *de;
 
-                d = opendir(*i);
+                d = opendir(*dirname);
                 if (!d) {
                         if (errno == ENOENT)
                                 continue;
                         if (IN_SET(errno, ENOTDIR, EACCES)) {
-                                log_debug_errno(errno, "Failed to open \"%s\": %m", *i);
+                                log_debug_errno(errno, "Failed to open \"%s\": %m", *dirname);
                                 continue;
                         }
 
@@ -3298,7 +3827,11 @@ int unit_file_get_list(
                 }
 
                 FOREACH_DIRENT(de, d, return -errno) {
-                        _cleanup_(unit_file_list_free_onep) UnitFileList *f = NULL;
+                        if (!IN_SET(de->d_type, DT_LNK, DT_REG))
+                                continue;
+
+                        if (hashmap_contains(h, de->d_name))
+                                continue;
 
                         if (!unit_name_is_valid(de->d_name, UNIT_NAME_ANY))
                                 continue;
@@ -3306,70 +3839,78 @@ int unit_file_get_list(
                         if (!strv_fnmatch_or_empty(patterns, de->d_name, FNM_NOESCAPE))
                                 continue;
 
-                        if (hashmap_get(h, de->d_name))
+                        UnitFileState state;
+
+                        r = unit_file_lookup_state(scope, &lp, de->d_name, &state);
+                        if (r < 0)
+                                state = UNIT_FILE_BAD;
+
+                        if (!strv_isempty(states) &&
+                            !strv_contains(states, unit_file_state_to_string(state)))
                                 continue;
 
-                        dirent_ensure_type(d, de);
-
-                        if (!IN_SET(de->d_type, DT_LNK, DT_REG))
-                                continue;
-
-                        f = new0(UnitFileList, 1);
+                        _cleanup_(unit_file_list_freep) UnitFileList *f = new(UnitFileList, 1);
                         if (!f)
                                 return -ENOMEM;
 
-                        f->path = path_make_absolute(de->d_name, *i);
+                        *f = (UnitFileList) {
+                                .path = path_make_absolute(de->d_name, *dirname),
+                                .state = state,
+                        };
                         if (!f->path)
                                 return -ENOMEM;
 
-                        r = unit_file_lookup_state(scope, &paths, de->d_name, &f->state);
-                        if (r < 0)
-                                f->state = UNIT_FILE_BAD;
+                        _cleanup_free_ char *unit_name = strdup(de->d_name);
+                        if (!unit_name)
+                                return -ENOMEM;
 
-                        if (!strv_isempty(states) &&
-                            !strv_contains(states, unit_file_state_to_string(f->state)))
-                                continue;
-
-                        r = hashmap_put(h, basename(f->path), f);
+                        r = hashmap_ensure_put(&h, &unit_file_list_hash_ops_free_free, unit_name, f);
                         if (r < 0)
                                 return r;
+                        assert(r > 0);
 
-                        f = NULL; /* prevent cleanup */
+                        TAKE_PTR(unit_name);
+                        TAKE_PTR(f);
                 }
         }
 
+        *ret = TAKE_PTR(h);
         return 0;
 }
 
 static const char* const unit_file_state_table[_UNIT_FILE_STATE_MAX] = {
-        [UNIT_FILE_ENABLED] = "enabled",
+        [UNIT_FILE_ENABLED]         = "enabled",
         [UNIT_FILE_ENABLED_RUNTIME] = "enabled-runtime",
-        [UNIT_FILE_LINKED] = "linked",
-        [UNIT_FILE_LINKED_RUNTIME] = "linked-runtime",
-        [UNIT_FILE_MASKED] = "masked",
-        [UNIT_FILE_MASKED_RUNTIME] = "masked-runtime",
-        [UNIT_FILE_STATIC] = "static",
-        [UNIT_FILE_DISABLED] = "disabled",
-        [UNIT_FILE_INDIRECT] = "indirect",
-        [UNIT_FILE_GENERATED] = "generated",
-        [UNIT_FILE_TRANSIENT] = "transient",
-        [UNIT_FILE_BAD] = "bad",
+        [UNIT_FILE_LINKED]          = "linked",
+        [UNIT_FILE_LINKED_RUNTIME]  = "linked-runtime",
+        [UNIT_FILE_ALIAS]           = "alias",
+        [UNIT_FILE_MASKED]          = "masked",
+        [UNIT_FILE_MASKED_RUNTIME]  = "masked-runtime",
+        [UNIT_FILE_STATIC]          = "static",
+        [UNIT_FILE_DISABLED]        = "disabled",
+        [UNIT_FILE_INDIRECT]        = "indirect",
+        [UNIT_FILE_GENERATED]       = "generated",
+        [UNIT_FILE_TRANSIENT]       = "transient",
+        [UNIT_FILE_BAD]             = "bad",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(unit_file_state, UnitFileState);
 
-static const char* const unit_file_change_type_table[_UNIT_FILE_CHANGE_TYPE_MAX] = {
-        [UNIT_FILE_SYMLINK] = "symlink",
-        [UNIT_FILE_UNLINK] = "unlink",
-        [UNIT_FILE_IS_MASKED] = "masked",
-        [UNIT_FILE_IS_DANGLING] = "dangling",
+static const char* const install_change_type_table[_INSTALL_CHANGE_TYPE_MAX] = {
+        [INSTALL_CHANGE_SYMLINK]                 = "symlink",
+        [INSTALL_CHANGE_UNLINK]                  = "unlink",
+        [INSTALL_CHANGE_IS_MASKED]               = "masked",
+        [INSTALL_CHANGE_IS_MASKED_GENERATOR]     = "masked by generator",
+        [INSTALL_CHANGE_IS_DANGLING]             = "dangling",
+        [INSTALL_CHANGE_DESTINATION_NOT_PRESENT] = "destination not present",
+        [INSTALL_CHANGE_AUXILIARY_FAILED]        = "auxiliary unit failed",
 };
 
-DEFINE_STRING_TABLE_LOOKUP(unit_file_change_type, UnitFileChangeType);
+DEFINE_STRING_TABLE_LOOKUP(install_change_type, InstallChangeType);
 
-static const char* const unit_file_preset_mode_table[_UNIT_FILE_PRESET_MAX] = {
-        [UNIT_FILE_PRESET_FULL] = "full",
-        [UNIT_FILE_PRESET_ENABLE_ONLY] = "enable-only",
+static const char* const unit_file_preset_mode_table[_UNIT_FILE_PRESET_MODE_MAX] = {
+        [UNIT_FILE_PRESET_FULL]         = "full",
+        [UNIT_FILE_PRESET_ENABLE_ONLY]  = "enable-only",
         [UNIT_FILE_PRESET_DISABLE_ONLY] = "disable-only",
 };
 

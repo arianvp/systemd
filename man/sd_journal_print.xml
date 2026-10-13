@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_journal_print" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -22,6 +22,12 @@
     <refname>sd_journal_sendv</refname>
     <refname>sd_journal_perror</refname>
     <refname>SD_JOURNAL_SUPPRESS_LOCATION</refname>
+    <refname>sd_journal_print_with_location</refname>
+    <refname>sd_journal_printv_with_location</refname>
+    <refname>sd_journal_send_with_location</refname>
+    <refname>sd_journal_sendv_with_location</refname>
+    <refname>sd_journal_perror_with_location</refname>
+
     <refpurpose>Submit log entries to the journal</refpurpose>
   </refnamediv>
 
@@ -60,6 +66,51 @@
         <paramdef>const char *<parameter>message</parameter></paramdef>
       </funcprototype>
 
+      <funcprototype>
+        <funcdef>int <function>sd_journal_print_with_location</function></funcdef>
+        <paramdef>int <parameter>priority</parameter></paramdef>
+        <paramdef>const char *<parameter>file</parameter></paramdef>
+        <paramdef>const char *<parameter>line</parameter></paramdef>
+        <paramdef>const char *<parameter>func</parameter></paramdef>
+        <paramdef>const char *<parameter>format</parameter></paramdef>
+        <paramdef>…</paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_journal_printv_with_location</function></funcdef>
+        <paramdef>int <parameter>priority</parameter></paramdef>
+        <paramdef>const char *<parameter>file</parameter></paramdef>
+        <paramdef>const char *<parameter>line</parameter></paramdef>
+        <paramdef>const char *<parameter>func</parameter></paramdef>
+        <paramdef>const char *<parameter>format</parameter></paramdef>
+        <paramdef>va_list <parameter>ap</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_journal_send_with_location</function></funcdef>
+        <paramdef>const char *<parameter>file</parameter></paramdef>
+        <paramdef>const char *<parameter>line</parameter></paramdef>
+        <paramdef>const char *<parameter>func</parameter></paramdef>
+        <paramdef>const char *<parameter>format</parameter></paramdef>
+        <paramdef>…</paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_journal_sendv_with_location</function></funcdef>
+        <paramdef>const char *<parameter>file</parameter></paramdef>
+        <paramdef>const char *<parameter>line</parameter></paramdef>
+        <paramdef>const char *<parameter>func</parameter></paramdef>
+        <paramdef>const struct iovec *<parameter>iov</parameter></paramdef>
+        <paramdef>int <parameter>n</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_journal_perror_with_location</function></funcdef>
+        <paramdef>const char *<parameter>file</parameter></paramdef>
+        <paramdef>const char *<parameter>line</parameter></paramdef>
+        <paramdef>const char *<parameter>func</parameter></paramdef>
+        <paramdef>const char *<parameter>message</parameter></paramdef>
+      </funcprototype>
     </funcsynopsis>
   </refsynopsisdiv>
 
@@ -70,6 +121,7 @@
     journal. The first argument is a priority value. This is followed by a format string and its parameters, similar to
     <citerefentry project='man-pages'><refentrytitle>printf</refentrytitle><manvolnum>3</manvolnum></citerefentry> or
     <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
+    Note that currently the resulting message will be truncated to <constant>LINE_MAX - 8</constant>.
     The priority value is one of <constant>LOG_EMERG</constant>, <constant>LOG_ALERT</constant>,
     <constant>LOG_CRIT</constant>, <constant>LOG_ERR</constant>, <constant>LOG_WARNING</constant>,
     <constant>LOG_NOTICE</constant>, <constant>LOG_INFO</constant>, <constant>LOG_DEBUG</constant>, as defined in
@@ -111,7 +163,7 @@
     <function>sd_journal_print()</function> and <function>sd_journal_send()</function> described above, which are based
     on format strings, and do strip trailing whitespace.</para>
 
-    <para><function>sd_journal_perror()</function> is a similar to
+    <para><function>sd_journal_perror()</function> is similar to
     <citerefentry project='die-net'><refentrytitle>perror</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     and writes a message to the journal that consists of the passed
     string, suffixed with ": " and a human-readable representation of
@@ -135,11 +187,21 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
                 "PRIORITY=%i", LOG_INFO,
                 NULL);</programlisting>
 
-    <para>Note that these calls implicitly add fields for the source
-    file, function name and code line where invoked. This is
-    implemented with macros. If this is not desired, it can be turned
-    off by defining SD_JOURNAL_SUPPRESS_LOCATION before including
-    <filename>sd-journal.h</filename>.</para>
+    <para>Note that these calls implicitly add fields for the source file, function name and code line where
+    invoked. This is implemented with macros. If this is not desired, it can be turned off by defining
+    <constant>SD_JOURNAL_SUPPRESS_LOCATION</constant> before including <filename>sd-journal.h</filename>.
+    </para>
+
+    <para><function>sd_journal_print_with_location()</function>,
+    <function>sd_journal_printv_with_location()</function>, <function>sd_journal_send_with_location()</function>,
+    <function>sd_journal_sendv_with_location()</function>, and
+    <function>sd_journal_perror_with_location()</function> are similar to their counterparts without
+    <literal>_with_location</literal>, but accept additional parameters to explicitly set the source file
+    name, function, and line. The arguments <literal>file</literal> and <literal>line</literal> must contain valid
+    journal entries including the variable name, e.g. <literal>CODE_FILE=src/foo.c</literal> and
+    <literal>CODE_LINE=666</literal>, while <literal>func</literal> must only contain the function name, i.e. the value
+    without <literal>CODE_FUNC=</literal>. These variants are primarily useful when writing custom wrappers, for
+    example in bindings for a different language.</para>
 
     <para><citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     and <function>sd_journal_print()</function> may
@@ -157,14 +219,17 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
     <function>sd_journal_send()</function>. Using
     <function>syslog()</function> has the benefit of being
     more portable.</para>
+
+    <para>These functions implement a client to the <ulink
+    url="https://systemd.io/JOURNAL_NATIVE_PROTOCOL">Native Journal Protocol</ulink>.</para>
   </refsect1>
 
   <refsect1>
     <title>Return Value</title>
 
-    <para>The five calls return 0 on success or a negative errno-style error code. The <citerefentry
-    project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry> variable itself is
-    not altered.</para>
+    <para>The ten functions return 0 on success or a negative errno-style error code. The
+    <citerefentry project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+    variable itself is not altered.</para>
 
     <para>If
     <citerefentry><refentrytitle>systemd-journald</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -177,33 +242,49 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
 
     <xi:include href="threads-aware.xml" xpointer="safe"/>
 
-    <para><function>sd_journal_sendv()</function> is "async signal safe" in the meaning of <citerefentry
-    project='man-pages'><refentrytitle>signal-safety</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+    <para><function>sd_journal_sendv()</function> and <function>sd_journal_sendv_with_location()</function>
+    are "async signal safe" in the meaning of
+    <citerefentry project='man-pages'><refentrytitle>signal-safety</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
     </para>
 
-    <para><function>sd_journal_print</function>,
-    <function>sd_journal_printv</function>,
-    <function>sd_journal_send</function>, and
-    <function>sd_journal_perror</function> are
-    not async signal safe.</para>
+    <para><function>sd_journal_print()</function>,
+    <function>sd_journal_printv()</function>,
+    <function>sd_journal_send()</function>,
+    <function>sd_journal_perror()</function>,
+    and their counterparts with <literal>_with_location</literal>
+    are not async signal safe.</para>
   </refsect1>
 
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_journal_print()</function>,
+    <function>sd_journal_printv()</function>,
+    <function>sd_journal_send()</function>, and
+    <function>sd_journal_sendv()</function> were added in version 187.</para>
+    <para><function>sd_journal_perror()</function> was added in version 188.</para>
+    <para><function>sd_journal_print_with_location()</function>,
+    <function>sd_journal_printv_with_location()</function>,
+    <function>sd_journal_send_with_location()</function>,
+    <function>sd_journal_sendv_with_location()</function>, and
+    <function>sd_journal_perror_with_location()</function> were added in version 246.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_stream_fd</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='die-net'><refentrytitle>perror</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>socket</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_stream_fd</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='die-net'><refentrytitle>perror</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>socket</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

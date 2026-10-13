@@ -1,22 +1,19 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 
-#include <stdio.h>
+#include "forward.h"
 
-#include "build.h"
-#include "macro.h"
+extern PagerFlags arg_pager_flags;
 
-int info_main(int argc, char *argv[], void *userdata);
-int trigger_main(int argc, char *argv[], void *userdata);
-int settle_main(int argc, char *argv[], void *userdata);
-int control_main(int argc, char *argv[], void *userdata);
-int monitor_main(int argc, char *argv[], void *userdata);
-int hwdb_main(int argc, char *argv[], void *userdata);
-int test_main(int argc, char *argv[], void *userdata);
-int builtin_main(int argc, char *argv[], void *userdata);
-
-static inline int print_version(void) {
-        /* Dracut relies on the version being a single integer */
-        puts(STRINGIFY(PROJECT_VERSION));
-        return 0;
-}
+int verb_cat_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_info_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_trigger_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_settle_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_control_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_monitor_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_hwdb_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_test_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_builtin_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_verify_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_wait_main(int argc, char *argv[], uintptr_t _data, void *userdata);
+int verb_lock_main(int argc, char *argv[], uintptr_t _data, void *userdata);

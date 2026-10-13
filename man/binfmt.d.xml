@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 <refentry id="binfmt.d" conditional='ENABLE_BINFMT'
     xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -23,9 +23,12 @@
   </refnamediv>
 
   <refsynopsisdiv>
-    <para><filename>/etc/binfmt.d/*.conf</filename></para>
-    <para><filename>/run/binfmt.d/*.conf</filename></para>
-    <para><filename>/usr/lib/binfmt.d/*.conf</filename></para>
+    <para><simplelist>
+      <member><filename>/etc/binfmt.d/*.conf</filename></member>
+      <member><filename>/run/binfmt.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/binfmt.d/*.conf</filename></member>
+      <member><filename>/usr/lib/binfmt.d/*.conf</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -41,12 +44,12 @@
     <title>Configuration Format</title>
 
     <para>Each file contains a list of binfmt_misc kernel binary format rules. Consult the kernel's <ulink
-    url="https://www.kernel.org/doc/html/latest/admin-guide/binfmt-misc.html">binfmt-misc.rst</ulink> documentation
-    file for more information on registration of additional binary formats and how to write rules.</para>
+    url="https://docs.kernel.org/admin-guide/binfmt-misc.html">Kernel Support for
+    miscellaneous Binary Formats (binfmt_misc)</ulink> documentation file for more information on
+    registration of additional binary formats and how to write rules.</para>
 
-    <para>Empty lines and lines beginning with ; and # are ignored.
-    Note that this means you may not use ; and # as delimiter in
-    binary format rules.</para>
+    <para>Empty lines and lines beginning with <literal>;</literal> and <literal>#</literal> are ignored.
+    Note that this means you may not use those symbols as the delimiter in binary format rules.</para>
   </refsect1>
 
   <xi:include href="standard-conf.xml" xpointer="confd" />
@@ -63,12 +66,12 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-binfmt.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-delta</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='die-net'><refentrytitle>wine</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-binfmt.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-delta</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='die-net'><refentrytitle>wine</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

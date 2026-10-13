@@ -1,20 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-#include <linux/veth.h>
-#include <net/if.h>
+#include <net/ethernet.h>
 
 #include "sd-event.h"
 #include "sd-ipv4acd.h"
 #include "sd-netlink.h"
 
 #include "in-addr-util.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "tests.h"
-#include "util.h"
 
 static void acd_handler(sd_ipv4acd *acd, int event, void *userdata) {
         assert_se(acd);
@@ -30,7 +24,7 @@ static void acd_handler(sd_ipv4acd *acd, int event, void *userdata) {
                 log_error("the client was stopped");
                 break;
         default:
-                assert_not_reached("invalid ACD event");
+                assert_not_reached();
         }
 }
 
@@ -47,7 +41,7 @@ static int client_run(int ifindex, const struct in_addr *pa, const struct ether_
 
         log_info("starting IPv4ACD client");
 
-        assert_se(sd_ipv4acd_start(acd) >= 0);
+        assert_se(sd_ipv4acd_start(acd, true) >= 0);
 
         assert_se(sd_event_loop(e) >= 0);
 

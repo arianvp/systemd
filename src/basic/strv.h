@@ -1,141 +1,169 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <fnmatch.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdio.h>
+#include "forward.h"
 
-#include "alloc-util.h"
-#include "extract-word.h"
-#include "macro.h"
-#include "string-util.h"
+#include "../fundamental/strv.h"   /* IWYU pragma: export */
 
-char *strv_find(char **l, const char *name) _pure_;
-char *strv_find_prefix(char **l, const char *name) _pure_;
-char *strv_find_startswith(char **l, const char *name) _pure_;
+char* strv_find(char * const *l, const char *name) _pure_;
+char* strv_find_case(char * const *l, const char *name) _pure_;
+char* strv_find_prefix(char * const *l, const char *name) _pure_;
+char* strv_find_startswith(char * const *l, const char *name) _pure_;
+char* strv_find_closest(char * const *l, const char *name) _pure_;
+/* Given two vectors, the first a list of keys and the second a list of key-value pairs, returns the value
+ * of the first key from the first vector that is found in the second vector. */
+char* strv_find_first_field(char * const *needles, char * const *haystack) _pure_;
 
-char **strv_free(char **l);
+#define strv_contains(l, s) (!!strv_find((l), (s)))
+#define strv_contains_case(l, s) (!!strv_find_case((l), (s)))
+
+char** strv_free(char **l);
 DEFINE_TRIVIAL_CLEANUP_FUNC(char**, strv_free);
 #define _cleanup_strv_free_ _cleanup_(strv_freep)
 
-char **strv_free_erase(char **l);
+char** strv_free_erase(char **l);
 DEFINE_TRIVIAL_CLEANUP_FUNC(char**, strv_free_erase);
 #define _cleanup_strv_free_erase_ _cleanup_(strv_free_erasep)
 
-void strv_clear(char **l);
+void strv_free_many(char ***strvs, size_t n) _nonnull_if_nonzero_(1, 2);
 
-char **strv_copy(char * const *l);
+char** strv_copy_n(char * const *l, size_t n);
+static inline char** strv_copy(char * const *l) {
+        return strv_copy_n(l, SIZE_MAX);
+}
+int strv_copy_unless_empty(char * const *l, char ***ret);
+
 size_t strv_length(char * const *l) _pure_;
 
-int strv_extend_strv(char ***a, char **b, bool filter_duplicates);
-int strv_extend_strv_concat(char ***a, char **b, const char *suffix);
-int strv_extend(char ***l, const char *value);
-int strv_extendf(char ***l, const char *format, ...) _printf_(2,0);
-int strv_extend_front(char ***l, const char *value);
-int strv_push(char ***l, char *value);
+int strv_extend_strv(char ***a, char * const *b, bool filter_duplicates);
+int strv_extend_strv_consume(char ***a, char **b, bool filter_duplicates);
+
+int strv_extend_strv_biconcat(char ***a, const char *prefix, const char* const *b, const char *suffix);
+static inline int strv_extend_strv_concat(char ***a, const char* const *b, const char *suffix) {
+        return strv_extend_strv_biconcat(a, NULL, b, suffix);
+}
+
+int strv_prepend(char ***l, const char *value);
+
+/* _with_size() are lower-level functions where the size can be provided externally,
+ * which allows us to skip iterating over the strv to find the end, which saves
+ * a bit of time and reduces the complexity of appending from O(n²) to O(n). */
+
+int strv_extend_with_size(char ***l, size_t *n, const char *value);
+static inline int strv_extend(char ***l, const char *value) {
+        return strv_extend_with_size(l, NULL, value);
+}
+
+int strv_extend_many_internal(char ***l, const char *value, ...);
+#define strv_extend_many(l, ...) strv_extend_many_internal(l, __VA_ARGS__, POINTER_MAX)
+
+int strv_extendf_with_size(char ***l, size_t *n, const char *format, ...) _printf_(3,4);
+#define strv_extendf(l, ...) strv_extendf_with_size(l, NULL, __VA_ARGS__)
+
+int strv_extend_joined_with_size_sentinel(char ***l, size_t *n, ...) _sentinel_;
+#define strv_extend_joined_with_size(l, n, ...) strv_extend_joined_with_size_sentinel(l, n, __VA_ARGS__, NULL)
+#define strv_extend_joined(l, ...) strv_extend_joined_with_size(l, NULL, __VA_ARGS__)
+
+int strv_push_with_size(char ***l, size_t *n, char *value);
+static inline int strv_push(char ***l, char *value) {
+        return strv_push_with_size(l, NULL, value);
+}
 int strv_push_pair(char ***l, char *a, char *b);
+
 int strv_insert(char ***l, size_t position, char *value);
 
 static inline int strv_push_prepend(char ***l, char *value) {
         return strv_insert(l, 0, value);
 }
 
-int strv_consume(char ***l, char *value);
+int strv_consume_with_size(char ***l, size_t *n, char *value);
+static inline int strv_consume(char ***l, char *value) {
+        return strv_consume_with_size(l, NULL, value);
+}
+
 int strv_consume_pair(char ***l, char *a, char *b);
 int strv_consume_prepend(char ***l, char *value);
 
-char **strv_remove(char **l, const char *s);
-char **strv_uniq(char **l);
-bool strv_is_uniq(char **l);
+char** strv_remove(char **l, const char *s);
+char** strv_remove_strv(char **l, char *const*ll);
+char** strv_uniq(char **l);
+bool strv_is_uniq(char * const *l) _pure_;
 
-bool strv_equal(char **a, char **b);
+int strv_compare(char * const *a, char * const *b) _pure_;
+static inline bool strv_equal(char * const *a, char * const *b) {
+        return strv_compare(a, b) == 0;
+}
 
-#define strv_contains(l, s) (!!strv_find((l), (s)))
+bool strv_equal_ignore_order(char * const *a, char * const *b) _pure_;
 
-char **strv_new_internal(const char *x, ...) _sentinel_;
-char **strv_new_ap(const char *x, va_list ap);
+char** strv_new_internal(const char *x, ...) _sentinel_;
+char** strv_new_ap(const char *x, va_list ap);
 #define strv_new(...) strv_new_internal(__VA_ARGS__, NULL)
 
-#define STRV_IGNORE ((const char *) -1)
+#define STRV_IGNORE ((const char *) POINTER_MAX)
 
 static inline const char* STRV_IFNOTNULL(const char *x) {
-        return x ? x : STRV_IGNORE;
+        return x ?: STRV_IGNORE;
 }
 
-static inline bool strv_isempty(char * const *l) {
-        return !l || !*l;
+int strv_split_full(char ***t, const char *s, const char *separators, ExtractFlags flags);
+char** strv_split(const char *s, const char *separators);
+
+int strv_split_and_extend_full(char ***t, const char *s, const char *separators, bool filter_duplicates, ExtractFlags flags);
+int strv_split_and_extend(char ***t, const char *s, const char *separators, bool filter_duplicates);
+
+int strv_split_newlines_full(char ***ret, const char *s, ExtractFlags flags);
+char** strv_split_newlines(const char *s);
+
+/* Given a string containing white-space separated tuples of words themselves separated by ':',
+ * returns a vector of strings. If the second element in a tuple is missing, the corresponding
+ * string in the vector is an empty string. */
+int strv_split_colon_pairs(char ***t, const char *s);
+
+char* strv_join_full(char * const *l, const char *separator, const char *prefix);
+static inline char *strv_join(char * const *l, const char *separator) {
+        return strv_join_full(l, separator, NULL);
 }
 
-char **strv_split_full(const char *s, const char *separator, SplitFlags flags);
-static inline char **strv_split(const char *s, const char *separator) {
-        return strv_split_full(s, separator, 0);
+bool strv_overlap(char * const *a, char * const *b) _pure_;
+
+#define _STRV_FOREACH_BACKWARDS(s, l, h, i)                             \
+        for (typeof(*(l)) *s, *h = (l), *i = ({                         \
+                                size_t _len = strv_length(h);           \
+                                _len > 0 ? h + _len - 1 : NULL;         \
+                        });                                             \
+             (s = i);                                                   \
+             i = PTR_SUB1(i, h))
+
+#define STRV_FOREACH_BACKWARDS(s, l)                                    \
+        _STRV_FOREACH_BACKWARDS(s, l, UNIQ_T(h, UNIQ), UNIQ_T(i, UNIQ))
+
+#define _STRV_FOREACH_PAIR(x, y, l, i)                          \
+        for (typeof(*(l)) *x, *y, *i = (l);                     \
+             i && *(x = i) && *(y = i + 1);                     \
+             i += 2)
+
+#define STRV_FOREACH_PAIR(x, y, l)                      \
+        _STRV_FOREACH_PAIR(x, y, l, UNIQ_T(i, UNIQ))
+
+char** strv_sort(char **l);
+char** strv_sort_uniq(char **l);
+void strv_print_full(char * const *l, const char *prefix);
+static inline void strv_print(char * const *l) {
+        strv_print_full(l, NULL);
 }
-char **strv_split_newlines(const char *s);
 
-int strv_split_extract(char ***t, const char *s, const char *separators, ExtractFlags flags);
+char* startswith_strv_internal(const char *s, char * const *l);
+#define startswith_strv(s, l) const_generic(s, startswith_strv_internal(s, l))
 
-char *strv_join_prefix(char **l, const char *separator, const char *prefix);
-static inline char *strv_join(char **l, const char *separator) {
-        return strv_join_prefix(l, separator, NULL);
-}
+#define STARTSWITH_SET(p, ...)                                  \
+        startswith_strv(p, STRV_MAKE(__VA_ARGS__))
 
-char **strv_parse_nulstr(const char *s, size_t l);
-char **strv_split_nulstr(const char *s);
-int strv_make_nulstr(char **l, char **p, size_t *n);
+char* endswith_strv_internal(const char *s, char * const *l);
+#define endswith_strv(s, l) const_generic(s, endswith_strv_internal(s, l))
 
-bool strv_overlap(char **a, char **b) _pure_;
-
-#define STRV_FOREACH(s, l)                      \
-        for ((s) = (l); (s) && *(s); (s)++)
-
-#define STRV_FOREACH_BACKWARDS(s, l)                                \
-        for (s = ({                                                 \
-                        char **_l = l;                              \
-                        _l ? _l + strv_length(_l) - 1U : NULL;      \
-                        });                                         \
-             (l) && ((s) >= (l));                                   \
-             (s)--)
-
-#define STRV_FOREACH_PAIR(x, y, l)               \
-        for ((x) = (l), (y) = (x+1); (x) && *(x) && *(y); (x) += 2, (y) = (x + 1))
-
-char **strv_sort(char **l);
-void strv_print(char **l);
-
-#define STRV_MAKE(...) ((char**) ((const char*[]) { __VA_ARGS__, NULL }))
-
-#define STRV_MAKE_EMPTY ((char*[1]) { NULL })
-
-#define strv_from_stdarg_alloca(first)                          \
-        ({                                                      \
-                char **_l;                                      \
-                                                                \
-                if (!first)                                     \
-                        _l = (char**) &first;                   \
-                else {                                          \
-                        size_t _n;                              \
-                        va_list _ap;                            \
-                                                                \
-                        _n = 1;                                 \
-                        va_start(_ap, first);                   \
-                        while (va_arg(_ap, char*))              \
-                                _n++;                           \
-                        va_end(_ap);                            \
-                                                                \
-                        _l = newa(char*, _n+1);                 \
-                        _l[_n = 0] = (char*) first;             \
-                        va_start(_ap, first);                   \
-                        for (;;) {                              \
-                                _l[++_n] = va_arg(_ap, char*);  \
-                                if (!_l[_n])                    \
-                                        break;                  \
-                        }                                       \
-                        va_end(_ap);                            \
-                }                                               \
-                _l;                                             \
-        })
+#define ENDSWITH_SET(p, ...)                                    \
+        endswith_strv(p, STRV_MAKE(__VA_ARGS__))
 
 #define STR_IN_SET(x, ...) strv_contains(STRV_MAKE(__VA_ARGS__), x)
 #define STRPTR_IN_SET(x, ...)                                    \
@@ -144,47 +172,56 @@ void strv_print(char **l);
                 _x && strv_contains(STRV_MAKE(__VA_ARGS__), _x); \
         })
 
-#define STARTSWITH_SET(p, ...)                                  \
-        ({                                                      \
-                const char *_p = (p);                           \
-                char  *_found = NULL, **_i;                     \
-                STRV_FOREACH(_i, STRV_MAKE(__VA_ARGS__)) {      \
-                        _found = startswith(_p, *_i);           \
-                        if (_found)                             \
-                                break;                          \
-                }                                               \
-                _found;                                         \
+#define STRCASE_IN_SET(x, ...) strv_contains_case(STRV_MAKE(__VA_ARGS__), x)
+#define STRCASEPTR_IN_SET(x, ...)                                    \
+        ({                                                       \
+                const char* _x = (x);                            \
+                _x && strv_contains_case(STRV_MAKE(__VA_ARGS__), _x); \
         })
 
-#define FOREACH_STRING(x, y, ...)                                       \
-        for (char **_l = STRV_MAKE(({ x = y; }), ##__VA_ARGS__);        \
+#define _FOREACH_STRING(uniq, x, y, ...)                                \
+        for (const char *x, * const*UNIQ_T(l, uniq) = STRV_MAKE_CONST(({ x = y; }), ##__VA_ARGS__); \
              x;                                                         \
-             x = *(++_l))
+             x = *(++UNIQ_T(l, uniq)))
 
-char **strv_reverse(char **l);
-char **strv_shell_escape(char **l, const char *bad);
+#define FOREACH_STRING(x, y, ...)                       \
+        _FOREACH_STRING(UNIQ, x, y, ##__VA_ARGS__)
 
-bool strv_fnmatch(char* const* patterns, const char *s, int flags);
+char** strv_reverse(char **l);
+char** strv_shell_escape(char **l, const char *bad);
 
+bool strv_fnmatch_full(char* const* patterns, const char *s, int flags, size_t *ret_matched_pos);
+static inline bool strv_fnmatch(char* const* patterns, const char *s) {
+        return strv_fnmatch_full(patterns, s, 0, NULL);
+}
 static inline bool strv_fnmatch_or_empty(char* const* patterns, const char *s, int flags) {
         assert(s);
         return strv_isempty(patterns) ||
-               strv_fnmatch(patterns, s, flags);
+               strv_fnmatch_full(patterns, s, flags, NULL);
 }
 
-char ***strv_free_free(char ***l);
-DEFINE_TRIVIAL_CLEANUP_FUNC(char***, strv_free_free);
-
-char **strv_skip(char **l, size_t n);
+char** strv_skip(char **l, size_t n);
 
 int strv_extend_n(char ***l, const char *value, size_t n);
 
-int fputstrv(FILE *f, char **l, const char *separator, bool *space);
+int strv_extend_assignment(char ***l, const char *lhs, const char *rhs);
+
+int fputstrv(FILE *f, char * const *l, const char *separator, bool *space);
 
 #define strv_free_and_replace(a, b)             \
-        ({                                      \
-                strv_free(a);                   \
-                (a) = (b);                      \
-                (b) = NULL;                     \
-                0;                              \
-        })
+        free_and_replace_full(a, b, strv_free)
+
+void string_strv_hashmap_remove(Hashmap *h, const char *key, const char *value);
+void string_strv_ordered_hashmap_remove(OrderedHashmap *h, const char *key, const char *value);
+int string_strv_hashmap_put(Hashmap **h, const char *key, const char *value);
+int string_strv_ordered_hashmap_put(OrderedHashmap **h, const char *key, const char *value);
+
+int strv_rebreak_lines(char **l, size_t width, char ***ret);
+
+char** strv_filter_prefix(char * const *l, const char *prefix);
+
+/* whenever we need to initialize something with a constant non-NULL, but empty strv, we can use this shared
+ * one */
+extern const char* const strv_empty[1];
+
+#define STRV_EMPTY ((char**) strv_empty)

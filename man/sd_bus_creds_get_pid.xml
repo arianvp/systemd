@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_creds_get_pid" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -17,6 +17,7 @@
 
   <refnamediv>
     <refname>sd_bus_creds_get_pid</refname>
+    <refname>sd_bus_creds_get_pidfd_dup</refname>
     <refname>sd_bus_creds_get_ppid</refname>
     <refname>sd_bus_creds_get_tid</refname>
     <refname>sd_bus_creds_get_uid</refname>
@@ -62,6 +63,12 @@
         <funcdef>int <function>sd_bus_creds_get_pid</function></funcdef>
         <paramdef>sd_bus_creds *<parameter>c</parameter></paramdef>
         <paramdef>pid_t *<parameter>pid</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_bus_creds_get_pidfd_dup</function></funcdef>
+        <paramdef>sd_bus_creds *<parameter>c</parameter></paramdef>
+        <paramdef>int *<parameter>ret_fd</parameter></paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -289,11 +296,14 @@
     <citerefentry><refentrytitle>sd_bus_creds_get_mask</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     to determine the mask of fields available.</para>
 
-    <para><function>sd_bus_creds_get_pid()</function> will retrieve
-    the PID (process identifier). Similarly,
-    <function>sd_bus_creds_get_ppid()</function> will retrieve the
-    parent PID. Note that PID 1 has no parent process, in which case
-    -ENXIO is returned.</para>
+    <para><function>sd_bus_creds_get_pid()</function> will retrieve the PID (process identifier). Similarly,
+    <function>sd_bus_creds_get_ppid()</function> will retrieve the parent PID. Note that PID 1 has no parent
+    process, in which case -ENXIO is returned.</para>
+
+    <para><function>sd_bus_creds_get_pidfd_dup()</function> will retrieve the PID file descriptor (pidfd),
+    see <citerefentry
+    project='man-pages'><refentrytitle>pidfd_open</refentrytitle><manvolnum>2</manvolnum></citerefentry> for
+    details. The file descriptor is duplicated and thus must be closed by the caller.</para>
 
     <para><function>sd_bus_creds_get_tid()</function> will retrieve the
     TID (thread identifier).</para>
@@ -325,12 +335,14 @@
     <filename>/proc/<replaceable>pid</replaceable>/task/<replaceable>tid</replaceable>/comm</filename>).
     </para>
 
-    <para><function>sd_bus_creds_get_exe()</function> will retrieve
-    the path to the program executable (as stored in the
-    <filename>/proc/<replaceable>pid</replaceable>/exe</filename>
-    link, but with the <literal> (deleted)</literal> suffix removed). Note
-    that kernel threads do not have an executable path, in which case
-    -ENXIO is returned.</para>
+    <para><function>sd_bus_creds_get_exe()</function> will retrieve the path to the program executable (as
+    stored in the <filename>/proc/<replaceable>pid</replaceable>/exe</filename> link, but with the <literal>
+    (deleted)</literal> suffix removed). Note that kernel threads do not have an executable path, in which
+    case -ENXIO is returned. Note that this property should not be used for more than explanatory
+    information, in particular it should not be used for security-relevant decisions. That's because the
+    executable might have been replaced or removed by the time the value can be processed. Moreover, the
+    kernel exports this information in an ambiguous way (i.e. a deleted executable cannot be safely
+    distinguished from one whose name suffix is <literal> (deleted)</literal>).</para>
 
     <para><function>sd_bus_creds_get_cmdline()</function> will
     retrieve an array of command line arguments (as stored in
@@ -338,9 +350,8 @@
     that kernel threads do not have a command line, in which case
     -ENXIO is returned.</para>
 
-    <para><function>sd_bus_creds_get_cgroup()</function> will retrieve
-    the control group path. See <ulink
-    url="https://www.kernel.org/doc/Documentation/cgroup-v1/cgroups.txt">cgroups.txt</ulink>.
+    <para><function>sd_bus_creds_get_cgroup()</function> will retrieve the control group path. See <ulink
+    url="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Groups v2</ulink>.
     </para>
 
     <para><function>sd_bus_creds_get_unit()</function> will retrieve
@@ -420,12 +431,12 @@
 
     <para><function>sd_bus_creds_get_unique_name()</function> will
     retrieve the D-Bus unique name. See <ulink
-    url="http://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-bus">The
+    url="https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-bus">The
     D-Bus specification</ulink>.</para>
 
     <para><function>sd_bus_creds_get_well_known_names()</function> will
     retrieve the set of D-Bus well-known names. See <ulink
-    url="http://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-bus">The
+    url="https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-names-bus">The
     D-Bus specification</ulink>.</para>
 
     <para><function>sd_bus_creds_get_description()</function> will
@@ -437,14 +448,14 @@
 
     <para>All functions that take a <parameter>const
     char**</parameter> parameter will store the answer there as an
-    address of a NUL-terminated string. It will be valid as long as
+    address of a <constant>NUL</constant>-terminated string. It will be valid as long as
     <parameter>c</parameter> remains valid, and should not be freed or
     modified by the caller.</para>
 
     <para>All functions that take a <parameter>char***</parameter>
     parameter will store the answer there as an address of an array
-    of strings. Each individual string is NUL-terminated, and the
-    array is NULL-terminated as a whole. It will be valid as long as
+    of strings. Each individual string is <constant>NUL</constant>-terminated, and the
+    array is <constant>NULL</constant>-terminated as a whole. It will be valid as long as
     <parameter>c</parameter> remains valid, and should not be freed or
     modified by the caller.</para>
   </refsect1>
@@ -504,22 +515,61 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_creds_get_pid()</function>,
+    <function>sd_bus_creds_get_tid()</function>,
+    <function>sd_bus_creds_get_gid()</function>,
+    <function>sd_bus_creds_get_comm()</function>,
+    <function>sd_bus_creds_get_tid_comm()</function>,
+    <function>sd_bus_creds_get_exe()</function>,
+    <function>sd_bus_creds_get_cmdline()</function>,
+    <function>sd_bus_creds_get_cgroup()</function>,
+    <function>sd_bus_creds_get_unit()</function>,
+    <function>sd_bus_creds_get_user_unit()</function>,
+    <function>sd_bus_creds_get_slice()</function>,
+    <function>sd_bus_creds_get_session()</function>,
+    <function>sd_bus_creds_get_owner_uid()</function>,
+    <function>sd_bus_creds_has_effective_cap()</function>,
+    <function>sd_bus_creds_has_permitted_cap()</function>,
+    <function>sd_bus_creds_has_inheritable_cap()</function>,
+    <function>sd_bus_creds_has_bounding_cap()</function>,
+    <function>sd_bus_creds_get_selinux_context()</function>,
+    <function>sd_bus_creds_get_audit_session_id()</function>,
+    <function>sd_bus_creds_get_audit_login_uid()</function>,
+    <function>sd_bus_creds_get_unique_name()</function>,
+    <function>sd_bus_creds_get_well_known_names()</function>,
+    <function>sd_bus_creds_get_ppid()</function>,
+    <function>sd_bus_creds_get_uid()</function>,
+    <function>sd_bus_creds_get_euid()</function>,
+    <function>sd_bus_creds_get_suid()</function>,
+    <function>sd_bus_creds_get_fsuid()</function>,
+    <function>sd_bus_creds_get_egid()</function>,
+    <function>sd_bus_creds_get_sgid()</function>,
+    <function>sd_bus_creds_get_fsgid()</function>,
+    <function>sd_bus_creds_get_supplementary_gids()</function>,
+    <function>sd_bus_creds_get_tty()</function>,
+    <function>sd_bus_creds_get_description()</function>, and
+    <function>sd_bus_creds_get_user_slice()</function> were added in version 221.</para>
+    <para><function>sd_bus_creds_get_pidfd_dup()</function> was added in version 256.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_creds_new_from_pid</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>fork</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>execve</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>credentials</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>proc</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_creds_new_from_pid</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>fork</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>execve</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>credentials</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>proc</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # udevadm(8) completion                                   -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -16,7 +17,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -30,16 +31,48 @@ __get_all_sysdevs() {
     printf '%s\n' "${devs[@]%/}"
 }
 
-__get_all_devs() {
-    local i
-    for i in /dev/* /dev/*/*; do
-        echo $i
-    done
+__get_all_device_nodes() {
+    find /dev -xtype b -o -xtype c
 }
 
 __get_all_device_units() {
-    systemctl list-units -t device --full --no-legend --no-pager 2>/dev/null | \
+    systemctl list-units -t device --full --no-legend --no-pager --plain 2>/dev/null |
         { while read -r a b; do echo "$a"; done; }
+}
+
+__get_all_devices() {
+    __get_all_sysdevs
+    __get_all_device_nodes
+    __get_all_device_units
+}
+
+__get_root() {
+    local i
+
+    for ((i=0; i < COMP_CWORD; i++)); do
+        if [[ "${COMP_WORDS[i]}" = --root=* ]]; then
+            echo "${COMP_WORDS[i]#--root=}"
+            break
+        fi
+        if (( i > 0 )) && [[ "${COMP_WORDS[i-1]}" == "--root" ]]; then
+            echo "${COMP_WORDS[i]}"
+            break
+        fi
+    done
+}
+
+__get_udev_rules_files() {
+    local root=$( __get_root )
+
+    ls "$root"/usr/lib/udev/rules.d/*.rules \
+       "$root"/usr/local/lib/udev/rules.d/*.rules \
+       "$root"/run/udev/rules.d/*.rules \
+       "$root"/etc/udev/rules.d/*.rules 2>/dev/null
+}
+
+__get_udev_rules_names() {
+    local -a rules=( $( __get_udev_rules_files ) )
+    printf '%s\n' "${rules[@]##*/}"
 }
 
 _udevadm() {
@@ -48,23 +81,36 @@ _udevadm() {
     local -A OPTS=(
         [COMMON]='-h --help -V --version'
         [DEBUG]='-d --debug'
-        [INFO_STANDALONE]='-r --root -a --attribute-walk -x --export -e --export-db -c --cleanup-db
-                           -w --wait-for-initialization'
-        [INFO_ARG]='-q --query -p --path -n --name -P --export-prefix -d --device-id-of-file'
-        [TRIGGER_STANDALONE]='-v --verbose -n --dry-run -w --settle --wait-daemon'
+        [INFO_STANDALONE]='-r --root -a --attribute-walk -t --tree -x --export -e --export-db -c --cleanup-db
+                           -w --wait-for-initialization --value --no-pager --initialized-match --initialized-nomatch'
+        [INFO_ARG]='-q --query -p --path -n --name -P --export-prefix -d --device-id-of-file --property
+                    --json --subsystem-match --subsystem-nomatch --attr-match --attr-nomatch --property-match
+                    --tag-match --sysname-match --name-match --parent-match'
+        [TRIGGER_STANDALONE]='-v --verbose -n --dry-run -q --quiet -w --settle --wait-daemon --uuid
+                              --initialized-match --initialized-nomatch --include-parents'
         [TRIGGER_ARG]='-t --type -c --action -s --subsystem-match -S --subsystem-nomatch
                        -a --attr-match -A --attr-nomatch -p --property-match
-                       -g --tag-match -y --sysname-match --name-match -b --parent-match'
+                       -g --tag-match -y --sysname-match --name-match -b --parent-match
+                       --prioritized-subsystem'
         [SETTLE]='-t --timeout -E --exit-if-exists'
-        [CONTROL_STANDALONE]='-e --exit -s --stop-exec-queue -S --start-exec-queue -R --reload --ping'
-        [CONTROL_ARG]='-l --log-priority -p --property -m --children-max -t --timeout'
+        [CONTROL_STANDALONE]='-e --exit -s --stop-exec-queue -S --start-exec-queue -R --reload --ping --revert
+                              --load-credentials'
+        [CONTROL_ARG]='-l --log-priority -p --property -m --children-max -t --timeout --trace'
         [MONITOR_STANDALONE]='-k --kernel -u --udev -p --property'
         [MONITOR_ARG]='-s --subsystem-match -t --tag-match'
-        [TEST]='-a --action -N --resolve-names'
+        [TEST_STANDALONE]='-v --verbose'
+        [TEST_ARG]='-a --action -N --resolve-names -D --extra-rules-dir --json'
+        [TEST_BUILTIN]='-a --action'
+        [VERIFY_STANDALONE]='--no-summary --no-style'
+        [VERIFY_ARG]='-N --resolve-names --root'
+        [CAT_STANDALONE]='--tldr --config'
+        [CAT_ARG]='--root'
+        [WAIT]='-t --timeout --initialized=no --removed --settle'
+        [LOCK]='-t --timeout -d --device -b --backing -p --print'
     )
 
-    local verbs=(info trigger settle control monitor test-builtin test)
-    local builtins=(blkid btrfs hwdb input_id keyboard kmod net_id net_setup_link path_id usb_id uaccess)
+    local verbs=(info trigger settle control monitor test-builtin test verify cat wait lock)
+    local builtins=(blkid btrfs dissect_image factory_reset hwdb input_id keyboard kmod net_driver net_id net_setup_link path_id uaccess usb_id)
 
     for ((i=0; i < COMP_CWORD; i++)); do
         if __contains_word "${COMP_WORDS[i]}" "${verbs[@]}"; then
@@ -73,7 +119,7 @@ _udevadm() {
         fi
     done
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         if [[ "$cur" = -* ]]; then
             COMPREPLY=( $(compgen -W '${OPTS[COMMON]} ${OPTS[DEBUG]}' -- "$cur") )
         else
@@ -94,7 +140,17 @@ _udevadm() {
                         local IFS=$'\n'
                         ;;
                     -n|--name)
-                        comps=$( __get_all_devs )
+                        comps=$( __get_all_device_nodes )
+                        ;;
+                    --json)
+                        comps=$( udevadm info --json=help )
+                        ;;
+                    --parent-match)
+                        comps=$( __get_all_sysdevs )
+                        local IFS=$'\n'
+                        ;;
+                    --name-match)
+                        comps=$( __get_all_device_nodes )
                         ;;
                     *)
                         comps=''
@@ -107,7 +163,7 @@ _udevadm() {
             if [[ $cur = -* ]]; then
                 comps="${OPTS[COMMON]} ${OPTS[INFO_STANDALONE]} ${OPTS[INFO_ARG]}"
             else
-                comps=$( __get_all_sysdevs; __get_all_device_units )
+                comps=$( __get_all_devices )
                 local IFS=$'\n'
             fi
             ;;
@@ -116,17 +172,17 @@ _udevadm() {
             if __contains_word "$prev" ${OPTS[TRIGGER_ARG]}; then
                 case $prev in
                     -t|--type)
-                        comps='devices subsystems'
+                        comps='all devices subsystems'
                         ;;
                     -c|--action)
-                        comps='add change remove bind unbind'
+                        comps=$( udevadm trigger --action help )
                         ;;
                     -y|--sysname-match|-b|--parent-match)
                         comps=$( __get_all_sysdevs )
                         local IFS=$'\n'
                         ;;
                     --name-match)
-                        comps=$( __get_all_devs )
+                        comps=$( __get_all_device_nodes )
                         ;;
                     *)
                         comps=''
@@ -139,7 +195,7 @@ _udevadm() {
             if [[ $cur = -* ]]; then
                 comps="${OPTS[COMMON]} ${OPTS[TRIGGER_STANDALONE]} ${OPTS[TRIGGER_ARG]}"
             else
-                comps=$( __get_all_sysdevs; __get_all_device_units )
+                comps=$( __get_all_devices )
                 local IFS=$'\n'
             fi
             ;;
@@ -167,6 +223,9 @@ _udevadm() {
                     -l|--log-priority)
                         comps='alert crit debug emerg err info notice warning'
                         ;;
+                    --trace)
+                        comps='yes no'
+                        ;;
                     *)
                         comps=''
                         ;;
@@ -193,28 +252,41 @@ _udevadm() {
             ;;
 
         'test')
-            if __contains_word "$prev" ${OPTS[TEST]}; then
+            if __contains_word "$prev" ${OPTS[TEST_ARG]}; then
                 case $prev in
                     -a|--action)
-                        comps='add change remove bind unbind'
+                        comps=$( udevadm test --action help )
                         ;;
                     -N|--resolve-names)
-                        comps='early late never'
+                        comps=$( udevadm test --resolve-names help )
+                        ;;
+                    -D|--extra-rules-dir)
+                        comps=''
+                        compopt -o dirnames
+                        ;;
+                    --json)
+                        comps=$( udevadm test --json help )
+                        ;;
+                esac
+            elif [[ $cur = -* ]]; then
+                comps="${OPTS[COMMON]} ${OPTS[TEST_ARG]} ${OPTS[TEST_STANDALONE]}"
+            else
+                comps=$( __get_all_devices )
+                local IFS=$'\n'
+            fi
+            ;;
+
+        'test-builtin')
+            if __contains_word "$prev" ${OPTS[TEST_BUILTIN]}; then
+                case $prev in
+                    -a|--action)
+                        comps=$( udevadm test-builtin --action help )
                         ;;
                 esac
                 COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
                 return 0
             fi
 
-            if [[ $cur = -* ]]; then
-                comps="${OPTS[COMMON]} ${OPTS[TEST]}"
-            else
-                comps=$( __get_all_sysdevs )
-                local IFS=$'\n'
-            fi
-            ;;
-
-        'test-builtin')
             for ((i=0; i < COMP_CWORD; i++)); do
                 if __contains_word "${COMP_WORDS[i]}" "${builtins[@]}"; then
                     builtin=${COMP_WORDS[i]}
@@ -225,10 +297,96 @@ _udevadm() {
             if [[ -z $builtin ]]; then
                 comps="${builtins[@]}"
             elif [[ $cur = -* ]]; then
-                comps="${OPTS[COMMON]}"
+                comps="${OPTS[COMMON]} ${OPTS[TEST_BUILTIN]}"
             else
-                comps=$( __get_all_sysdevs )
+                comps=$( __get_all_devices )
                 local IFS=$'\n'
+            fi
+            ;;
+
+        'verify')
+            if __contains_word "$prev" ${OPTS[VERIFY_ARG]}; then
+                case $prev in
+                    -N|--resolve-names)
+                        comps=$( udevadm test --resolve-names help )
+                        ;;
+                    --root)
+                        comps=''
+                        compopt -o dirnames
+                        ;;
+                    *)
+                        comps=''
+                        ;;
+                esac
+            elif [[ $cur = -* ]]; then
+                comps="${OPTS[COMMON]} ${OPTS[VERIFY_ARG]} ${OPTS[VERIFY_STANDALONE]}"
+            elif [[ $cur = */* ]]; then
+                comps=$( __get_udev_rules_files )
+                compopt -o dirnames
+            else
+                comps=$( __get_udev_rules_names )
+                compopt -o default
+            fi
+            ;;
+
+        'cat')
+            if __contains_word "$prev" ${OPTS[CAT_ARG]}; then
+                case $prev in
+                    --root)
+                        comps=''
+                        compopt -o dirnames
+                        ;;
+                    *)
+                        comps=''
+                        ;;
+                esac
+            elif [[ $cur = -* ]]; then
+                comps="${OPTS[COMMON]} ${OPTS[CAT_ARG]} ${OPTS[CAT_STANDALONE]}"
+            elif __contains_word "--config" ${COMP_WORDS[*]}; then
+                comps="${OPTS[COMMON]} ${OPTS[CAT_ARG]} ${OPTS[CAT_STANDALONE]}"
+            elif [[ $cur = */* ]]; then
+                comps=$( __get_udev_rules_files )
+                compopt -o dirnames
+            else
+                comps=$( __get_udev_rules_names )
+                compopt -o default
+            fi
+            ;;
+
+        'wait')
+            if __contains_word "$prev" ${OPTS[WAIT]}; then
+                case $prev in
+                    *)
+                        comps=''
+                        ;;
+                esac
+                COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
+                return 0
+            fi
+
+            if [[ $cur = -* ]]; then
+                comps="${OPTS[COMMON]} ${OPTS[WAIT]}"
+            else
+                comps=$( __get_all_devices )
+                local IFS=$'\n'
+            fi
+            ;;
+
+        'lock')
+            if __contains_word "$prev" ${OPTS[LOCK]}; then
+                case $prev in
+                    *)
+                        comps=''
+                        ;;
+                esac
+                COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
+                return 0
+            fi
+
+            if [[ $cur = -* ]]; then
+                comps="${OPTS[COMMON]} ${OPTS[LOCK]}"
+            else
+                comps=''
             fi
             ;;
 

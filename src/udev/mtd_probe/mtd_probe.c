@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright © 2010 - Maxim Levitsky
  *
@@ -18,42 +18,78 @@
  * Boston, MA  02110-1301  USA
  */
 
-#include <errno.h>
 #include <fcntl.h>
 #include <mtd/mtd-user.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
-#include "alloc-util.h"
+#include "sd-json.h"
+
+#include "build.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "log.h"
+#include "main-func.h"
 #include "mtd_probe.h"
+#include "strv.h"
+#include "verbs.h"
 
-int main(int argc, char** argv) {
-        _cleanup_close_ int mtd_fd = -1;
-        mtd_info_t mtd_info;
+static const char *arg_device = NULL;
 
-        if (argc != 2) {
-                printf("usage: mtd_probe /dev/mtd[n]\n");
-                return EXIT_FAILURE;
-        }
+COMMAND(
+        "mtd_probe\0",
+        "Probe MTD devices.",
+        .argspec = "/dev/mtdN\0",
+);
 
-        mtd_fd = open(argv[1], O_RDONLY|O_CLOEXEC);
-        if (mtd_fd < 0) {
-                log_error_errno(errno, "Failed to open: %m");
-                return EXIT_FAILURE;
-        }
+static int parse_argv(int argc, char *argv[]) {
+        assert(argc >= 0);
+        assert(argv);
 
-        if (ioctl(mtd_fd, MEMGETINFO, &mtd_info) < 0) {
-                log_error_errno(errno, "Failed to issue MEMGETINFO ioctl: %m");
-                return EXIT_FAILURE;
-        }
+        OptionParser opts = { argc, argv };
 
-        if (probe_smart_media(mtd_fd, &mtd_info) < 0)
-                return EXIT_FAILURE;
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
 
-        return EXIT_SUCCESS;
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+                }
+
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Need exactly one DEVICE argument.");
+
+        arg_device = args[0];
+        return 1;
 }
+
+static int run(int argc, char** argv) {
+        _cleanup_close_ int mtd_fd = -EBADF;
+        mtd_info_t mtd_info;
+        int r;
+
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
+
+        mtd_fd = open(arg_device, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        if (mtd_fd < 0) {
+                bool ignore = ERRNO_IS_DEVICE_ABSENT_OR_EMPTY(errno);
+                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, errno,
+                               "Failed to open device node '%s'%s: %m",
+                               arg_device, ignore ? ", ignoring" : "");
+                return ignore ? 0 : -errno;
+        }
+
+        if (ioctl(mtd_fd, MEMGETINFO, &mtd_info) < 0)
+                return log_error_errno(errno, "MEMGETINFO ioctl failed: %m");
+
+        return probe_smart_media(mtd_fd, &mtd_info);
+}
+
+DEFINE_MAIN_FUNCTION(run);

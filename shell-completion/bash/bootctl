@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # bootctl(1) completion                               -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -24,26 +25,56 @@ __contains_word () {
 }
 
 __get_entry_ids() {
-    bootctl --no-pager list 2>/dev/null | { while read -r a b; do [[ $a == 'id:' ]] && echo " $b"; done }
+    bootctl --no-pager list 2>/dev/null | { while read -r a b; do [[ $a == 'id:' ]] && echo " $b"; done; }
 }
 
 _bootctl() {
     local i verb comps
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     local -A OPTS=(
-        [STANDALONE]='-h --help --no-variables -p --print-esp-path -x --print-boot-path --version --no-pager'
-        [ARG]='--esp-path --boot-path'
+        [STANDALONE]='-h --help --version
+                      -p --print-esp-path -x --print-boot-path --print-loader-path
+                      --print-stub-path -R --print-root-device -RR
+                      --print-efi-architecture
+                      --no-pager --graceful -q --quiet --all-architectures
+                      -n --dry-run'
+        [ARG]='--esp-path --boot-path --root --image --image-policy --install-source
+               --variables --random-seed --make-entry-directory --entry-token --json
+               --efi-boot-option-description --efi-boot-option-description-with-device
+               --secure-boot-auto-enroll --private-key
+               --private-key-source --certificate --certificate-source
+               --oldest --keep-free --entry-title --entry-version --entry-commit
+               -X --extra --tries-left'
     )
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
         case $prev in
-            --esp-path|--boot-path)
+            --esp-path|--boot-path|--private-key|--certificate)
                 if [[ -z $cur ]]; then
                     comps=$(compgen -A directory -- "/" )
                 else
                     comps=$(compgen -A directory -- "$cur" )
                 fi
                 compopt -o filenames
+                ;;
+            --make-entry-directory)
+                comps="yes no auto"
+                ;;
+            --entry-token)
+                comps="machine-id os-id os-image-id auto literal:"
+                ;;
+            --image|--root|-X|--extra)
+                compopt -o nospace
+                comps=$( compgen -A file -- "$cur" )
+                ;;
+            --install-source)
+                comps="image host auto"
+                ;;
+            --random-seed|--variables|--secure-boot-auto-enroll|--oldest|--efi-boot-option-description-with-device)
+                comps="yes no"
+                ;;
+            --json)
+                comps=$( bootctl --json=help 2>/dev/null )
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
@@ -56,8 +87,10 @@ _bootctl() {
     fi
 
     local -A VERBS=(
-        [STANDALONE]='help install list remove status update'
-        [BOOTENTRY]='set-default set-oneshot'
+        [STANDALONE]='help status install update remove is-installed random-seed list set-timeout set-timeout-oneshot cleanup link-auto'
+        [BOOTENTRY]='set-default set-oneshot set-sysfail set-preferred unlink'
+        [BOOLEAN]='reboot-to-firmware'
+        [FILE]='kernel-identify kernel-inspect link'
     )
 
     for ((i=0; i < COMP_CWORD; i++)); do
@@ -67,7 +100,7 @@ _bootctl() {
         fi
     done
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
     elif __contains_word "$verb" ${VERBS[STANDALONE]}; then
         comps=''
@@ -77,7 +110,7 @@ _bootctl() {
             if ! __contains_word "${COMP_WORDS[i]}" ${OPTS[*]} ${VERBS[*]} &&
                     ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                 name=${COMP_WORDS[i]}
-                break;
+                break
             fi
         done
 
@@ -86,6 +119,11 @@ _bootctl() {
         else
             comps=''
         fi
+    elif __contains_word "$verb" ${VERBS[BOOLEAN]}; then
+        comps="yes no"
+    elif __contains_word "$verb" ${VERBS[FILE]}; then
+        comps=$( compgen -A file -- "$cur" )
+        compopt -o filenames
     fi
 
     COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

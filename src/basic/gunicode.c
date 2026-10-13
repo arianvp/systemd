@@ -1,8 +1,11 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* gunicode.c - Unicode manipulation functions
  *
  *  Copyright (C) 1999, 2000 Tom Tromey
  *  Copyright © 2000, 2005 Red Hat, Inc.
  */
+
+#include <stdlib.h>
 
 #include "gunicode.h"
 
@@ -24,6 +27,8 @@
 char *
 utf8_prev_char (const char *p)
 {
+  assert(p);
+
   for (;;)
     {
       p--;
@@ -91,7 +96,7 @@ unichar_iswide (unichar c)
     {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
   };
 
-  if (bsearch ((void *)(uintptr_t)c, wide, (sizeof (wide) / sizeof ((wide)[0])), sizeof wide[0],
+  if (bsearch ((void *)(uintptr_t)c, wide, ELEMENTSOF(wide), sizeof wide[0],
                interval_compare))
     return true;
 

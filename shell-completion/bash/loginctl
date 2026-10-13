@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # loginctl(1) completion                                  -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -16,7 +17,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -25,14 +26,15 @@ __contains_word () {
     done
 }
 
-__get_all_sessions () { loginctl --no-legend list-sessions | { while read -r a b; do printf "%s\n" "$a"; done; } ; }
-__get_all_users    () { loginctl --no-legend list-users    | { while read -r a b; do printf "%s\n" "$b"; done; } ; }
-__get_all_seats    () { loginctl --no-legend list-seats    | { while read -r a b; do printf "%s\n" "$a"; done; } ; }
+__get_all_sessions () { loginctl --no-legend list-sessions 2>/dev/null | { while read -r a b; do printf "%s\n" "$a"; done; } ; }
+__get_all_users    () { loginctl --no-legend list-users    2>/dev/null | { while read -r a b; do printf "%s\n" "$b"; done; } ; }
+__get_all_seats    () { loginctl --no-legend list-seats    2>/dev/null | { while read -r a b; do printf "%s\n" "$a"; done; } ; }
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager 2>/dev/null |
-        { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 _loginctl () {
@@ -41,9 +43,9 @@ _loginctl () {
 
     local -A OPTS=(
         [STANDALONE]='--all -a --help -h --no-pager --version
-                      --no-legend --no-ask-password -l --full --value'
-        [ARG]='--host -H --kill-who --property -p --signal -s -M --machine
-                      -n --lines -o --output'
+                      --no-legend --no-ask-password -l --full --value -j'
+        [ARG]='--host -H --kill-whom --property -p --signal -s -M --machine
+                      -n --lines -o --output -P --json'
     )
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
@@ -52,7 +54,7 @@ _loginctl () {
                 _signals
                 return
                 ;;
-            --kill-who)
+            --kill-whom|--kill-who)
                 comps='all leader'
                 ;;
             --host|-H)
@@ -61,17 +63,19 @@ _loginctl () {
             --machine|-M)
                 comps=$( __get_machines )
                 ;;
-            --property|-p)
+            --property|-p|-P)
                 comps=''
                 ;;
             --output|-o)
                 comps=$( loginctl --output=help 2>/dev/null )
                 ;;
+            --json)
+                comps=$( loginctl --json=help 2>/dev/null )
+                ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
         return 0
     fi
-
 
     if [[ "$cur" = -* ]]; then
         COMPREPLY=( $(compgen -W '${OPTS[*]}' -- "$cur") )
@@ -94,7 +98,7 @@ _loginctl () {
         fi
     done
 
-    if   [[ -z $verb ]]; then
+    if   [[ -z ${verb-} ]]; then
         comps="${VERBS[*]}"
 
     elif __contains_word "$verb" ${VERBS[SESSIONS]}; then

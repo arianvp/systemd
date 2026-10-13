@@ -1,12 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <malloc.h>
-#include <stdint.h>
-#include <string.h>
 
 #include "alloc-util.h"
-#include "macro.h"
-#include "memory-util.h"
 
 void* memdup(const void *p, size_t l) {
         void *ret;
@@ -17,8 +13,7 @@ void* memdup(const void *p, size_t l) {
         if (!ret)
                 return NULL;
 
-        memcpy(ret, p, l);
-        return ret;
+        return memcpy_safe(ret, p, l);
 }
 
 void* memdup_suffix0(const void *p, size_t l) {
@@ -35,78 +30,145 @@ void* memdup_suffix0(const void *p, size_t l) {
         if (!ret)
                 return NULL;
 
-        *((uint8_t*) mempcpy(ret, p, l)) = 0;
-        return ret;
+        ((uint8_t*) ret)[l] = 0;
+        return memcpy_safe(ret, p, l);
 }
 
-void* greedy_realloc(void **p, size_t *allocated, size_t need, size_t size) {
-        size_t a, newalloc;
+size_t malloc_sizeof_safe(void **xp) {
+        POINTER_MAY_BE_NULL(xp);
+
+        if (_unlikely_(!xp || !*xp))
+                return 0;
+
+        /* Prevent the compiler from retaining a tighter object-size bound on *xp from a prior allocator call
+         * (e.g. realloc()). This adds a simple no-op barrier after which the *xp pointer becomes clobbered,
+         * which forces clang to skip fortify checks. Without this, clang's __builtin_dynamic_object_size()
+         * (used with _FORTIFY_SOURCE=3) keeps the requested-size bound from realloc() and ignores
+         * expand_to_usable()'s __alloc_size__, causing false-positive fortify failures when we zero the
+         * malloc_usable_size() region in realloc0()/greedy_realloc0(). */
+        asm volatile("" : "+r"(*xp));
+
+        size_t sz = malloc_usable_size(*xp);
+        *xp = expand_to_usable(*xp, sz);
+        /* GCC doesn't see the _returns_nonnull_ when built with ubsan, so yet another hint to make it doubly
+         * clear that expand_to_usable won't return NULL.
+         * See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=79265 */
+        if (!*xp)
+                assert_not_reached();
+        return sz;
+}
+
+void* expand_to_usable(void *ptr, size_t newsize _unused_) {
+        return ptr;
+}
+
+void* realloc0(void *p, size_t new_size) {
+        size_t old_size;
+        void *q;
+
+        /* Like realloc(), but initializes anything appended to zero */
+
+        old_size = MALLOC_SIZEOF_SAFE(p);
+
+        q = realloc(p, new_size);
+        if (!q)
+                return NULL;
+
+        new_size = MALLOC_SIZEOF_SAFE(q); /* Update with actually allocated space */
+
+        if (new_size > old_size)
+                memset((uint8_t*) q + old_size, 0, new_size - old_size);
+
+        return q;
+}
+
+void* greedy_realloc(
+                void **p,
+                size_t need,
+                size_t size) {
+
+        size_t newalloc;
         void *q;
 
         assert(p);
-        assert(allocated);
 
-        if (*allocated >= need)
+        /* We use malloc_usable_size() for determining the current allocated size. On all systems we care
+         * about this should be safe to rely on. Should there ever arise the need to avoid relying on this we
+         * can instead locally fall back to realloc() on every call, rounded up to the next exponent of 2 or
+         * so. */
+
+        if (*p && (size == 0 || (MALLOC_SIZEOF_SAFE(*p) / size >= need)))
                 return *p;
 
         if (_unlikely_(need > SIZE_MAX/2)) /* Overflow check */
                 return NULL;
-
         newalloc = need * 2;
-        if (size_multiply_overflow(newalloc, size))
+
+        if (!MUL_ASSIGN_SAFE(&newalloc, size))
                 return NULL;
 
-        a = newalloc * size;
-        if (a < 64) /* Allocate at least 64 bytes */
-                a = 64;
+        if (newalloc < 64) /* Allocate at least 64 bytes */
+                newalloc = 64;
 
-        q = realloc(*p, a);
+        q = realloc(*p, newalloc);
         if (!q)
                 return NULL;
 
-        if (size > 0) {
-                size_t bn;
-
-                /* Adjust for the 64 byte minimum */
-                newalloc = a / size;
-
-                bn = malloc_usable_size(q) / size;
-                if (bn > newalloc) {
-                        void *qq;
-
-                        /* The actual size allocated is larger than what we asked for. Let's call realloc() again to
-                         * take possession of the extra space. This should be cheap, since libc doesn't have to move
-                         * the memory for this. */
-
-                        qq = realloc(q, bn * size);
-                        if (_likely_(qq)) {
-                                *p = qq;
-                                *allocated = bn;
-                                return qq;
-                        }
-                }
-        }
-
-        *p = q;
-        *allocated = newalloc;
-        return q;
+        return *p = q;
 }
 
-void* greedy_realloc0(void **p, size_t *allocated, size_t need, size_t size) {
-        size_t prev;
+void* greedy_realloc0(
+                void **p,
+                size_t need,
+                size_t size) {
+
+        size_t before, after;
         uint8_t *q;
 
         assert(p);
-        assert(allocated);
 
-        prev = *allocated;
+        before = MALLOC_SIZEOF_SAFE(*p); /* malloc_usable_size() will return 0 on NULL input, as per docs */
 
-        q = greedy_realloc(p, allocated, need, size);
+        q = greedy_realloc(p, need, size);
         if (!q)
                 return NULL;
 
-        if (*allocated > prev)
-                memzero(q + prev * size, (*allocated - prev) * size);
+        after = MALLOC_SIZEOF_SAFE(q);
+
+        if (size == 0) /* avoid division by zero */
+                before = 0;
+        else
+                before = (before / size) * size; /* Round down */
+
+        if (after > before)
+                memzero(q + before, after - before);
+
+        return q;
+}
+
+void* greedy_realloc_append(
+                void **p,
+                size_t *n_p,
+                const void *from,
+                size_t n_from,
+                size_t size) {
+
+        uint8_t *q;
+
+        assert(p);
+        assert(n_p);
+        assert(from || n_from == 0);
+
+        if (n_from > SIZE_MAX - *n_p)
+                return NULL;
+
+        q = greedy_realloc(p, *n_p + n_from, size);
+        if (!q)
+                return NULL;
+
+        memcpy_safe(q + *n_p * size, from, n_from * size);
+
+        *n_p += n_from;
 
         return q;
 }

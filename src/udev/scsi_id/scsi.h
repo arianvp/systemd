@@ -1,17 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 
-/*
- * scsi.h
- *
- * General scsi and linux scsi specific defines and structs.
- *
- * Copyright (C) IBM Corp. 2003
- *
- *        This program is free software; you can redistribute it and/or modify it
- *        under the terms of the GNU General Public License as published by the
- *        Free Software Foundation version 2 of the License.
- */
+/* Copyright (C) IBM Corp. 2003 */
 
 #include <scsi/scsi.h>
 
@@ -34,7 +24,7 @@ struct scsi_ioctl_command {
  * as this is a nice value for some devices, especially some of the usb
  * mass storage devices.
  */
-#define SCSI_INQ_BUFF_LEN 254
+#define SCSI_INQ_BUFF_LEN 254U
 
 /*
  * SCSI INQUIRY vendor and model (really product) lengths.

@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_session_is_active" conditional='HAVE_PAM'
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -21,7 +21,9 @@
     <refname>sd_session_is_remote</refname>
     <refname>sd_session_get_state</refname>
     <refname>sd_session_get_uid</refname>
+    <refname>sd_session_get_username</refname>
     <refname>sd_session_get_seat</refname>
+    <refname>sd_session_get_start_time</refname>
     <refname>sd_session_get_service</refname>
     <refname>sd_session_get_type</refname>
     <refname>sd_session_get_class</refname>
@@ -31,6 +33,8 @@
     <refname>sd_session_get_vt</refname>
     <refname>sd_session_get_remote_host</refname>
     <refname>sd_session_get_remote_user</refname>
+    <refname>sd_session_get_leader</refname>
+    <refname>sd_session_get_extra_device_access</refname>
     <refpurpose>Determine state of a specific session</refpurpose>
   </refnamediv>
 
@@ -61,9 +65,21 @@
       </funcprototype>
 
       <funcprototype>
+        <funcdef>int <function>sd_session_get_username</function></funcdef>
+        <paramdef>const char *<parameter>session</parameter></paramdef>
+        <paramdef>char **<parameter>username</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
         <funcdef>int <function>sd_session_get_seat</function></funcdef>
         <paramdef>const char *<parameter>session</parameter></paramdef>
         <paramdef>char **<parameter>seat</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_session_get_start_time</function></funcdef>
+        <paramdef>const char *<parameter>session</parameter></paramdef>
+        <paramdef>uint64_t *<parameter>usec</parameter></paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -97,6 +113,12 @@
       </funcprototype>
 
       <funcprototype>
+        <funcdef>int <function>sd_session_get_leader</function></funcdef>
+        <paramdef>const char *<parameter>session</parameter></paramdef>
+        <paramdef>pid_t *<parameter>leader</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
         <funcdef>int <function>sd_session_get_remote_host</function></funcdef>
         <paramdef>const char *<parameter>session</parameter></paramdef>
         <paramdef>char **<parameter>remote_host</parameter></paramdef>
@@ -118,6 +140,12 @@
         <funcdef>int <function>sd_session_get_vt</function></funcdef>
         <paramdef>const char *<parameter>session</parameter></paramdef>
         <paramdef>unsigned int *<parameter>vt</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_session_get_extra_device_access</function></funcdef>
+        <paramdef>const char *<parameter>session</parameter></paramdef>
+        <paramdef>char ***<parameter>ret_ids</parameter></paramdef>
       </funcprototype>
     </funcsynopsis>
   </refsynopsisdiv>
@@ -155,6 +183,13 @@
     determine the user identifier of the Unix user the session
     identified by the specified session identifier belongs to.</para>
 
+    <para><function>sd_session_get_username()</function> may be used to
+    determine the name of the Unix user the session identified by
+    the specified session identifier belongs to. The returned string
+    needs to be freed with the libc
+    <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+    call after use.</para>
+
     <para><function>sd_session_get_seat()</function> may be used to
     determine the seat identifier of the seat the session identified
     by the specified session identifier belongs to. Note that not all
@@ -163,6 +198,11 @@
     to be freed with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use.</para>
+
+    <para><function>sd_session_get_start_time()</function> may be used to
+    determine the start time of the session identified by the specified
+    session identifier belongs to. The <parameter>usec</parameter>
+    is in microseconds since the epoch (<constant>CLOCK_REALTIME</constant>).</para>
 
     <para><function>sd_session_get_service()</function> may be used to
     determine the name of the service (as passed during PAM session
@@ -181,14 +221,14 @@
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use.</para>
 
-    <para><function>sd_session_get_class()</function> may be used to
-    determine the class of the session identified by the specified
-    session identifier. The returned string is one of
-    <literal>user</literal>, <literal>greeter</literal>,
-    <literal>lock-screen</literal>, or <literal>background</literal>
-    and needs to be freed with the libc
-    <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    call after use.</para>
+    <para><function>sd_session_get_class()</function> may be used to determine the class of the session
+    identified by the specified session identifier. The returned string is one of <literal>user</literal>,
+    <literal>user-early</literal>, <literal>user-light</literal>, <literal>user-early-light</literal>,
+    <literal>user-incomplete</literal>, <literal>greeter</literal>, <literal>lock-screen</literal>,
+    <literal>background</literal>, <literal>background-light</literal>, <literal>manager</literal> or
+    <literal>manager-early</literal> and needs to be freed with the libc <citerefentry
+    project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry> call after
+    use.</para>
 
     <para><function>sd_session_get_desktop()</function> may be used to
     determine the brand of the desktop running on the session
@@ -197,7 +237,7 @@
     formatting. However, desktops are strongly recommended to use the
     same identifiers and capitalization as for
     <varname>$XDG_CURRENT_DESKTOP</varname>, as defined by the <ulink
-    url="http://standards.freedesktop.org/desktop-entry-spec/latest/">Desktop
+    url="https://standards.freedesktop.org/desktop-entry-spec/latest/">Desktop
     Entry Specification</ulink>. The returned string needs to be freed
     with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
@@ -209,6 +249,10 @@
     freed with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use.</para>
+
+    <para><function>sd_session_get_leader()</function> may be used to
+    determine the PID of the leader of the session identified by the
+    specified session identifier.</para>
 
     <para><function>sd_session_get_remote_host()</function> may be
     used to determine the remote hostname of the session identified by
@@ -237,6 +281,12 @@
     session identifier. This function will return an error if the seat
     does not support VTs.</para>
 
+    <para><function>sd_session_get_extra_device_access()</function> may
+    be used to determine which additional hardware devices the session
+    is granted access to. For every <literal><replaceable>ID</replaceable></literal>
+    in the list, the session is granted access to all devices tagged with
+    <literal>xaccess-<replaceable>ID</replaceable></literal> in udev.</para>
+
     <para>If the <varname>session</varname> parameter of any of these
     functions is passed as <constant>NULL</constant>, the operation is
     executed for the session the calling process is a member of, if
@@ -248,19 +298,22 @@
 
     <para>If the test succeeds,
     <function>sd_session_is_active()</function> and
-    <function>sd_session_is_remote()</function> return a
-    positive integer; if it fails, 0.  On success,
+    <function>sd_session_is_remote()</function>
+    return a positive integer; if it fails, 0.  On success,
     <function>sd_session_get_state()</function>,
     <function>sd_session_get_uid()</function>,
+    <function>sd_session_get_username()</function>,
     <function>sd_session_get_seat()</function>,
     <function>sd_session_get_service()</function>,
     <function>sd_session_get_type()</function>,
     <function>sd_session_get_class()</function>,
     <function>sd_session_get_display()</function>,
+    <function>sd_session_get_leader()</function>,
     <function>sd_session_get_remote_user()</function>,
-    <function>sd_session_get_remote_host()</function> and
-    <function>sd_session_get_tty()</function> return 0 or
-    a positive integer. On failure, these calls return a
+    <function>sd_session_get_remote_host()</function>,
+    <function>sd_session_get_tty()</function>, and
+    <function>sd_session_get_extra_device_access()</function>
+    return 0 or a positive integer. On failure, these calls return a
     negative errno-style error code.</para>
 
     <refsect2>
@@ -303,13 +356,28 @@
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_session_get_state()</function> was added in version 186.</para>
+    <para><function>sd_session_get_tty()</function> was added in version 198.</para>
+    <para><function>sd_session_get_vt()</function> was added in version 207.</para>
+    <para><function>sd_session_is_remote()</function>,
+    <function>sd_session_get_remote_host()</function>, and
+    <function>sd_session_get_remote_user()</function> were added in version 209.</para>
+    <para><function>sd_session_get_desktop()</function> was added in version 217.</para>
+    <para><function>sd_session_get_username()</function>,
+    <function>sd_session_get_start_time()</function>, and
+    <function>sd_session_get_leader()</function> were added in version 254.</para>
+    <para><function>sd_session_get_extra_device_access()</function> was added in version 260.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

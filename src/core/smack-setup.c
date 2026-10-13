@@ -1,33 +1,33 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2013 Intel Corporation
   Authors:
         Nathaniel Chen <nathaniel.chen@intel.com>
 ***/
 
-#include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
+
+#include "sd-messages.h"
 
 #include "alloc-util.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "log.h"
-#include "macro.h"
 #include "smack-setup.h"
 #include "string-util.h"
-#include "util.h"
 
 #if ENABLE_SMACK
 
 static int fdopen_unlocked_at(int dfd, const char *dir, const char *name, int *status, FILE **ret_file) {
         int fd, r;
         FILE *f;
+
+        assert(status);
+        assert(ret_file);
 
         fd = openat(dfd, name, O_RDONLY|O_CLOEXEC);
         if (fd < 0) {
@@ -51,36 +51,36 @@ static int fdopen_unlocked_at(int dfd, const char *dir, const char *name, int *s
 }
 
 static int write_access2_rules(const char *srcdir) {
-        _cleanup_close_ int load2_fd = -1, change_fd = -1;
+        _cleanup_close_ int load2_fd = -EBADF, change_fd = -EBADF;
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *entry;
-        int dfd = -1, r = 0;
+        int dfd, r;
 
-        load2_fd = open("/sys/fs/smackfs/load2", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
-        if (load2_fd < 0)  {
-                if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to open '/sys/fs/smackfs/load2': %m");
-                return -errno; /* negative error */
+        load2_fd = r = RET_NERRNO(open("/sys/fs/smackfs/load2", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        if (r < 0)  {
+                if (r != -ENOENT)
+                        log_warning_errno(r, "Failed to open %s: %m", "/sys/fs/smackfs/load2");
+                return r;
         }
 
-        change_fd = open("/sys/fs/smackfs/change-rule", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
-        if (change_fd < 0)  {
-                if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to open '/sys/fs/smackfs/change-rule': %m");
-                return -errno; /* negative error */
+        change_fd = r = RET_NERRNO(open("/sys/fs/smackfs/change-rule", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        if (r < 0)  {
+                if (r != -ENOENT)
+                        log_warning_errno(r, "Failed to open %s: %m", "/sys/fs/smackfs/change-rule");
+                return r;
         }
 
         /* write rules to load2 or change-rule from every file in the directory */
         dir = opendir(srcdir);
         if (!dir) {
                 if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to opendir '%s': %m", srcdir);
+                        log_warning_errno(errno, "Failed to open %s/: %m", srcdir);
                 return errno; /* positive on purpose */
         }
 
         dfd = dirfd(dir);
         assert(dfd >= 0);
 
+        r = 0;
         FOREACH_DIRENT(entry, dir, return 0) {
                 _cleanup_fclose_ FILE *policy = NULL;
 
@@ -97,7 +97,7 @@ static int write_access2_rules(const char *srcdir) {
 
                         q = read_line(policy, NAME_MAX, &buf);
                         if (q < 0)
-                                return log_error_errno(q, "Failed to read line from '%s': %m", entry->d_name);
+                                return log_error_errno(q, "%s/%s: failed to read line: %m", srcdir, entry->d_name);
                         if (q == 0)
                                 break;
 
@@ -107,15 +107,17 @@ static int write_access2_rules(const char *srcdir) {
                         /* if 3 args -> load rule   : subject object access1 */
                         /* if 4 args -> change rule : subject object access1 access2 */
                         if (sscanf(buf, "%ms %ms %ms %ms", &sbj, &obj, &acc1, &acc2) < 3) {
-                                log_error_errno(errno, "Failed to parse rule '%s' in '%s', ignoring.", buf, entry->d_name);
+                                log_error_errno(errno, "%s/%s: failed to parse rule '%s', ignoring.",
+                                                srcdir, entry->d_name, buf);
                                 continue;
                         }
 
-                        if (write(isempty(acc2) ? load2_fd : change_fd, buf, strlen(buf)) < 0) {
-                                if (r == 0)
-                                        r = -errno;
-                                log_error_errno(errno, "Failed to write '%s' to '%s' in '%s': %m",
-                                                buf, isempty(acc2) ? "/sys/fs/smackfs/load2" : "/sys/fs/smackfs/change-rule", entry->d_name);
+                        q = RET_NERRNO(write(isempty(acc2) ? load2_fd : change_fd, buf, strlen(buf)));
+                        if (q < 0) {
+                                log_error_errno(q, "%s/%s: failed to write '%s' to '%s': %m",
+                                                srcdir, entry->d_name,
+                                                buf, isempty(acc2) ? "/sys/fs/smackfs/load2" : "/sys/fs/smackfs/change-rule");
+                                RET_GATHER(r, q);
                         }
                 }
         }
@@ -124,29 +126,29 @@ static int write_access2_rules(const char *srcdir) {
 }
 
 static int write_cipso2_rules(const char *srcdir) {
-        _cleanup_close_ int cipso2_fd = -1;
+        _cleanup_close_ int cipso2_fd = -EBADF;
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *entry;
-        int dfd = -1, r = 0;
+        int dfd, r;
 
-        cipso2_fd = open("/sys/fs/smackfs/cipso2", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
-        if (cipso2_fd < 0)  {
-                if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to open '/sys/fs/smackfs/cipso2': %m");
-                return -errno; /* negative error */
+        cipso2_fd = r = RET_NERRNO(open("/sys/fs/smackfs/cipso2", O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        if (r < 0)  {
+                if (r != -ENOENT)
+                        log_warning_errno(r, "Failed to open %s: %m", "/sys/fs/smackfs/cipso2");
+                return r;
         }
 
         /* write rules to cipso2 from every file in the directory */
         dir = opendir(srcdir);
         if (!dir) {
                 if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to opendir '%s': %m", srcdir);
+                        log_warning_errno(errno, "Failed to open %s/: %m", srcdir);
                 return errno; /* positive on purpose */
         }
 
         dfd = dirfd(dir);
         assert(dfd >= 0);
 
+        r = 0;
         FOREACH_DIRENT(entry, dir, return 0) {
                 _cleanup_fclose_ FILE *policy = NULL;
 
@@ -163,18 +165,20 @@ static int write_cipso2_rules(const char *srcdir) {
 
                         q = read_line(policy, NAME_MAX, &buf);
                         if (q < 0)
-                                return log_error_errno(q, "Failed to read line from '%s': %m", entry->d_name);
+                                return log_error_errno(q, "%s/%s: failed to read line: %m",
+                                                       srcdir, entry->d_name);
                         if (q == 0)
                                 break;
 
                         if (isempty(buf) || strchr(COMMENTS, buf[0]))
                                 continue;
 
-                        if (write(cipso2_fd, buf, strlen(buf)) < 0) {
-                                if (r == 0)
-                                        r = -errno;
-                                log_error_errno(errno, "Failed to write '%s' to '/sys/fs/smackfs/cipso2' in '%s': %m",
-                                                buf, entry->d_name);
+                        q = RET_NERRNO(write(cipso2_fd, buf, strlen(buf)));
+                        if (q < 0) {
+                                log_error_errno(q, "%s/%s: failed to write '%s' to %s: %m",
+                                                srcdir, entry->d_name,
+                                                buf, "/sys/fs/smackfs/cipso2");
+                                RET_GATHER(r, q);
                                 break;
                         }
                 }
@@ -186,13 +190,12 @@ static int write_cipso2_rules(const char *srcdir) {
 static int write_netlabel_rules(const char *srcdir) {
         _cleanup_fclose_ FILE *dst = NULL;
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *entry;
-        int dfd = -1, r = 0;
+        int dfd, r;
 
         dst = fopen("/sys/fs/smackfs/netlabel", "we");
         if (!dst)  {
                 if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to open /sys/fs/smackfs/netlabel: %m");
+                        log_warning_errno(errno, "Failed to open %s/: %m", "/sys/fs/smackfs/netlabel");
                 return -errno; /* negative error */
         }
 
@@ -200,13 +203,14 @@ static int write_netlabel_rules(const char *srcdir) {
         dir = opendir(srcdir);
         if (!dir) {
                 if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to opendir %s: %m", srcdir);
+                        log_warning_errno(errno, "Failed to open %s/: %m", srcdir);
                 return errno; /* positive on purpose */
         }
 
         dfd = dirfd(dir);
         assert(dfd >= 0);
 
+        r = 0;
         FOREACH_DIRENT(entry, dir, return 0) {
                 _cleanup_fclose_ FILE *policy = NULL;
 
@@ -220,21 +224,20 @@ static int write_netlabel_rules(const char *srcdir) {
 
                         q = read_line(policy, NAME_MAX, &buf);
                         if (q < 0)
-                                return log_error_errno(q, "Failed to read line from %s: %m", entry->d_name);
+                                return log_error_errno(q, "%s/%s: failed to read line: %m",
+                                                       srcdir, entry->d_name);
                         if (q == 0)
                                 break;
 
                         if (!fputs(buf, dst)) {
-                                if (r == 0)
-                                        r = -EINVAL;
-                                log_error_errno(errno, "Failed to write line to /sys/fs/smackfs/netlabel: %m");
+                                log_error_errno(errno, "Failed to write line to %s: %m", "/sys/fs/smackfs/netlabel");
+                                RET_GATHER(r, -errno);
                                 break;
                         }
                         q = fflush_and_check(dst);
                         if (q < 0) {
-                                if (r == 0)
-                                        r = q;
-                                log_error_errno(q, "Failed to flush writes to /sys/fs/smackfs/netlabel: %m");
+                                log_error_errno(q, "Failed to flush %s: %m", "/sys/fs/smackfs/netlabel");
+                                RET_GATHER(r, q);
                                 break;
                         }
                 }
@@ -244,16 +247,16 @@ static int write_netlabel_rules(const char *srcdir) {
 }
 
 static int write_onlycap_list(void) {
-        _cleanup_close_ int onlycap_fd = -1;
+        _cleanup_close_ int onlycap_fd = -EBADF;
         _cleanup_free_ char *list = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        size_t len = 0, allocated = 0;
+        size_t len = 0;
         int r;
 
         f = fopen("/etc/smack/onlycap", "re");
         if (!f) {
                 if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to read '/etc/smack/onlycap': %m");
+                        log_warning_errno(errno, "Failed to open %s: %m", "/etc/smack/onlycap");
 
                 return errno == ENOENT ? ENOENT : -errno;
         }
@@ -264,7 +267,7 @@ static int write_onlycap_list(void) {
 
                 r = read_line(f, LONG_LINE_MAX, &buf);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to read line from /etc/smack/onlycap: %m");
+                        return log_error_errno(r, "%s: failed to read line: %m", "/etc/smack/onlycap");
                 if (r == 0)
                         break;
 
@@ -272,7 +275,7 @@ static int write_onlycap_list(void) {
                         continue;
 
                 l = strlen(buf);
-                if (!GREEDY_REALLOC(list, allocated, len + l + 1))
+                if (!GREEDY_REALLOC(list, len + l + 1))
                         return log_oom();
 
                 stpcpy(list + len, buf)[0] = ' ';
@@ -284,16 +287,17 @@ static int write_onlycap_list(void) {
 
         list[len - 1] = 0;
 
-        onlycap_fd = open("/sys/fs/smackfs/onlycap", O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
-        if (onlycap_fd < 0) {
-                if (errno != ENOENT)
-                        log_warning_errno(errno, "Failed to open '/sys/fs/smackfs/onlycap': %m");
-                return -errno; /* negative error */
+        onlycap_fd = r = RET_NERRNO(open("/sys/fs/smackfs/onlycap", O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        if (r < 0) {
+                if (r != -ENOENT)
+                        log_warning_errno(r, "Failed to open %s: %m", "/sys/fs/smackfs/onlycap");
+                return r;
         }
 
-        r = write(onlycap_fd, list, len);
+        r = RET_NERRNO(write(onlycap_fd, list, len));
         if (r < 0)
-                return log_error_errno(errno, "Failed to write onlycap list(%s) to '/sys/fs/smackfs/onlycap': %m", list);
+                return log_error_errno(r, "%s: failed to write onlycap list(%s): %m",
+                                       "/sys/fs/smackfs/onlycap", list);
 
         return 0;
 }
@@ -303,13 +307,12 @@ static int write_onlycap_list(void) {
 int mac_smack_setup(bool *loaded_policy) {
 
 #if ENABLE_SMACK
-
         int r;
 
         assert(loaded_policy);
 
-        r = write_access2_rules("/etc/smack/accesses.d/");
-        switch(r) {
+        r = write_access2_rules("/etc/smack/accesses.d");
+        switch (r) {
         case -ENOENT:
                 log_debug("Smack is not enabled in the kernel.");
                 return 0;
@@ -324,7 +327,7 @@ int mac_smack_setup(bool *loaded_policy) {
                 return 0;
         }
 
-#ifdef SMACK_RUN_LABEL
+#if HAVE_SMACK_RUN_LABEL
         r = write_string_file("/proc/self/attr/current", SMACK_RUN_LABEL, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
                 log_warning_errno(r, "Failed to set SMACK label \"" SMACK_RUN_LABEL "\" on self: %m");
@@ -340,8 +343,8 @@ int mac_smack_setup(bool *loaded_policy) {
                 log_warning_errno(r, "Failed to set SMACK netlabel rule \"127.0.0.1 -CIPSO\": %m");
 #endif
 
-        r = write_cipso2_rules("/etc/smack/cipso.d/");
-        switch(r) {
+        r = write_cipso2_rules("/etc/smack/cipso.d");
+        switch (r) {
         case -ENOENT:
                 log_debug("Smack/CIPSO is not enabled in the kernel.");
                 return 0;
@@ -353,11 +356,10 @@ int mac_smack_setup(bool *loaded_policy) {
                 break;
         default:
                 log_warning_errno(r, "Failed to load Smack/CIPSO access rules, ignoring: %m");
-                break;
         }
 
-        r = write_netlabel_rules("/etc/smack/netlabel.d/");
-        switch(r) {
+        r = write_netlabel_rules("/etc/smack/netlabel.d");
+        switch (r) {
         case -ENOENT:
                 log_debug("Smack/CIPSO is not enabled in the kernel.");
                 return 0;
@@ -369,11 +371,10 @@ int mac_smack_setup(bool *loaded_policy) {
                 break;
         default:
                 log_warning_errno(r, "Failed to load Smack network host rules: %m, ignoring.");
-                break;
         }
 
         r = write_onlycap_list();
-        switch(r) {
+        switch (r) {
         case -ENOENT:
                 log_debug("Smack is not enabled in the kernel.");
                 break;
@@ -384,8 +385,9 @@ int mac_smack_setup(bool *loaded_policy) {
                 log_info("Successfully wrote Smack onlycap list.");
                 break;
         default:
-                log_emergency_errno(r, "Failed to write Smack onlycap list: %m");
-                return r;
+                return log_struct_errno(LOG_EMERG, r,
+                                        LOG_MESSAGE("Failed to write Smack onlycap list: %m"),
+                                        LOG_MESSAGE_ID(SD_MESSAGE_SMACK_FAILED_WRITE_STR));
         }
 
         *loaded_policy = true;

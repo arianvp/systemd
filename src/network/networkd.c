@@ -1,83 +1,104 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-event.h"
 
+#include "bus-log-control-api.h"
+#include "bus-object.h"
 #include "capability-util.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "networkd-conf.h"
 #include "networkd-manager.h"
-#include "signal-util.h"
+#include "networkd-manager-bus.h"
+#include "networkd-serialize.h"
+#include "service-util.h"
+#include "strv.h"
 #include "user-util.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-networkd\0",
+        "Manage and configure network devices, create virtual network devices.",
+        .man_pages = "systemd-networkd.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
-        const char *user = "systemd-network";
-        uid_t uid;
-        gid_t gid;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
-        log_setup_service();
+        LIBIDN2_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+
+        log_setup();
+
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object, &log_control_object),
+                               /* runtime_scope= */ NULL,
+                               argc, argv);
+        if (r <= 0)
+                return r;
 
         umask(0022);
 
         if (argc != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
-        r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
-        if (r < 0)
-                return log_error_errno(r, "Cannot resolve user name %s: %m", user);
-
-        /* Create runtime directory. This is not necessary when networkd is
-         * started with "RuntimeDirectory=systemd/netif", or after
-         * systemd-tmpfiles-setup.service. */
-        r = mkdir_safe_label("/run/systemd/netif", 0755, uid, gid, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory: %m");
-
         /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
-         * privileges are already dropped. */
+         * privileges are already dropped and we can't create our runtime directory. */
         if (geteuid() == 0) {
+                uid_t uid;
+                gid_t gid;
+
+                r = get_user_creds("systemd-network", /* flags= */ 0, NULL, &uid, &gid, NULL, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot resolve user name %s: %m", "systemd-network");
+
+                /* Create runtime directory. This is not necessary when networkd is
+                 * started with "RuntimeDirectory=systemd/netif", or after
+                 * systemd-tmpfiles-setup.service. */
+                r = mkdir_safe_label("/run/systemd/netif", 0755, uid, gid, MKDIR_WARN_MODE);
+                if (r < 0)
+                        log_warning_errno(r, "Could not create runtime directory: %m");
+
                 r = drop_privileges(uid, gid,
                                     (1ULL << CAP_NET_ADMIN) |
                                     (1ULL << CAP_NET_BIND_SERVICE) |
                                     (1ULL << CAP_NET_BROADCAST) |
-                                    (1ULL << CAP_NET_RAW));
+                                    (1ULL << CAP_NET_RAW) |
+                                    (1ULL << CAP_SYS_ADMIN) |
+                                    (1ULL << CAP_BPF));
                 if (r < 0)
                         return log_error_errno(r, "Failed to drop privileges: %m");
         }
 
-        /* Always create the directories people can create inotify watches in.
-         * It is necessary to create the following subdirectories after drop_privileges()
-         * to support old kernels not supporting AmbientCapabilities=. */
-        r = mkdir_safe_label("/run/systemd/netif/links", 0755, uid, gid, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'links': %m");
+        /* Always create the directories people can create inotify watches in. It is necessary to create the
+         * following subdirectories after drop_privileges() to make them owned by systemd-network. */
+        FOREACH_STRING(p,
+                       "/run/systemd/netif/dhcp-server-lease/",
+                       "/run/systemd/netif/leases/",
+                       "/run/systemd/netif/links/") {
+                r = mkdir_safe_label(p, 0755, UID_INVALID, GID_INVALID, MKDIR_WARN_MODE);
+                if (r < 0)
+                        log_warning_errno(r, "Could not create directory '%s': %m", p);
+        }
 
-        r = mkdir_safe_label("/run/systemd/netif/leases", 0755, uid, gid, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'leases': %m");
-
-        r = mkdir_safe_label("/run/systemd/netif/lldp", 0755, uid, gid, MKDIR_WARN_MODE);
-        if (r < 0)
-                log_warning_errno(r, "Could not create runtime directory 'lldp': %m");
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
-        r = manager_new(&m);
+        r = manager_new(&m, /* test_mode= */ false);
         if (r < 0)
                 return log_error_errno(r, "Could not create manager: %m");
 
-        r = manager_connect_bus(m);
+        r = manager_setup(m);
         if (r < 0)
-                return log_error_errno(r, "Could not connect to bus: %m");
+                return log_error_errno(r, "Could not set up manager: %m");
 
         r = manager_parse_config_file(m);
         if (r < 0)
@@ -87,29 +108,19 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Could not load configuration files: %m");
 
-        r = manager_rtnl_enumerate_links(m);
+        r = manager_enumerate(m);
         if (r < 0)
-                return log_error_errno(r, "Could not enumerate links: %m");
+                return r;
 
-        r = manager_rtnl_enumerate_addresses(m);
+        r = manager_deserialize(m);
         if (r < 0)
-                return log_error_errno(r, "Could not enumerate addresses: %m");
-
-        r = manager_rtnl_enumerate_routes(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate routes: %m");
-
-        r = manager_rtnl_enumerate_rules(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate rules: %m");
+                log_warning_errno(r, "Failed to deserialize the previous invocation, ignoring: %m");
 
         r = manager_start(m);
         if (r < 0)
                 return log_error_errno(r, "Could not start manager: %m");
 
-        log_info("Enumeration completed");
-
-        notify_message = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
+        notify_message = notify_start(NOTIFY_READY_MESSAGE, NOTIFY_STOPPING_MESSAGE);
 
         r = sd_event_loop(m->event);
         if (r < 0)

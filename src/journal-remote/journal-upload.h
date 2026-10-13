@@ -1,10 +1,10 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
 #pragma once
 
-#include <inttypes.h>
-
-#include "sd-event.h"
-#include "sd-journal.h"
-#include "time-util.h"
+#include "curl-util.h"
+#include "forward.h"
+#include "journal-compression-util.h"
 
 typedef enum {
         ENTRY_CURSOR = 0,           /* Nothing actually written yet. */
@@ -21,8 +21,7 @@ typedef enum {
 } entry_state;
 
 typedef struct Uploader {
-        sd_event *events;
-        sd_event_source *sigint_event, *sigterm_event;
+        sd_event *event;
 
         char *url;
         CURL *easy;
@@ -38,7 +37,7 @@ typedef struct Uploader {
         int input;
 
         /* journal stuff */
-        sd_journal* journal;
+        sd_journal *journal;
 
         entry_state entry_state;
         const void *field_data;
@@ -51,6 +50,7 @@ typedef struct Uploader {
         char *last_cursor, *current_cursor;
         usec_t watchdog_timestamp;
         usec_t watchdog_usec;
+        const CompressionConfig *compression;
 } Uploader;
 
 #define JOURNAL_UPLOAD_POLL_TIMEOUT (10 * USEC_PER_SEC)

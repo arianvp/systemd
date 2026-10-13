@@ -1,20 +1,40 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sysmacros.h>
 
 #include "hash-funcs.h"
 #include "path-util.h"
+#include "siphash24.h"
+#include "strv.h"
 
 void string_hash_func(const char *p, struct siphash *state) {
         siphash24_compress(p, strlen(p) + 1, state);
 }
 
-DEFINE_HASH_OPS(string_hash_ops, char, string_hash_func, string_compare_func);
+DEFINE_HASH_OPS(string_hash_ops,
+                char, string_hash_func, string_compare_func);
+DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+                string_hash_ops_free,
+                char, string_hash_func, string_compare_func, free);
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                string_hash_ops_value_free,
+                char, string_hash_func, string_compare_func,
+                void, free);
+DEFINE_HASH_OPS_FULL(
+                string_hash_ops_free_free,
+                char, string_hash_func, string_compare_func, free,
+                void, free);
+DEFINE_HASH_OPS_FULL(
+                string_hash_ops_free_strv_free,
+                char, string_hash_func, string_compare_func, free,
+                char*, strv_free);
 
-void path_hash_func(const char *q, struct siphash *state) {
-        size_t n;
+void path_hash_func(const char *p, struct siphash *state) {
+        bool add_slash = false;
 
-        assert(q);
+        assert(p);
         assert(state);
 
         /* Calculates a hash for a path in a way this duplicate inner slashes don't make a differences, and also
@@ -22,70 +42,105 @@ void path_hash_func(const char *q, struct siphash *state) {
          * similar checks and also doesn't care for trailing slashes. Note that relative and absolute paths (i.e. those
          * which begin in a slash or not) will hash differently though. */
 
-        n = strspn(q, "/");
-        if (n > 0) { /* Eat up initial slashes, and add one "/" to the hash for all of them */
-                siphash24_compress(q, 1, state);
-                q += n;
-        }
+        /* if path is absolute, add one "/" to the hash. */
+        if (path_is_absolute(p))
+                siphash24_compress_byte('/', state);
 
         for (;;) {
-                /* Determine length of next component */
-                n = strcspn(q, "/");
-                if (n == 0) /* Reached the end? */
-                        break;
+                const char *e;
+                int r;
 
-                /* Add this component to the hash and skip over it */
-                siphash24_compress(q, n, state);
-                q += n;
+                r = path_find_first_component(&p, true, &e);
+                if (r == 0)
+                        return;
 
-                /* How many slashes follow this component? */
-                n = strspn(q, "/");
-                if (q[n] == 0) /* Is this a trailing slash? If so, we are at the end, and don't care about the slashes anymore */
-                        break;
+                if (add_slash)
+                        siphash24_compress_byte('/', state);
 
-                /* We are not add the end yet. Hash exactly one slash for all of the ones we just encountered. */
-                siphash24_compress(q, 1, state);
-                q += n;
+                if (r < 0) {
+                        /* if a component is invalid, then add remaining part as a string. */
+                        string_hash_func(p, state);
+                        return;
+                }
+
+                /* Add this component to the hash. */
+                siphash24_compress(e, r, state);
+
+                add_slash = true;
         }
 }
 
-int path_compare_func(const char *a, const char *b) {
-        return path_compare(a, b);
-}
-
-DEFINE_HASH_OPS(path_hash_ops, char, path_hash_func, path_compare_func);
+DEFINE_HASH_OPS(path_hash_ops,
+                char, path_hash_func, path_compare);
+DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+                path_hash_ops_free,
+                char, path_hash_func, path_compare, free);
+DEFINE_HASH_OPS_FULL(
+                path_hash_ops_free_free,
+                char, path_hash_func, path_compare, free,
+                void, free);
 
 void trivial_hash_func(const void *p, struct siphash *state) {
-        siphash24_compress(&p, sizeof(p), state);
+        siphash24_compress_typesafe(p, state);
 }
 
 int trivial_compare_func(const void *a, const void *b) {
         return CMP(a, b);
 }
 
-const struct hash_ops trivial_hash_ops = {
-        .hash = trivial_hash_func,
-        .compare = trivial_compare_func,
-};
+DEFINE_HASH_OPS(trivial_hash_ops,
+                void, trivial_hash_func, trivial_compare_func);
+DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+                trivial_hash_ops_free,
+                void, trivial_hash_func, trivial_compare_func, free);
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                trivial_hash_ops_value_free,
+                void, trivial_hash_func, trivial_compare_func,
+                void, free);
+DEFINE_HASH_OPS_FULL(
+                trivial_hash_ops_free_free,
+                void, trivial_hash_func, trivial_compare_func, free,
+                void, free);
 
 void uint64_hash_func(const uint64_t *p, struct siphash *state) {
-        siphash24_compress(p, sizeof(uint64_t), state);
+        assert(p);
+
+        siphash24_compress_typesafe(*p, state);
 }
 
 int uint64_compare_func(const uint64_t *a, const uint64_t *b) {
+        assert(a);
+        assert(b);
+
         return CMP(*a, *b);
 }
 
-DEFINE_HASH_OPS(uint64_hash_ops, uint64_t, uint64_hash_func, uint64_compare_func);
+DEFINE_HASH_OPS(uint64_hash_ops,
+                uint64_t, uint64_hash_func, uint64_compare_func);
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                uint64_hash_ops_value_free,
+                uint64_t, uint64_hash_func, uint64_compare_func,
+                void, free);
 
 #if SIZEOF_DEV_T != 8
 void devt_hash_func(const dev_t *p, struct siphash *state) {
-        siphash24_compress(p, sizeof(dev_t), state);
+        assert(p);
+
+        siphash24_compress_typesafe(*p, state);
 }
+#endif
 
 int devt_compare_func(const dev_t *a, const dev_t *b) {
-        return CMP(*a, *b);
+        int r;
+
+        assert(a);
+        assert(b);
+
+        r = CMP(major(*a), major(*b));
+        if (r != 0)
+                return r;
+
+        return CMP(minor(*a), minor(*b));
 }
 
 DEFINE_HASH_OPS(devt_hash_ops, dev_t, devt_hash_func, devt_compare_func);
-#endif

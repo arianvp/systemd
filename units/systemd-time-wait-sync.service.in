@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -11,10 +11,10 @@
 Description=Wait Until Kernel Time Synchronized
 Documentation=man:systemd-time-wait-sync.service(8)
 
-# Note that this tool doesn't need CAP_SYS_TIME itself, but it's primary
-# usecase is to run in conjunction with a local NTP service such as
+# Note that this tool doesn't need CAP_SYS_TIME itself, but its primary
+# use case is to run in conjunction with a local NTP service such as
 # systemd-timesyncd.service, which is conditioned this way. There might be
-# niche usecases where running this service independently is desired, but let's
+# niche use cases where running this service independently is desired, but let's
 # make this all "just work" for the general case, and leave it to local
 # modifications to make it work in the remaining cases.
 
@@ -28,7 +28,7 @@ Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
-ExecStart=@rootlibexecdir@/systemd-time-wait-sync
+ExecStart={{LIBEXECDIR}}/systemd-time-wait-sync
 TimeoutStartSec=infinity
 RemainAfterExit=yes
 

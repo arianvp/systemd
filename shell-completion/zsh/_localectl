@@ -1,19 +1,19 @@
-#compdef localectl                    -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+#compdef localectl
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 (( $+functions[_localectl_set-locale] )) ||
 _localectl_set-locale() {
     local -a _locales locale_fields
-    locale_fields=(LANG LANGUAGE LC_CTYPE LC_NUMERIC LC_TIME \
-                   LC_COLLATE LC_MONETARY LC_MESSAGES LC_PAPER \
-                   LC_NAME LC_ADDRESS LC_TELEPHONE \
+    locale_fields=(LANG LANGUAGE LC_CTYPE LC_NUMERIC LC_TIME
+                   LC_COLLATE LC_MONETARY LC_MESSAGES LC_PAPER
+                   LC_NAME LC_ADDRESS LC_TELEPHONE
                    LC_MEASUREMENT LC_IDENTIFICATION)
     # LC_ALL is omitted on purpose
 
     local expl suf
     _locales=( ${(f)"$(_call_program locales "$service" list-locales)"} )
-    compset -P1 '*='
     if [[ -prefix 1 *\= ]]; then
+        compset -P1 '*='
         local conf=${PREFIX%%\=*}
         _wanted locales expl "locales configs" \
             _combination localeconfs  confs=$conf locales "$@" -
@@ -39,7 +39,7 @@ _localectl_set-x11-keymap() {
         local -a _file _layout _model _variant _options
         local _xorg_lst
         _xorg_lst=${"$($commands[pkg-config] xkeyboard-config --variable=xkb_base)"}
-        _file=( ${(ps:\n\!:)"$(<$_xorg_lst/rules/xorg.lst)"} )
+        _file=( ${(ps:\n\!:)"$(<$_xorg_lst/rules/base.lst)"} )
         _layout=( ${${${(M)${(f)_file[2]}:#  *}#  }%% *} )
         _model=( ${${${(M)${(f)_file[1]}:#  *}#  }%% *} )
         _variant=( ${${${(M)${(f)_file[3]}:#  *}#  }%% *} )
@@ -88,11 +88,12 @@ _localectl_commands() {
 }
 
 _arguments \
-    {-h,--help}'[Show this help]' \
+    '(- *)'{-h,--help}'[Show this help]' \
     '--version[Show package version]' \
     "--no-convert[Don't convert keyboard mappings]" \
     '--no-pager[Do not pipe output into a pager]' \
     '--no-ask-password[Do not prompt for password]' \
-    {-H+,--host=}'[Operate on remote host]:userathost:_sd_hosts_or_user_at_host' \
-    {-M+,--machine=}'[Operate on local container]:machine' \
+    '(-H --host)'{-H+,--host=}'[Operate on remote host]:userathost:_sd_hosts_or_user_at_host' \
+    '(-M --machine)'{-M+,--machine=}'[Operate on local container]:machine' \
+    '(-l --full)'{-l,--full}'[Do not ellipsize the output]' \
     '*::localectl commands:_localectl_commands'

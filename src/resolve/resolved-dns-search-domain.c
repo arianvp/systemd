@@ -1,14 +1,20 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "resolved-dns-delegate.h"
 #include "resolved-dns-search-domain.h"
+#include "resolved-link.h"
+#include "resolved-manager.h"
 
 int dns_search_domain_new(
                 Manager *m,
                 DnsSearchDomain **ret,
                 DnsSearchDomainType type,
-                Link *l,
+                Link *link,
+                DnsDelegate *delegate,
                 const char *name) {
 
         _cleanup_free_ char *normalized = NULL;
@@ -16,45 +22,57 @@ int dns_search_domain_new(
         int r;
 
         assert(m);
-        assert((type == DNS_SEARCH_DOMAIN_LINK) == !!l);
+        assert((type == DNS_SEARCH_DOMAIN_LINK) == !!link);
+        assert((type == DNS_SEARCH_DOMAIN_DELEGATE) == !!delegate);
         assert(name);
 
         r = dns_name_normalize(name, 0, &normalized);
         if (r < 0)
                 return r;
 
-        if (l) {
-                if (l->n_search_domains >= LINK_SEARCH_DOMAINS_MAX)
+        if (link) {
+                if (link->n_search_domains >= LINK_SEARCH_DOMAINS_MAX)
+                        return -E2BIG;
+        } else if (delegate) {
+                if (delegate->n_search_domains >= DELEGATE_SEARCH_DOMAINS_MAX)
                         return -E2BIG;
         } else {
                 if (m->n_search_domains >= MANAGER_SEARCH_DOMAINS_MAX)
                         return -E2BIG;
         }
 
-        d = new0(DnsSearchDomain, 1);
+        d = new(DnsSearchDomain, 1);
         if (!d)
                 return -ENOMEM;
 
-        d->n_ref = 1;
-        d->manager = m;
-        d->type = type;
-        d->name = TAKE_PTR(normalized);
+        *d = (DnsSearchDomain) {
+                .n_ref = 1,
+                .manager = m,
+                .type = type,
+                .name = TAKE_PTR(normalized),
+        };
 
         switch (type) {
 
         case DNS_SEARCH_DOMAIN_LINK:
-                d->link = l;
-                LIST_APPEND(domains, l->search_domains, d);
-                l->n_search_domains++;
+                d->link = link;
+                LIST_APPEND(domains, link->search_domains, d);
+                link->n_search_domains++;
                 break;
 
-        case DNS_SERVER_SYSTEM:
+        case DNS_SEARCH_DOMAIN_SYSTEM:
                 LIST_APPEND(domains, m->search_domains, d);
                 m->n_search_domains++;
                 break;
 
+        case DNS_SEARCH_DOMAIN_DELEGATE:
+                d->delegate = delegate;
+                LIST_APPEND(domains, delegate->search_domains, d);
+                delegate->n_search_domains++;
+                break;
+
         default:
-                assert_not_reached("Unknown search domain type");
+                assert_not_reached();
         }
 
         d->linked = true;
@@ -95,6 +113,13 @@ void dns_search_domain_unlink(DnsSearchDomain *d) {
                 LIST_REMOVE(domains, d->manager->search_domains, d);
                 d->manager->n_search_domains--;
                 break;
+
+        case DNS_SEARCH_DOMAIN_DELEGATE:
+                assert(d->delegate);
+                assert(d->delegate->n_search_domains > 0);
+                LIST_REMOVE(domains, d->delegate->search_domains, d);
+                d->delegate->n_search_domains--;
+                break;
         }
 
         d->linked = false;
@@ -119,19 +144,26 @@ void dns_search_domain_move_back_and_unmark(DnsSearchDomain *d) {
 
         case DNS_SEARCH_DOMAIN_LINK:
                 assert(d->link);
-                LIST_FIND_TAIL(domains, d, tail);
+                tail = LIST_FIND_TAIL(domains, d);
                 LIST_REMOVE(domains, d->link->search_domains, d);
                 LIST_INSERT_AFTER(domains, d->link->search_domains, tail, d);
                 break;
 
         case DNS_SEARCH_DOMAIN_SYSTEM:
-                LIST_FIND_TAIL(domains, d, tail);
+                tail = LIST_FIND_TAIL(domains, d);
                 LIST_REMOVE(domains, d->manager->search_domains, d);
                 LIST_INSERT_AFTER(domains, d->manager->search_domains, tail, d);
                 break;
 
+        case DNS_SEARCH_DOMAIN_DELEGATE:
+                assert(d->delegate);
+                tail = LIST_FIND_TAIL(domains, d);
+                LIST_REMOVE(domains, d->delegate->search_domains, d);
+                LIST_INSERT_AFTER(domains, d->delegate->search_domains, tail, d);
+                break;
+
         default:
-                assert_not_reached("Unknown search domain type");
+                assert_not_reached();
         }
 }
 
@@ -147,18 +179,22 @@ void dns_search_domain_unlink_all(DnsSearchDomain *first) {
         dns_search_domain_unlink_all(next);
 }
 
-void dns_search_domain_unlink_marked(DnsSearchDomain *first) {
+bool dns_search_domain_unlink_marked(DnsSearchDomain *first) {
         DnsSearchDomain *next;
+        bool changed;
 
         if (!first)
-                return;
+                return false;
 
         next = first->domains_next;
 
-        if (first->marked)
+        if (first->marked) {
                 dns_search_domain_unlink(first);
+                changed = true;
+        } else
+                changed = false;
 
-        dns_search_domain_unlink_marked(next);
+        return dns_search_domain_unlink_marked(next) || changed;
 }
 
 void dns_search_domain_mark_all(DnsSearchDomain *first) {
@@ -170,7 +206,6 @@ void dns_search_domain_mark_all(DnsSearchDomain *first) {
 }
 
 int dns_search_domain_find(DnsSearchDomain *first, const char *name, DnsSearchDomain **ret) {
-        DnsSearchDomain *d;
         int r;
 
         assert(name);
@@ -189,4 +224,22 @@ int dns_search_domain_find(DnsSearchDomain *first, const char *name, DnsSearchDo
 
         *ret = NULL;
         return 0;
+}
+
+int dns_search_domain_dump_to_json(DnsSearchDomain *domain, sd_json_variant **ret) {
+        int ifindex = 0;
+
+        assert(domain);
+        assert(ret);
+
+        if (domain->type == DNS_SEARCH_DOMAIN_LINK) {
+                assert(domain->link);
+                ifindex = domain->link->ifindex;
+        }
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("name", domain->name),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("routeOnly", domain->route_only),
+                        SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", SD_JSON_BUILD_UNSIGNED(ifindex)));
 }

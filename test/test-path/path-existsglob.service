@@ -1,1 +1,9 @@
-path-service.service
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=Service Test for Path units
+
+[Service]
+ExecStart=sleep infinity
+Type=exec
+RemainAfterExit=true

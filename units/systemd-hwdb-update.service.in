@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -10,17 +10,20 @@
 [Unit]
 Description=Rebuild Hardware Database
 Documentation=man:hwdb(7) man:systemd-hwdb(8)
-DefaultDependencies=no
-Conflicts=shutdown.target
-After=systemd-remount-fs.service
-Before=sysinit.target shutdown.target systemd-update-done.service
+
 ConditionNeedsUpdate=/etc
-ConditionPathExists=|!@udevlibexecdir@/hwdb.bin
+ConditionPathExists=|!{{UDEVLIBEXECDIR}}/hwdb.bin
 ConditionPathExists=|/etc/udev/hwdb.bin
 ConditionDirectoryNotEmpty=|/etc/udev/hwdb.d/
+
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target systemd-update-done.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=@rootbindir@/systemd-hwdb update
+ExecStart=systemd-hwdb update
 TimeoutSec=90s

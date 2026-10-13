@@ -1,18 +1,15 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <errno.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
-#include "macro.h"
-#include "parse-util.h"
 #include "proc-cmdline.h"
 #include "string-table.h"
-#include "string-util.h"
 #include "volatile-util.h"
 
 int query_volatile_mode(VolatileMode *ret) {
         _cleanup_free_ char *mode = NULL;
         int r;
+
+        assert(ret);
 
         r = proc_cmdline_get_key("systemd.volatile", PROC_CMDLINE_VALUE_OPTIONAL, &mode);
         if (r < 0)
@@ -27,7 +24,7 @@ int query_volatile_mode(VolatileMode *ret) {
 
                 m = volatile_mode_from_string(mode);
                 if (m < 0)
-                        return -EINVAL;
+                        return m;
 
                 *ret = m;
         } else

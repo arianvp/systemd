@@ -1,127 +1,258 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <ftw.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "bus-util.h"
 #include "capability-util.h"
+#include "efi-api.h"
 #include "fileio.h"
 #include "kmod-setup.h"
-#include "macro.h"
+#include "log.h"
+#include "module-util.h"
+#include "recurse-dir.h"
 #include "string-util.h"
+#include "strv.h"
+#include "virt.h"
 
 #if HAVE_KMOD
-#include <libkmod.h>
-#include "module-util.h"
-
-static void systemd_kmod_log(
-                void *data,
-                int priority,
-                const char *file, int line,
-                const char *fn,
-                const char *format,
-                va_list args) {
-
-        /* library logging is enabled at debug only */
-        DISABLE_WARNING_FORMAT_NONLITERAL;
-        log_internalv(LOG_DEBUG, 0, file, line, fn, format, args);
-        REENABLE_WARNING;
-}
-
-static int has_virtio_rng_nftw_cb(
-                const char *fpath,
-                const struct stat *sb,
-                int tflag,
-                struct FTW *ftwbuf) {
+static int match_pci_modalias_recurse_dir_cb(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
 
         _cleanup_free_ char *alias = NULL;
+        char **modaliases = ASSERT_PTR(userdata);
         int r;
 
-        if ((FTW_D == tflag) && (ftwbuf->level > 2))
-                return FTW_SKIP_SUBTREE;
+        if (event != RECURSE_DIR_ENTRY)
+                return RECURSE_DIR_CONTINUE;
 
-        if (FTW_F != tflag)
-                return FTW_CONTINUE;
+        if (de->d_type != DT_REG)
+                return RECURSE_DIR_CONTINUE;
 
-        if (!endswith(fpath, "/modalias"))
-                return FTW_CONTINUE;
+        if (!streq(de->d_name, "modalias"))
+                return RECURSE_DIR_CONTINUE;
 
-        r = read_one_line_file(fpath, &alias);
-        if (r < 0)
-                return FTW_SKIP_SIBLINGS;
+        r = read_one_line_file(path, &alias);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to read %s, ignoring: %m", path);
+                return RECURSE_DIR_LEAVE_DIRECTORY;
+        }
 
-        if (startswith(alias, "pci:v00001AF4d00001005"))
-                return FTW_STOP;
+        if (startswith_strv(alias, modaliases))
+                return 1;
 
-        if (startswith(alias, "pci:v00001AF4d00001044"))
-                return FTW_STOP;
-
-        return FTW_SKIP_SIBLINGS;
+        return RECURSE_DIR_LEAVE_DIRECTORY;
 }
 
+static bool has_virtio_pci_feature(const char *name, char **modaliases) {
+        int r;
+
+        /* Directory traversal might be slow, hence let's do a cheap check first if it's even worth it */
+        if (detect_vm() == VIRTUALIZATION_NONE)
+                return false;
+
+        r = recurse_dir_at(
+                        AT_FDCWD,
+                        "/sys/devices/pci0000:00",
+                        /* statx_mask= */ 0,
+                        /* n_depth_max= */ 3,
+                        RECURSE_DIR_ENSURE_TYPE,
+                        match_pci_modalias_recurse_dir_cb,
+                        modaliases);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine whether host has %s PCI device, ignoring: %m", name);
+
+        return r > 0;
+}
+
+#if defined(__s390__) || defined(__s390x__)
+static int match_ccw_modalias_recurse_dir_cb(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        _cleanup_free_ char *alias = NULL;
+        char **modaliases = ASSERT_PTR(userdata);
+        int r;
+
+        if (event != RECURSE_DIR_ENTRY)
+                return RECURSE_DIR_CONTINUE;
+
+        if (de->d_type != DT_REG)
+                return RECURSE_DIR_CONTINUE;
+
+        if (!streq(de->d_name, "modalias"))
+                return RECURSE_DIR_CONTINUE;
+
+        /* Unlike PCI's "recurse_dir_cb", upon finding a non-matching modalias,
+         * we don't abandon the current directory but keep looking for virtio
+         * devices in subdirectories, by returning RECURSE_DIR_CONTINUE. */
+        r = read_one_line_file(path, &alias);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to read %s, ignoring: %m", path);
+                return RECURSE_DIR_CONTINUE;
+        }
+
+        if (startswith_strv(alias, modaliases))
+                return 1;
+
+        return RECURSE_DIR_CONTINUE;
+}
+
+static bool has_virtio_ccw_feature(const char *name, char **modaliases) {
+        int r;
+
+        /* Directory traversal might be slow, hence let's do a cheap check first if it's even worth it */
+        if (detect_vm() == VIRTUALIZATION_NONE)
+                return false;
+
+        r = recurse_dir_at(
+                        AT_FDCWD,
+                        "/sys/devices/css0",
+                        /* statx_mask= */ 0,
+                        /* n_depth_max= */ 3,
+                        RECURSE_DIR_ENSURE_TYPE,
+                        match_ccw_modalias_recurse_dir_cb,
+                        modaliases);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine whether host has %s CCW device, ignoring: %m", name);
+
+        return r > 0;
+}
+
+static bool has_virtio_ccw(void) {
+        /* All virtio-ccw devices use the control unit type (CU type) 0x3832 */
+        return has_virtio_ccw_feature("virtio-ccw", STRV_MAKE("ccw:t3832"));
+}
+#else
+static bool has_virtio_ccw_feature(const char *name, char **modaliases) {
+        return false;
+}
+
+static bool has_virtio_ccw(void) {
+        return false;
+}
+#endif
+
 static bool has_virtio_rng(void) {
-        return (nftw("/sys/devices/pci0000:00", has_virtio_rng_nftw_cb, 64, FTW_MOUNT|FTW_PHYS|FTW_ACTIONRETVAL) == FTW_STOP);
+        return has_virtio_pci_feature("virtio-rng", STRV_MAKE("pci:v00001AF4d00001005", "pci:v00001AF4d00001044")) ||
+               has_virtio_ccw_feature("virtio-rng", STRV_MAKE("ccw:t3832m04"));
+}
+
+static bool has_virtio_pci(void) {
+        return has_virtio_pci_feature("virtio-pci", STRV_MAKE("pci:v00001AF4d"));
+}
+
+static bool may_have_virtio(void) {
+        /* FIXME: strictly speaking, other virtio features, e.g. vsock, are independent of the virtio PCI
+         * or CCW device. */
+        return has_virtio_pci() || has_virtio_ccw();
+}
+
+static bool in_qemu(void) {
+        return IN_SET(detect_vm(), VIRTUALIZATION_KVM, VIRTUALIZATION_QEMU);
+}
+
+static bool in_vmware(void) {
+        return detect_vm() == VIRTUALIZATION_VMWARE;
+}
+
+static bool in_hyperv(void) {
+        return detect_vm() == VIRTUALIZATION_MICROSOFT;
+}
+
+static bool may_have_vsock_loopback(void) {
+        return may_have_virtio() || in_vmware();
 }
 #endif
 
 int kmod_setup(void) {
 #if HAVE_KMOD
-
         static const struct {
                 const char *module;
                 const char *path;
-                bool warn_if_unavailable:1;
-                bool warn_if_module:1;
+                bool warn_if_unavailable;
+                bool warn_if_module;
                 bool (*condition_fn)(void);
         } kmod_table[] = {
                 /* This one we need to load explicitly, since auto-loading on use doesn't work
                  * before udev created the ghost device nodes, and we need it earlier than that. */
-                { "autofs4",   "/sys/class/misc/autofs",    true,   false,   NULL      },
+                { "autofs4",                    "/sys/class/misc/autofs",       true,  false, NULL                      },
 
                 /* This one we need to load explicitly, since auto-loading of IPv6 is not done when
                  * we try to configure ::1 on the loopback device. */
-                { "ipv6",      "/sys/module/ipv6",          false,  true,    NULL      },
+                { "ipv6",                       "/sys/module/ipv6",             false, true,  NULL                      },
 
-                /* This should never be a module */
-                { "unix",      "/proc/net/unix",            true,   true,    NULL      },
-
-#if HAVE_LIBIPTC
-                /* netfilter is needed by networkd, nspawn among others, and cannot be autoloaded */
-                { "ip_tables", "/proc/net/ip_tables_names", false,  false,   NULL      },
-#endif
                 /* virtio_rng would be loaded by udev later, but real entropy might be needed very early */
-                { "virtio_rng", NULL,                       false,  false,   has_virtio_rng },
-        };
-        _cleanup_(kmod_unrefp) struct kmod_ctx *ctx = NULL;
-        unsigned i;
+                { "virtio_rng",                 NULL,                           false, false, has_virtio_rng            },
 
-        if (have_effective_cap(CAP_SYS_MODULE) == 0)
+                /* we want early logging to hvc consoles if possible, and make sure systemd-getty-generator
+                 * can rely on all consoles being probed already. */
+                { "virtio_console",             NULL,                           false, false, may_have_virtio           },
+
+                /* Make sure we can send sd-notify messages over vsock as early as possible. */
+                { "vmw_vsock_virtio_transport", NULL,                           false, false, may_have_virtio           },
+                /* vsock_loopback provides VMADDR_CID_LOCAL and is not a hard dep of any transport module */
+                { "vsock_loopback",             "/sys/module/vsock_loopback",   false, false, may_have_vsock_loopback   },
+                { "vmw_vsock_vmci_transport",   NULL,                           false, false, in_vmware                 },
+                { "hv_sock",                    NULL,                           false, false, in_hyperv                 },
+
+                /* We can't wait for specific virtiofs tags to show up as device nodes so we have to load the
+                 * virtiofs and virtio_pci modules early to make sure the virtiofs tags are found when
+                 * sysroot.mount is started.
+                 *
+                 * TODO: Remove these again once https://gitlab.com/virtio-fs/virtiofsd/-/issues/128 is
+                 * resolved and the kernel fix is widely available. */
+                { "virtiofs",                   "/sys/module/virtiofs",         false, false, may_have_virtio           },
+                { "virtio_pci",                 "/sys/module/virtio_pci",       false, false, has_virtio_pci            },
+                { "virtio_ccw",                 "/sys/module/virtio_ccw",       false, false, has_virtio_ccw            },
+
+                /* qemu_fw_cfg would be loaded by udev later, but we want to import credentials from it super early */
+                { "qemu_fw_cfg",                "/sys/firmware/qemu_fw_cfg",    false, false, in_qemu                   },
+
+                /* dmi-sysfs is needed to import credentials from it super early */
+                { "dmi-sysfs",                  "/sys/firmware/dmi/entries",    false, false, NULL                      },
+
+#if HAVE_TPM2
+                /* Make sure the tpm subsystem is available which ConditionSecurity=tpm2 depends on. */
+                { "tpm",                        "/sys/class/tpmrm",             false, false, efi_has_tpm2              },
+#endif
+        };
+
+        int r;
+
+        if (have_effective_cap(CAP_SYS_MODULE) <= 0)
                 return 0;
 
-        for (i = 0; i < ELEMENTSOF(kmod_table); i++) {
-                if (kmod_table[i].path && access(kmod_table[i].path, F_OK) >= 0)
+        _cleanup_(kmod_unrefp) struct kmod_ctx *ctx = NULL;
+        FOREACH_ELEMENT(kmod, kmod_table) {
+                if (kmod->path && access(kmod->path, F_OK) >= 0)
                         continue;
 
-                if (kmod_table[i].condition_fn && !kmod_table[i].condition_fn())
+                if (kmod->condition_fn && !kmod->condition_fn())
                         continue;
 
-                if (kmod_table[i].warn_if_module)
+                if (kmod->warn_if_module)
                         log_debug("Your kernel apparently lacks built-in %s support. Might be "
                                   "a good idea to compile it in. We'll now try to work around "
-                                  "this by loading the module...", kmod_table[i].module);
+                                  "this by loading the module...", kmod->module);
 
                 if (!ctx) {
-                        ctx = kmod_new(NULL, NULL);
-                        if (!ctx)
-                                return log_oom();
-
-                        kmod_set_log_fn(ctx, systemd_kmod_log, NULL);
-                        kmod_load_resources(ctx);
+                        r = module_setup_context(&ctx);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to initialize kmod context: %m");
                 }
 
-                (void) module_load_and_warn(ctx, kmod_table[i].module, kmod_table[i].warn_if_unavailable);
+                (void) module_load_and_warn(ctx, kmod->module, kmod->warn_if_unavailable);
         }
 
 #endif

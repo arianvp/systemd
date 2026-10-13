@@ -1,0 +1,995 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <pthread.h>
+#include <setjmp.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/uio.h>
+#include <threads.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#if HAVE_VALGRIND_VALGRIND_H
+#include <valgrind/valgrind.h>
+#endif
+
+#include "sd-event.h"
+#include "sd-future.h"
+
+#include "alloc-util.h"
+#include "architecture.h"
+#include "errno-util.h"
+#include "event-future.h"
+#include "fiber-ops.h"
+#include "log-context.h"
+#include "log.h"
+#include "memory-util.h"
+#include "pthread-util.h"
+#include "time-util.h"
+
+#if HAS_FEATURE_ADDRESS_SANITIZER
+#include <sanitizer/common_interface_defs.h>
+#endif
+
+/* glibc's _FORTIFY_SOURCE wraps siglongjmp() with __longjmp_chk, which asserts that the target SP is below
+ * the current SP. That assumption is incompatible with fiber switching, where the target SP lives on a
+ * separately-mmap'd stack and can be at any address relative to the caller. The fortify redirect happens
+ * in <setjmp.h>'s declaration of siglongjmp; we sidestep it by declaring our own alias that links
+ * directly to the unchecked "siglongjmp" symbol. musl doesn't fortify setjmp.h, so the alias is a plain
+ * synonym there. */
+_noreturn_ extern void siglongjmp_unchecked(sigjmp_buf env, int val) __asm__("siglongjmp");
+
+static thread_local sd_future *current_fiber = NULL;
+
+typedef enum FiberState {
+        FIBER_STATE_INITIAL,
+        FIBER_STATE_READY,
+        FIBER_STATE_RUNNING,
+        FIBER_STATE_SUSPENDED,
+        FIBER_STATE_COMPLETED,
+        _FIBER_STATE_MAX,
+        _FIBER_STATE_INVALID = -EINVAL,
+} FiberState;
+
+typedef struct Fiber {
+        struct iovec stack;
+        sigjmp_buf context;             /* Where to jump to when entering or resuming the fiber. */
+        sigjmp_buf resume_context;      /* Where to jump back to when the fiber yields or completes. */
+
+        /* Caller's stack range, recorded by fiber_run() on each entry so the fiber's siglongjmp back
+         * out (in fiber_swap() or the trampoline's terminate path) can hand AddressSanitizer the
+         * destination stack info. With ucontext this comes for free via uc_link/uc_stack; sigjmp_buf
+         * is opaque and doesn't carry it. */
+        struct iovec resume_stack;
+
+        FiberState state;
+        int result;                     /* Either resume error code or final return value */
+        bool result_pending;            /* sd_fiber_resume() stashed a value that fiber_swap() hasn't consumed yet */
+
+        sd_future *floating;            /* Self-ref held while the fiber is floating; dropped on resolve. */
+        sd_future *awaiting;            /* Target of the wait the fiber is suspended in, if any. */
+
+        sd_event_source *defer_event_source;
+        sd_event_source *exit_event_source;
+
+        char *name;
+        int64_t priority;
+        sd_fiber_func_t func;
+        void *userdata;
+        sd_fiber_destroy_t destroy;
+
+        /* Storage for the swap performed in fiber_run(): while the fiber is suspended these hold the
+         * fiber's own log state; while it is running they hold the caller's log state. The active state
+         * always lives in the thread-locals in log.c / log-context.c. */
+        LIST_HEAD(LogContext, log_context);
+        size_t log_context_num_fields;
+        const char *log_prefix;
+
+#if HAVE_VALGRIND_VALGRIND_H
+        unsigned stack_id;
+#endif
+} Fiber;
+
+static Fiber* fiber_get(sd_future *f) {
+        return ASSERT_PTR(sd_future_get_private(ASSERT_PTR(f)));
+}
+
+static Fiber* fiber_get_maybe(sd_future *f) {
+        return f ? fiber_get(f) : NULL;
+}
+
+static void fiber_set_current(sd_future *f) {
+        current_fiber = f;
+}
+
+static int fiber_allocate_stack(size_t size, void **ret) {
+        void *stack = NULL;
+        int r;
+
+        /* The effective stack size is one page less than the given size, because we have to use
+         * one page as the guard page for the stack. */
+
+        assert(size > 0 && size % page_size() == 0);
+        assert(ret);
+
+        stack = mmap(/* addr= */ NULL, size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+                     /* fd= */ -EBADF, /* offset= */ 0);
+        if (stack == MAP_FAILED)
+                return -errno;
+
+        /* Place the guard page where stack overflow will hit it: the high end on architectures
+         * where the stack grows up (PA-RISC), the low end everywhere else. fiber_stack_usable()
+         * mirrors this with the inverse offset. */
+        void *guard = STACK_GROWS_UP ? (uint8_t*) stack + size - page_size() : stack;
+
+        /* Prefer MADV_GUARD_INSTALL (Linux 6.13+): unlike mprotect(PROT_NONE) it doesn't split
+         * the VMA, so guard installation skips the mmap-lock contention and per-guard VMA cost.
+         * Fall back to mprotect on older kernels, which return EINVAL for unknown advice.
+         * FIXME: delete when baseline above 6.13. */
+        r = RET_NERRNO(madvise(guard, page_size(), MADV_GUARD_INSTALL));
+        if (r == -EINVAL)
+                r = RET_NERRNO(mprotect(guard, page_size(), PROT_NONE));
+        if (r < 0) {
+                (void) munmap(stack, size);
+                return r;
+        }
+
+        *ret = TAKE_PTR(stack);
+        return 0;
+}
+
+/* Usable stack range of a fiber: the full mmap region minus the guard page. Single source of
+ * truth for the layout assumed by fiber_allocate_stack(); every consumer (ucontext ss_sp,
+ * ASAN handoff iovecs, Valgrind stack registration) goes through here.
+ *
+ * iov_base is the lowest usable byte regardless of growth direction — that matches POSIX's
+ * definition of stack_t.ss_sp, so libc's makecontext() handles the direction for us. Only the
+ * guard page placement (and hence iov_base's offset within the mapping) varies. */
+static struct iovec fiber_stack_usable(const struct iovec *stack) {
+        assert(stack);
+        assert(stack->iov_len > page_size());
+        return (struct iovec) {
+                .iov_base = STACK_GROWS_UP ? stack->iov_base : (uint8_t*) stack->iov_base + page_size(),
+                .iov_len = stack->iov_len - page_size(),
+        };
+}
+
+static inline void start_switch_stack(void **fake_stack_save, const struct iovec *dest) {
+#if HAS_FEATURE_ADDRESS_SANITIZER
+        __sanitizer_start_switch_fiber(fake_stack_save,
+                                       dest ? dest->iov_base : NULL,
+                                       dest ? dest->iov_len : 0);
+#endif
+}
+
+static inline void finish_switch_stack(void *fake_stack_save) {
+#if HAS_FEATURE_ADDRESS_SANITIZER
+        __sanitizer_finish_switch_fiber(fake_stack_save, NULL, NULL);
+#endif
+}
+
+/* Refresh f->resume_stack from whoever is currently the running fiber, so the next siglongjmp() out
+ * of f (in the trampoline or fiber_swap()) can hand the right destination stack to ASAN. Must be
+ * called before fiber_set_current(f) — relies on sd_fiber_get_current() returning the caller. */
+static void fiber_set_resume_stack(Fiber *f, Fiber *resume) {
+        assert(f);
+
+        if (resume)
+                f->resume_stack = fiber_stack_usable(&resume->stack);
+        else
+                f->resume_stack = (struct iovec) {};
+}
+
+_noreturn_ static void fiber_entry_point(void) {
+        Fiber *fiber = fiber_get(sd_fiber_get_current());
+        void *fake_stack_save = NULL;
+
+        assert(fiber->func);
+        assert(fiber->state == FIBER_STATE_INITIAL);
+
+        finish_switch_stack(NULL);
+
+        /* Capture our resumable point on the fiber's stack, then bounce back to whoever last set
+         * fiber->resume_context. On bootstrap that's fiber_init(); on every subsequent yield it's
+         * the most recent fiber_run(). sigsetjmp(buf, 0) skips the signal-mask save: switching is
+         * thread-shared with respect to signal masks. */
+        if (sigsetjmp(fiber->context, /* savemask= */ 0) == 0) {
+                start_switch_stack(&fake_stack_save, &fiber->resume_stack);
+                siglongjmp_unchecked(fiber->resume_context, /* val= */ 1);
+        }
+
+        /* Re-entered for real via fiber_run()'s siglongjmp(fiber->context). */
+        finish_switch_stack(fake_stack_save);
+        assert(fiber->state == FIBER_STATE_RUNNING);
+
+        /* Block scope so the cleanups attached to LOG_SET_PREFIX / LOG_CONTEXT_PUSH_KEY_VALUE fire
+         * before the siglongjmp below — siglongjmp skips _cleanup_ attributes, so we have to make
+         * sure the scope ends via a normal control-flow path first. */
+        {
+                LOG_SET_PREFIX(fiber->name);
+                LOG_CONTEXT_PUSH_KEY_VALUE("FIBER=", fiber->name);
+
+                fiber->result = fiber->func(fiber->userdata);
+                fiber->state = FIBER_STATE_COMPLETED;
+        }
+
+        /* Pass NULL fake_stack_save to discard the fiber's fake stack since the fiber is done. */
+        start_switch_stack(NULL, &fiber->resume_stack);
+
+        /* Bounce back to whichever fiber_run() call most recently entered us. resume_context is
+         * per-fiber so nested fiber_run() — e.g. a bus method dispatched as a fiber handler while
+         * sd_event_loop() itself runs in a fiber — is safe. */
+        siglongjmp_unchecked(fiber->resume_context, 1);
+        assert_not_reached();
+}
+
+static int fiber_init(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+        ucontext_t old_uc, uc;
+        void *fake_stack_save = NULL;
+
+        if (getcontext(&uc) < 0)
+                return -errno;
+
+        struct iovec fiber_stack = fiber_stack_usable(&fiber->stack);
+
+        uc.uc_link = NULL;              /* Unused: trampoline siglongjmps out instead of returning. */
+        uc.uc_stack.ss_sp = fiber_stack.iov_base;
+        uc.uc_stack.ss_size = fiber_stack.iov_len;
+        uc.uc_stack.ss_flags = 0;
+
+        sd_future *prev = sd_fiber_get_current();
+        fiber_set_current(f);
+
+        makecontext(&uc, fiber_entry_point, /* argc= */ 0);
+
+        fiber_set_resume_stack(fiber, fiber_get_maybe(prev));
+        if (sigsetjmp(fiber->resume_context, /* savemask= */ 0) == 0) {
+                start_switch_stack(&fake_stack_save, &fiber_stack);
+                if (swapcontext(&old_uc, &uc) < 0) {
+                        finish_switch_stack(fake_stack_save);
+                        fiber_set_current(prev);
+                        return -errno;
+                }
+                assert_not_reached();   /* Trampoline siglongjmps back; swapcontext doesn't return. */
+        }
+
+        finish_switch_stack(fake_stack_save);
+
+        fiber_set_current(prev);
+        return 0;
+}
+
+/* Swap the thread-local log prefix and log context with the values stashed in f. While the fiber is
+ * suspended, f holds the fiber's own log state; while it's running, f holds the caller's log state. The
+ * swap is its own inverse, so the same call drives both directions. */
+static void fiber_swap_log_state(Fiber *f) {
+        assert(f);
+        log_prefix_swap(&f->log_prefix);
+        log_context_swap(&f->log_context, &f->log_context_num_fields);
+}
+
+static void reset_current_fiber(void) {
+        /* Restore the caller's log state stashed in the running fiber (if any) before clearing
+         * current_fiber. Without this, the child of a fork() that happened mid-fiber would inherit the
+         * fiber's log prefix / context list in its thread-locals even though no fiber is running. */
+        sd_future *f = sd_fiber_get_current();
+        if (f) {
+                Fiber *fiber = fiber_get(f);
+                fiber_swap_log_state(fiber);
+                fiber_ops_set(NULL);
+        }
+        fiber_set_current(NULL);
+}
+
+static sd_event_source* fiber_current_event_source(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+        assert(fiber->state != FIBER_STATE_COMPLETED);
+
+        /* SD_EVENT_EXITING only covers the exit callback itself, not the time between callbacks or
+         * io_uring completions dispatched while exiting. The exit request persists across all of these. */
+        return sd_event_get_exit_code(sd_future_get_event(f), /* ret= */ NULL) >= 0 ?
+                fiber->exit_event_source : fiber->defer_event_source;
+}
+
+static int atfork_ret;
+
+static void install_atfork(void) {
+        /* __register_atfork() either returns 0 or -ENOMEM, in its glibc implementation. Since it's
+         * only half-documented (glibc doesn't document it but LSB does — though only superficially)
+         * we'll check for errors only in the most generic fashion possible. */
+        atfork_ret = pthread_atfork(/* prepare= */ NULL, /* parent= */ NULL, reset_current_fiber);
+        if (atfork_ret != 0)
+                log_debug_errno(atfork_ret, "pthread_atfork() failed: %m");
+}
+
+static void fiber_resolve(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+
+        fiber->defer_event_source = sd_event_source_disable_unref(fiber->defer_event_source);
+        fiber->exit_event_source = sd_event_source_disable_unref(fiber->exit_event_source);
+        /* The floating reference may be the last one. Keep it until sd_future_resolve() has marked the
+         * future resolved and armed its callbacks; dropping it can free the fiber immediately. */
+        _unused_ _cleanup_(sd_future_unrefp) sd_future *floating = TAKE_PTR(fiber->floating);
+        sd_future_resolve(f, fiber->result);
+}
+
+static const FiberOps fiber_ops = {
+        .ppoll = sd_fiber_ppoll,
+        .read = sd_fiber_read,
+        .write = sd_fiber_write,
+        .timeout = sd_fiber_timeout,
+        .cancel_wait_unref = sd_future_cancel_wait_unref,
+};
+
+static void fiber_enter(sd_future *f, sd_future *prev, void **fake_stack_save) {
+        Fiber *fiber = fiber_get(f);
+        Fiber *prev_fiber = fiber_get_maybe(prev);
+
+        fiber_set_current(f);
+        fiber_swap_log_state(fiber);
+        if (!prev)
+                fiber_ops_set(&fiber_ops);
+
+        struct iovec fiber_stack = fiber_stack_usable(&fiber->stack);
+        start_switch_stack(fake_stack_save, &fiber_stack);
+        fiber_set_resume_stack(fiber, prev_fiber);
+}
+
+static void fiber_leave(sd_future *f, sd_future *prev, void *fake_stack_save) {
+        Fiber *fiber = fiber_get(f);
+
+        finish_switch_stack(fake_stack_save);
+        if (!prev)
+                fiber_ops_set(NULL);
+        fiber_swap_log_state(fiber);
+        fiber_set_current(prev);
+}
+
+static int fiber_run(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+        int r;
+
+        if (fiber->state == FIBER_STATE_COMPLETED)
+                return -ESTALE;
+
+        assert(IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_READY));
+
+        static pthread_once_t atfork_once = PTHREAD_ONCE_INIT;
+        r = pthread_once(&atfork_once, install_atfork);
+        if (r != 0)
+                return -r;
+        if (atfork_ret != 0)
+                return -atfork_ret;
+
+        LOG_SET_PREFIX(fiber->name);
+        LOG_CONTEXT_PUSH_KEY_VALUE("FIBER=", fiber->name);
+
+        log_debug("Scheduling fiber");
+
+        /* Save the previously-current fiber (if any) so we can restore it when this fiber yields or
+         * completes. This matters when fiber_run() is invoked from within another fiber (e.g. an
+         * sd-event dispatch that happens to be running inside a fiber context itself): the
+         * LOG_SET_PREFIX/LOG_CONTEXT_PUSH above attached to whichever fiber was current at that moment,
+         * and their scope-level cleanup must see the same sd_fiber_get_current() when it runs to detach
+         * them from the correct list. */
+        sd_future *prev = sd_fiber_get_current();
+        void *fake_stack_save = NULL;
+
+        /* INITIAL means the function has never started; READY means it yielded or was woken. Neither
+         * includes execution: stay RUNNING until a real yield, suspension, or completion, even while
+         * a nested event loop dispatches another fiber and temporarily changes the current fiber. */
+        fiber->state = FIBER_STATE_RUNNING;
+        fiber_enter(f, prev, &fake_stack_save);
+
+        /* This is where we start executing the fiber. Once it yields, we continue here as if nothing
+         * happened. resume_context captures this point; the fiber siglongjmps back to it. */
+        if (sigsetjmp(fiber->resume_context, 0) == 0)
+                siglongjmp_unchecked(fiber->context, 1);
+
+        fiber_leave(f, prev, fake_stack_save);
+
+        switch (fiber->state) {
+
+        case FIBER_STATE_COMPLETED:
+                if (fiber->result < 0 && fiber->result != -ECANCELED)
+                        log_debug_errno(fiber->result, "Fiber failed with error: %m");
+                else
+                        log_debug("Fiber finished executing");
+
+                fiber_resolve(f);
+                break;
+
+        case FIBER_STATE_READY:
+                log_debug("Fiber yielded execution");
+
+                r = sd_event_source_set_enabled(fiber_current_event_source(f), SD_EVENT_ONESHOT);
+                if (r < 0)
+                        return r;
+                break;
+
+        case FIBER_STATE_SUSPENDED:
+                log_debug("Fiber suspended execution");
+                /* Fiber is waiting for something - don't re-queue it */
+                break;
+
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int fiber_cancel(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+        int r;
+
+        assert(f != sd_fiber_get_current());
+
+        if (fiber->state == FIBER_STATE_COMPLETED)
+                return 0;
+
+        if (fiber->state == FIBER_STATE_INITIAL) {
+                /* The fiber's function has never started, so there are no scope-level cleanups
+                 * waiting to run. Skip the dispatch round-trip and settle the future right here —
+                 * mirroring the FIBER_STATE_COMPLETED branch of fiber_run(). */
+                fiber->result = -ECANCELED;
+                fiber->state = FIBER_STATE_COMPLETED;
+                fiber_resolve(f);
+                return 1;
+        }
+
+        bool queued = fiber->result_pending && fiber->result == -ECANCELED;
+
+        /* Even an already-queued cancellation may need to move a pending defer dispatch to the exit
+         * source. Let sd_fiber_resume() handle scheduling in both cases, while keeping cancellation
+         * idempotent. -ECANCELED is sticky, so an async wakeup cannot overwrite it. */
+        r = sd_fiber_resume(f, -ECANCELED);
+        if (r < 0)
+                return r;
+
+        return !queued;
+}
+
+static int fiber_on_defer(sd_event_source *s, void *userdata) {
+        sd_future *f = ASSERT_PTR(userdata);
+        return fiber_run(f);
+}
+
+static int fiber_on_exit(sd_event_source *s, void *userdata) {
+        sd_future *f = ASSERT_PTR(userdata);
+        Fiber *fiber = fiber_get(f);
+        int r;
+
+        /* An INITIAL fiber is cancelled synchronously; a COMPLETED fiber needs no further work.
+         * Return directly: cancelling an unstarted floating fiber may drop its last self-reference,
+         * so neither f nor fiber may be accessed afterwards. */
+        if (IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_COMPLETED))
+                return fiber_cancel(f);
+
+        /* Cancellation of a started fiber only queues an interruption; it cannot resolve it here. */
+        r = fiber_cancel(f);
+        if (r < 0)
+                return r;
+
+        /* Run directly in this dispatch. Cancellation re-arms the source for a READY or SUSPENDED
+         * fiber; clear that redundant dispatch so cleanup can suspend without being run again
+         * prematurely. fiber_run() will re-arm the source itself if the fiber yields. */
+        r = sd_event_source_set_enabled(s, SD_EVENT_OFF);
+        if (r < 0)
+                return r;
+
+        return fiber_run(f);
+}
+
+static void* fiber_alloc(void) {
+        return new0(Fiber, 1);
+}
+
+static void fiber_free(sd_future *f) {
+        Fiber *fiber = fiber_get(f);
+
+        /* To make sure all memory is deallocated, the fiber has to have completed by the time we free it to
+         * make sure its stack has finished unwinding (which will invoke the registered cleanup functions).
+         * As this function may get called when not running on a fiber ourselves, we can't guarantee here
+         * that we can run the fiber to completion ourselves, so we insist that this happens before we get
+         * here. To ensure fibers are cleaned up before exiting the event loop, exit handlers are added for
+         * fibers created outside of existing fibers. For fibers created within running fibers, unwinding the
+         * outer fiber should take care of cleaning up any created child fibers (for example using
+         * sd_future_cancel_wait_unref()).
+         *
+         * FIBER_STATE_INITIAL is also accepted: the function has never started, so there are no
+         * registered cleanups to run. This covers the partial-construction failure path in sd_fiber_new()
+         * as well as fibers that are unrefed before the event loop ever dispatches them. */
+        assert(IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_COMPLETED));
+
+        if (fiber->destroy)
+                fiber->destroy(fiber->userdata);
+
+#if HAVE_VALGRIND_VALGRIND_H
+        if (fiber->stack.iov_base)
+                VALGRIND_STACK_DEREGISTER(fiber->stack_id);
+#endif
+
+        if (fiber->stack.iov_base)
+                (void) munmap(fiber->stack.iov_base, fiber->stack.iov_len);
+
+        sd_event_source_disable_unref(fiber->defer_event_source);
+        sd_event_source_disable_unref(fiber->exit_event_source);
+
+        free(fiber->name);
+        free(fiber);
+}
+
+sd_future* sd_fiber_get_current(void) {
+        return current_fiber;
+}
+
+int sd_fiber_is_running(void) {
+        return !!current_fiber;
+}
+
+sd_event* sd_fiber_get_event(void) {
+        sd_future *f = sd_fiber_get_current();
+        assert_return(f, NULL);
+        return sd_future_get_event(f);
+}
+
+int sd_fiber_get_priority(int64_t *ret) {
+        sd_future *f = sd_fiber_get_current();
+
+        assert_return(ret, -EINVAL);
+        assert_return(f, -ESRCH);
+
+        Fiber *fiber = fiber_get(f);
+        *ret = fiber->priority;
+        return 0;
+}
+
+static int fiber_swap(FiberState state) {
+        Fiber *fiber = fiber_get(sd_fiber_get_current());
+
+        assert(fiber->state == FIBER_STATE_RUNNING);
+        assert(IN_SET(state, FIBER_STATE_READY, FIBER_STATE_SUSPENDED));
+
+        /* A value queued by sd_fiber_resume() while the fiber was running short-circuits the swap:
+         * deliver it as if we had suspended and been resumed instantly, without round-tripping
+         * through the event loop. Neither yield nor suspend changes the scheduling state in this case:
+         * the caller must first observe the queued result before parking or yielding again. */
+        if (!fiber->result_pending) {
+                fiber->state = state;
+
+                void *fake_stack_save = NULL;
+
+                if (sigsetjmp(fiber->context, 0) == 0) {
+                        start_switch_stack(&fake_stack_save, &fiber->resume_stack);
+                        siglongjmp_unchecked(fiber->resume_context, 1);
+                }
+
+                finish_switch_stack(fake_stack_save);
+        }
+
+        assert(fiber->state == FIBER_STATE_RUNNING);
+
+        /* Consume the resume value after either path, whether it was queued while running or
+         * delivered after a context switch. Clear it unconditionally so it doesn't pollute
+         * subsequent suspends or the fiber's eventual return value — both negative errors and
+         * positive payloads (byte counts, accepted fds, revents masks) are valid resume values. */
+        fiber->result_pending = false;
+        return TAKE_GENERIC(fiber->result, int, 0);
+}
+
+int sd_fiber_yield(void) {
+        assert_return(sd_fiber_get_current(), -ESRCH);
+        return fiber_swap(FIBER_STATE_READY);
+}
+
+int sd_fiber_suspend(void) {
+        assert_return(sd_fiber_get_current(), -ESRCH);
+        return fiber_swap(FIBER_STATE_SUSPENDED);
+}
+
+static int fiber_set_priority(sd_future *f, int64_t priority) {
+        Fiber *fiber = fiber_get(f);
+        int r = 0;
+
+        if (fiber->defer_event_source)
+                RET_GATHER(r, sd_event_source_set_priority(fiber->defer_event_source, priority));
+
+        if (fiber->exit_event_source)
+                RET_GATHER(r, sd_event_source_set_priority(fiber->exit_event_source, priority));
+
+        if (r >= 0)
+                fiber->priority = priority;
+
+        return r;
+}
+
+static const sd_future_ops fiber_future_ops;
+
+int sd_fiber_resume(sd_future *f, int result) {
+        int r;
+
+        assert_return(f, -EINVAL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
+
+        Fiber *fiber = fiber_get(f);
+
+        if (fiber->state == FIBER_STATE_COMPLETED)
+                return 0;
+
+        /* Cancellation outranks timeout; neither may be overwritten by an ordinary wakeup.
+         * Make sure we always schedule below as a retained result may need to be moved from the
+         * defer source to the exit source on event loop exit. */
+        if (fiber->result_pending &&
+            (fiber->result == -ECANCELED || (fiber->result == -ETIME && result != -ECANCELED)))
+                result = fiber->result;
+
+        fiber->result = result;
+        fiber->result_pending = true;
+
+        /* INITIAL already has a dispatch queued. RUNNING fibers (including active ancestors in nested
+         * loops) consume the result at their next fiber_swap(), without needing another dispatch. */
+        if (IN_SET(fiber->state, FIBER_STATE_INITIAL, FIBER_STATE_RUNNING))
+                return 0;
+
+        assert(IN_SET(fiber->state, FIBER_STATE_READY, FIBER_STATE_SUSPENDED));
+
+        /* READY may need moving from defer source to exit source scheduling. Arm before changing state
+         * so a failure cannot leave a suspended fiber marked READY without a dispatch. */
+        sd_event_source *source = fiber_current_event_source(f);
+        r = sd_event_source_set_enabled(source, SD_EVENT_ONESHOT);
+        if (r < 0)
+                return r;
+
+        fiber->state = FIBER_STATE_READY;
+        if (source == fiber->exit_event_source)
+                return sd_event_source_set_enabled(fiber->defer_event_source, SD_EVENT_OFF);
+
+        return 0;
+}
+
+/* The fiber_future ops pass the Fiber pointer through as the future's private state. Once started, the
+ * fiber resolves its own future when it finishes running; cancellation only queues an interruption. */
+static const sd_future_ops fiber_future_ops = {
+        .size = sizeof(sd_future_ops),
+        .alloc = fiber_alloc,
+        .free = fiber_free,
+        .cancel = fiber_cancel,
+        .set_priority = fiber_set_priority,
+};
+
+int sd_fiber_new(sd_event *e, const char *name, sd_fiber_func_t func, void *userdata, sd_fiber_destroy_t destroy, sd_future **ret) {
+        int r;
+
+        assert_return(e, -EINVAL);
+        assert_return(name, -EINVAL);
+        assert_return(func, -EINVAL);
+
+        if (IN_SET(sd_event_get_state(e), SD_EVENT_EXITING, SD_EVENT_FINISHED))
+                return -ECANCELED;
+
+        _cleanup_(sd_future_cancel_unrefp) sd_future *f = NULL;
+        r = sd_future_new(e, &fiber_future_ops, &f);
+        if (r < 0)
+                return r;
+
+        Fiber *fiber = fiber_get(f);
+
+        struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+        if (getrlimit(RLIMIT_STACK, &rl) < 0)
+                log_debug_errno(errno, "Reading RLIMIT_STACK failed, ignoring: %m");
+        if (rl.rlim_cur == RLIM_INFINITY)
+                rl.rlim_cur = 8U * U64_MB; /* Same as the default thread stack size */
+
+        /* Reserve room for the guard page so the usable region stays above PTHREAD_STACK_MIN, which
+         * is what libc/pthread routines (e.g. TLS setup on musl) assume. */
+        size_t stack_len = ROUND_UP(rl.rlim_cur, page_size());
+        if (stack_len < (size_t) PTHREAD_STACK_MIN + page_size())
+                stack_len = ROUND_UP((size_t) PTHREAD_STACK_MIN + page_size(), page_size());
+
+        *fiber = (Fiber) {
+                .stack.iov_len = stack_len,
+                .state = FIBER_STATE_INITIAL,
+                .name = strdup(name),
+                .func = func,
+                .userdata = userdata,
+        };
+        if (!fiber->name)
+                return -ENOMEM;
+
+        r = fiber_allocate_stack(fiber->stack.iov_len, &fiber->stack.iov_base);
+        if (r < 0)
+                return r;
+
+#if HAVE_VALGRIND_VALGRIND_H
+        /* Register the usable stack range (above the guard page) before fiber_bootstrap() so the
+         * trampoline's first sigsetjmp doesn't trip Valgrind's stack-tracking heuristics. */
+        struct iovec usable = fiber_stack_usable(&fiber->stack);
+        fiber->stack_id = VALGRIND_STACK_REGISTER(
+                        usable.iov_base,
+                        (uint8_t*) usable.iov_base + usable.iov_len);
+#endif
+
+        r = fiber_init(f);
+        if (r < 0)
+                return r;
+
+        /* Execution of the fiber is driven by two event sources, one deferred, one exit. The exit event
+         * source kicks in when sd_event_exit() is called, as from that point onwards only exit event
+         * sources will be dispatched. */
+
+        r = sd_event_add_defer(e, &fiber->defer_event_source, fiber_on_defer, f);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_description(fiber->defer_event_source, fiber->name);
+        if (r < 0)
+                return r;
+
+        r = sd_event_add_exit(e, &fiber->exit_event_source, fiber_on_exit, f);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_description(fiber->exit_event_source, fiber->name);
+        if (r < 0)
+                return r;
+
+        /* If we're on a fiber, we'll rely on the parent fiber to cancel this fiber if the event loop is
+         * exiting. Otherwise, we'll trigger cancellation of this fiber via the exit event source. Why cancel
+         * via the exit event source? We can only run the fiber while the event loop is active, so we need to
+         * make sure all fibers finish running before the event loop is finished, which an exit event source
+         * allows us to do. */
+        r = sd_event_source_set_enabled(fiber->exit_event_source, sd_fiber_is_running() ? SD_EVENT_OFF : SD_EVENT_ONESHOT);
+        if (r < 0)
+                return r;
+
+        /* Stays in FIBER_STATE_INITIAL until the event loop first dispatches it via fiber_run(). */
+
+        if (ret)
+                *ret = TAKE_PTR(f);
+        else {
+                /* Fire-and-forget: the fiber is guaranteed to resolve (via completion, cancellation, or
+                 * the event loop exit handler), so making the future floating cleans it up. */
+                r = sd_fiber_set_floating(f, true);
+                if (r < 0)
+                        return r;
+
+                /* Floating self-ref keeps the fiber alive; release our local ref without cancelling. */
+                f = sd_future_unref(f);
+        }
+
+        /* We only take ownership of the given userdata pointer on success so assign the destroy callback
+         * at the very end so we don't clean up the userdata pointer on failure. */
+        fiber->destroy = destroy;
+
+        return 0;
+}
+
+int sd_fiber_set_floating(sd_future *f, int b) {
+        assert_return(f, -EINVAL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
+
+        Fiber *fiber = fiber_get(f);
+
+        if (!!fiber->floating == !!b)
+                return 0;
+
+        /* The floating self-ref keeps the future alive until the fiber resolves; fiber_run() drops it
+         * in the COMPLETED branch. Only valid for fiber futures because fibers uniquely guarantee
+         * resolution (via completion, cancellation, or the event loop exit handler). */
+        if (b)
+                fiber->floating = sd_future_ref(f);
+        else
+                fiber->floating = sd_future_unref(fiber->floating);
+
+        return 0;
+}
+
+int sd_fiber_get_floating(sd_future *f) {
+        assert_return(f, -EINVAL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, -EINVAL);
+
+        Fiber *fiber = fiber_get(f);
+        return !!fiber->floating;
+}
+
+int sd_fiber_sleep(uint64_t usec) {
+        sd_future *f = sd_fiber_get_current();
+        int r;
+
+        if (!f)
+                return usleep_safe(usec);
+
+        if (usec == 0)
+                return sd_fiber_yield();
+
+        /* Match usleep_safe(USEC_INFINITY): suspend indefinitely. Passing USEC_INFINITY to
+         * sd_event_add_time_relative() would overflow into -EOVERFLOW. */
+        if (usec == USEC_INFINITY)
+                return sd_fiber_suspend();
+
+        _cleanup_(sd_future_cancel_wait_unrefp) sd_future *timer = NULL;
+        r = future_new_time_relative(
+                        sd_future_get_event(f),
+                        CLOCK_MONOTONIC,
+                        usec,
+                        /* accuracy= */ 1,
+                        /* result= */ 0,
+                        &timer);
+        if (r < 0)
+                return r;
+
+        r = sd_fiber_await(timer);
+        if (r < 0)
+                return r;
+
+        return sd_future_result(timer);
+}
+
+static int fiber_wait_callback(sd_future *target, void *userdata) {
+        /* Completion only wakes the waiter. Passing the future's error here would make it
+         * indistinguishable from an interruption of the waiting fiber. */
+        return sd_fiber_resume(userdata, 0);
+}
+
+static int fiber_suspend_for(sd_future *f, sd_future *target) {
+        Fiber *fiber = fiber_get(f);
+        int r;
+
+        assert(!fiber->awaiting);
+
+        fiber->awaiting = target;
+        r = sd_fiber_suspend();
+        fiber->awaiting = NULL;
+
+        return r;
+}
+
+sd_future* sd_fiber_get_awaiting(sd_future *f) {
+        assert_return(f, NULL);
+        assert_return(sd_future_get_ops(f) == &fiber_future_ops, NULL);
+
+        return fiber_get(f)->awaiting;
+}
+
+int sd_fiber_await(sd_future *target) {
+        sd_future *f = sd_fiber_get_current();
+        int r;
+
+        assert_return(f, -ESRCH);
+        assert_return(target, -EINVAL);
+        assert_return(target != f, -EDEADLK);
+        assert_return(sd_future_get_event(target) == sd_future_get_event(f), -EINVAL);
+
+        if (sd_future_state(target) == SD_FUTURE_RESOLVED)
+                return 0;
+
+        /* The fiber is executing inside event dispatch, so its loop cannot have finished yet.
+         * Waiting during exit is supported by the slot's exit source. */
+        assert(sd_event_get_state(sd_future_get_event(f)) != SD_EVENT_FINISHED);
+
+        _cleanup_(sd_future_slot_unrefp) sd_future_slot *slot = NULL;
+        r = sd_future_add_callback(target, &slot, fiber_wait_callback, f);
+        if (r < 0)
+                return r;
+
+        r = fiber_suspend_for(f, target);
+        if (r < 0)
+                return r;
+
+        if (sd_future_state(target) != SD_FUTURE_RESOLVED)
+                return -EBUSY;
+
+        return 0;
+}
+
+sd_future* sd_future_cancel_wait_unref(sd_future *f) {
+        sd_future *self = sd_fiber_get_current();
+        int r, q = 0;
+
+        if (!f)
+                return NULL;
+
+        /* Outside a fiber we can still clean up futures whose cancellation is synchronous, or which
+         * are already resolved. Asynchronous cancellation requires a fiber to await completion. */
+        if (!self)
+                return sd_future_cancel_unref(f);
+
+        /* Invalid calls still consume their reference. Releasing the last reference to a pending
+         * future remains a programming error, diagnosed by sd_future_free(). */
+        assert_return(f != self, sd_future_unref(f));
+
+        for (;;) {
+                r = sd_future_cancel(f);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to cancel future, ignoring: %m");
+
+                if (sd_future_state(f) != SD_FUTURE_PENDING)
+                        break;
+
+                /* Synchronous cancellation needs no dispatch and works across event loops too. */
+                assert_return(sd_future_get_event(f) == sd_future_get_event(self), sd_future_unref(f));
+
+                /* Unlike sd_fiber_await(), a failure to set up the wait must be told apart from a
+                 * wait that was interrupted or woken spuriously. Retrying the former would spin
+                 * without ever yielding to the event loop, so nothing could resolve the future. */
+                _cleanup_(sd_future_slot_unrefp) sd_future_slot *slot = NULL;
+                r = sd_future_add_callback(f, &slot, fiber_wait_callback, self);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to wait for future to finish, giving up: %m");
+                        break;
+                }
+
+                r = fiber_suspend_for(self, f);
+
+                if (sd_future_state(f) == SD_FUTURE_RESOLVED) {
+                        int fr = sd_future_result(f);
+                        if (fr < 0 && fr != -ECANCELED)
+                                log_debug_errno(fr, "Future resolved with error, ignoring: %m");
+                }
+
+                if (IN_SET(r, -ECANCELED, -ETIME)) {
+                        log_debug_errno(r, "Interrupted while waiting for future to finish, deferring the interruption until the future resolves: %m");
+                        /* The wait reports interruptions separately from the future's result. Preserve
+                         * them even if the future resolved concurrently, or a previous cleanup queued
+                         * the interruption before this wait. Cancellation takes precedence over timeout. */
+                        if (q != -ECANCELED)
+                                q = r;
+                } else if (r < 0)
+                        log_debug_errno(r, "Failed to wait for future to finish, ignoring: %m");
+
+                if (sd_future_state(f) != SD_FUTURE_PENDING)
+                        break;
+        }
+
+        /* Re-queue the interruption we held back, if any. */
+        if (q < 0) {
+                r = sd_fiber_resume(self, q);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to re-queue interruption (%i) on calling fiber, ignoring: %m", q);
+        }
+
+        return sd_future_unref(f);
+}
+
+DEFINE_POINTER_ARRAY_CLEAR_FUNC(sd_future*, sd_future_cancel_wait_unref);
+DEFINE_POINTER_ARRAY_FREE_FUNC(sd_future*, sd_future_cancel_wait_unref);
+
+static int fiber_timeout_callback(sd_future *f, void *userdata) {
+        /* Timeout scopes deliver -ETIME, unlike ordinary waits which only signal completion. */
+        return sd_fiber_resume(userdata, sd_future_result(f));
+}
+
+sd_future* sd_fiber_timeout(uint64_t timeout) {
+        sd_future *f = sd_fiber_get_current();
+        int r;
+
+        assert_return(f, NULL);
+
+        if (timeout == USEC_INFINITY)
+                return NULL;
+
+        _cleanup_(sd_future_cancel_wait_unrefp) sd_future *timer = NULL;
+        r = future_new_time_relative(
+                        sd_future_get_event(f),
+                        CLOCK_MONOTONIC,
+                        timeout,
+                        /* accuracy= */ 1,
+                        /* result= */ -ETIME,
+                        &timer);
+        if (r < 0)
+                return NULL; /* On allocation failure no timer is armed and the scope becomes a no-op.
+                              * Errors here are rare; if the caller cares they can compare to NULL. */
+
+        /* The whole point of SD_FIBER_TIMEOUT is to wake the calling fiber when the deadline
+         * fires (so a later sd_fiber_suspend / sd_fiber_await returns -ETIME from this timer's
+         * resolve). Install a floating resume callback bound to the timer's lifetime. */
+        r = sd_future_add_callback(timer, /* ret_slot= */ NULL, fiber_timeout_callback, f);
+        if (r < 0)
+                return NULL;
+
+        return TAKE_PTR(timer);
+}

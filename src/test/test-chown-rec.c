@@ -1,11 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
-#include "alloc-util.h"
 #include "chown-recursive.h"
-#include "log.h"
+#include "errno-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "tests.h"
@@ -32,20 +32,19 @@ static const uint8_t default_acl[] = {
 static bool has_xattr(const char *p) {
         char buffer[sizeof(acl) * 4];
 
-        if (lgetxattr(p, "system.posix_acl_access", buffer, sizeof(buffer)) < 0) {
-                if (IN_SET(errno, EOPNOTSUPP, ENOTTY, ENODATA, ENOSYS))
-                        return false;
-        }
+        if (lgetxattr(p, "system.posix_acl_access", buffer, sizeof(buffer)) < 0)
+                return !ERRNO_IS_XATTR_ABSENT(errno);
 
         return true;
 }
 
-static void test_chown_recursive(void) {
+TEST(chown_recursive) {
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
         struct stat st;
         const char *p;
         const uid_t uid = getuid();
         const gid_t gid = getgid();
+        int r;
 
         umask(022);
         assert_se(mkdtemp_malloc(NULL, &t) >= 0);
@@ -97,7 +96,11 @@ static void test_chown_recursive(void) {
 
         /* We now apply an xattr to the dir, and check it again */
         p = strjoina(t, "/dir");
-        assert_se(setxattr(p, "system.posix_acl_access", acl, sizeof(acl), 0) >= 0);
+        r = RET_NERRNO(setxattr(p, "system.posix_acl_access", acl, sizeof(acl), 0));
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped_errno(r, "no acl supported on /tmp");
+
+        assert_se(r >= 0);
         assert_se(setxattr(p, "system.posix_acl_default", default_acl, sizeof(default_acl), 0) >= 0);
         assert_se(lstat(p, &st) >= 0);
         assert_se(S_ISDIR(st.st_mode));
@@ -106,7 +109,7 @@ static void test_chown_recursive(void) {
         assert_se(st.st_gid == gid);
         assert_se(has_xattr(p));
 
-        assert_se(path_chown_recursive(t, 1, 2, 07777) >= 0);
+        assert_se(path_chown_recursive(t, 1, 2, 07777, 0) >= 0);
 
         p = strjoina(t, "/dir");
         assert_se(lstat(p, &st) >= 0);
@@ -149,13 +152,11 @@ static void test_chown_recursive(void) {
         assert_se(!has_xattr(p));
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
-        if (geteuid() != 0)
-                return log_tests_skipped("not running as root");
-
-        test_chown_recursive();
+static int intro(void) {
+        if (geteuid() != 0 || userns_has_single_user())
+                return log_tests_skipped("not running as root or in userns with single user");
 
         return EXIT_SUCCESS;
 }
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

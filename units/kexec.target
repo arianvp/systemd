@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -14,6 +14,8 @@ DefaultDependencies=no
 Requires=systemd-kexec.service
 After=systemd-kexec.service
 AllowIsolate=yes
+JobTimeoutSec=30min
+JobTimeoutAction=kexec-force
 
 [Install]
 Alias=ctrl-alt-del.target

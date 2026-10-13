@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 [Unit]
 Description=Test for specifiers
 
@@ -12,20 +13,15 @@ ExecStart=test %I = ""
 ExecStart=test %j = specifier
 ExecStart=test %J = specifier
 ExecStart=test %f = /exec/specifier
-ExecStart=test %t = /run
-ExecStart=test %S = /var/lib
-ExecStart=test %C = /var/cache
-ExecStart=test %L = /var/log
-ExecStart=test %E = /etc
 ExecStart=test %T = /tmp
 ExecStart=test %V = /var/tmp
-ExecStart=sh -c 'test %u = $$(id -un)'
-ExecStart=sh -c 'test %U = $$(id -u)'
-ExecStart=sh -c 'test %g = $$(id -gn)'
-ExecStart=sh -c 'test %G = $$(id -g)'
+ExecStart=test %d = %t/credentials/%n
+ExecStart=bash -c 'test %u = $$(id -un)'
+ExecStart=bash -c 'test %U = $$(id -u)'
+ExecStart=bash -c 'test %g = $$(id -gn)'
+ExecStart=bash -c 'test %G = $$(id -g)'
 ExecStart=test %h = /root
-ExecStart=sh -c 'test %s = /bin/sh'
-ExecStart=sh -c 'test %m = $$(cat /etc/machine-id)'
-ExecStart=sh -c 'test %b = $$(cat /proc/sys/kernel/random/boot_id | sed -e 's/-//g')'
-ExecStart=sh -c 'test %H = $$(hostname)'
-ExecStart=sh -c 'test %v = $$(uname -r)'
+ExecStart=bash -c 'test -x %s'
+ExecStart=bash -c 'test %b = $$(cat /proc/sys/kernel/random/boot_id | sed -e 's/-//g')'
+ExecStart=bash -c 'test %H = $$(uname -n)'
+ExecStart=bash -c 'test %v = $$(uname -r)'

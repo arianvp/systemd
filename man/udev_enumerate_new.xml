@@ -1,10 +1,10 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="udev_enumerate_new"
   xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -49,17 +49,23 @@
     </funcsynopsis>
   </refsynopsisdiv>
 
-  <!--<refsect1>
+  <refsect1>
     <title>Description</title>
 
-    <para>XXX: Add short description.</para>
-  </refsect1>-->
+    <para><function>udev_enumerate_new()</function> creates an enumeration context to scan
+    <filename>/sys/</filename>.</para>
+
+    <para><function>udev_enumerate_ref()</function> takes a reference of an enumeration context.</para>
+
+    <para><function>udev_enumerate_unref()</function> drops a reference of an enumeration context. If the
+    refcount reaches zero, all resources of the enumeration context will be released.</para>
+  </refsect1>
 
   <refsect1>
     <title>Return Value</title>
 
     <para>On success, <function>udev_enumerate_new()</function> returns a
-    pointer to the allocated udev monitor. On failure,
+    pointer to the allocated enumeration object. On failure,
     <constant>NULL</constant> is returned.
     <function>udev_enumerate_ref()</function> returns the argument
     that it was passed, unmodified.
@@ -68,17 +74,24 @@
   </refsect1>
 
   <refsect1>
+    <title>History</title>
+    <para><function>udev_enumerate_new()</function>,
+    <function>udev_enumerate_ref()</function>, and
+    <function>udev_enumerate_unref()</function> were added in version 221.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>udev_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_device_new_from_syspath</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_enumerate_add_match_subsystem</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_enumerate_scan_devices</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_monitor_new_from_netlink</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_list_entry</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>udev_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_device_new_from_syspath</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_enumerate_add_match_subsystem</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_enumerate_scan_devices</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_monitor_new_from_netlink</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_list_entry</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

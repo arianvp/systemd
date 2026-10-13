@@ -1,6 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+#pragma once
 
-/* This is meant to be included in other files, hence no headers */
+#include <stdbool.h>
+
+#include "sd-bus-vtable.h"
 
 struct context {
         bool quit;
@@ -9,19 +12,19 @@ struct context {
         uint32_t automatic_integer_property;
 };
 
-static int handler(sd_bus_message *m, void *userdata, sd_bus_error *error) {
+static int handler(sd_bus_message *m, void *userdata, sd_bus_error *reterr_error) {
         return 1;
 }
 
-static int value_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *error) {
+static int value_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *reterr_error) {
         return 1;
 }
 
-static int get_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *error) {
+static int get_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *reterr_error) {
         return 1;
 }
 
-static int set_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *value, void *userdata, sd_bus_error *error) {
+static int set_handler(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *value, void *userdata, sd_bus_error *reterr_error) {
         return 1;
 }
 
@@ -42,7 +45,7 @@ static const sd_bus_vtable test_vtable_1[] = {
 
 static const sd_bus_vtable test_vtable_2[] = {
         SD_BUS_VTABLE_START(0),
-        SD_BUS_METHOD("AlterSomething", "s", "s", handler, 0),
+        SD_BUS_METHOD("AlterSomething", "s", "s", handler, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Exit", "", "", handler, 0),
         SD_BUS_METHOD_WITH_OFFSET("AlterSomething2", "s", "s", handler, 200, 0),
         SD_BUS_METHOD_WITH_OFFSET("Exit2", "", "", handler, 200, 0),

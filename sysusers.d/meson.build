@@ -1,33 +1,29 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-in_files = ['basic.conf']
+files = [['README',                true],
+         ['systemd-coredump.conf', conf.get('ENABLE_COREDUMP') == 1],
+         ['systemd-oom.conf',      conf.get('ENABLE_OOMD') == 1],
+         ['systemd-remote.conf',   conf.get('ENABLE_REMOTE') == 1 and conf.get('HAVE_MICROHTTPD') == 1]]
 
-enable_sysusers = conf.get('ENABLE_SYSUSERS') == 1
-
-foreach file : in_files
-        gen = configure_file(
-                input : file + '.in',
-                output : file,
-                configuration : substs)
-        if enable_sysusers
-                install_data(gen,
-                             install_dir : sysusersdir)
+foreach tuple : files
+        if enable_sysusers and tuple[1]
+                install_data(tuple[0], install_dir : sysusersdir)
         endif
 endforeach
 
-m4_files = ['systemd.conf']
+in_files = [['basic.conf',            true],
+            ['systemd-journal.conf',  true],
+            ['systemd-network.conf',  conf.get('ENABLE_NETWORKD') == 1],
+            ['systemd-resolve.conf',  conf.get('ENABLE_RESOLVE') == 1],
+            ['systemd-timesync.conf', conf.get('ENABLE_TIMESYNCD') == 1],
+            ['systemd-imds.conf',     conf.get('ENABLE_IMDS') == 1]]
 
-if conf.get('ENABLE_REMOTE') == 1 and conf.get('HAVE_MICROHTTPD') == 1
-        m4_files += ['systemd-remote.conf']
-endif
-
-foreach file : m4_files
+foreach tuple : in_files
+        file = tuple[0]
         custom_target(
-                'sysusers.d_' + file,
-                input : file + '.m4',
+                input : file + '.in',
                 output: file,
-                command : [meson_apply_m4, config_h, '@INPUT@'],
-                capture : true,
-                install : enable_sysusers,
+                command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+                install : enable_sysusers and tuple[1],
                 install_dir : sysusersdir)
 endforeach

@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Mount Mount;
-
+#include "cgroup.h"
+#include "core-forward.h"
+#include "execute.h"
 #include "kill.h"
-#include "dynamic-user.h"
+#include "pidref.h"
 #include "unit.h"
 
 typedef enum MountExecCommand {
@@ -12,7 +13,7 @@ typedef enum MountExecCommand {
         MOUNT_EXEC_UNMOUNT,
         MOUNT_EXEC_REMOUNT,
         _MOUNT_EXEC_COMMAND_MAX,
-        _MOUNT_EXEC_COMMAND_INVALID = -1
+        _MOUNT_EXEC_COMMAND_INVALID = -EINVAL,
 } MountExecCommand;
 
 typedef enum MountResult {
@@ -25,7 +26,7 @@ typedef enum MountResult {
         MOUNT_FAILURE_START_LIMIT_HIT,
         MOUNT_FAILURE_PROTOCOL,
         _MOUNT_RESULT_MAX,
-        _MOUNT_RESULT_INVALID = -1
+        _MOUNT_RESULT_INVALID = -EINVAL,
 } MountResult;
 
 typedef struct MountParameters {
@@ -41,7 +42,7 @@ typedef enum MountProcFlags {
         MOUNT_PROC_JUST_CHANGED = 1 << 2,
 } MountProcFlags;
 
-struct Mount {
+typedef struct Mount {
         Unit meta;
 
         char *where;
@@ -59,8 +60,11 @@ struct Mount {
         bool lazy_unmount;
         bool force_unmount;
 
+        bool read_write_only;
+
         MountResult result;
         MountResult reload_result;
+        MountResult clean_result;
 
         mode_t directory_mode;
 
@@ -73,27 +77,30 @@ struct Mount {
         CGroupContext cgroup_context;
 
         ExecRuntime *exec_runtime;
-        DynamicCreds dynamic_creds;
+        CGroupRuntime *cgroup_runtime;
 
         MountState state, deserialized_state;
 
-        ExecCommand* control_command;
+        ExecCommand *control_command;
         MountExecCommand control_command_id;
-        pid_t control_pid;
+        PidRef control_pid;
 
         sd_event_source *timer_event_source;
 
         unsigned n_retry_umount;
-};
+} Mount;
 
 extern const UnitVTable mount_vtable;
 
 void mount_fd_event(Manager *m, int events);
 
-const char* mount_exec_command_to_string(MountExecCommand i) _const_;
-MountExecCommand mount_exec_command_from_string(const char *s) _pure_;
+char* mount_get_where_escaped(const Mount *m);
+char* mount_get_what_escaped(const Mount *m);
+char* mount_get_options_escaped(const Mount *m);
+const char* mount_get_fstype(const Mount *m);
 
-const char* mount_result_to_string(MountResult i) _const_;
-MountResult mount_result_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(mount_exec_command, MountExecCommand);
+
+DECLARE_STRING_TABLE_LOOKUP(mount_result, MountResult);
 
 DEFINE_CAST(MOUNT, Mount);

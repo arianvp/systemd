@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-path"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -43,6 +43,12 @@
     The variables whose name begins with <literal>search-</literal>
     do not refer to individual paths, but instead to a list of
     colon-separated search paths, in their order of precedence.</para>
+
+    <para>Note that paths which depend on environment variables are
+    computed with <command>systemd-path</command>'s invoked
+    environment, and not the system or user manager's environment. As
+    such, the output of <command>systemd-path</command> may not
+    reflect the behavior of manager processes.</para>
   </refsect1>
 
   <refsect1>
@@ -54,9 +60,12 @@
       <varlistentry>
         <term><option>--suffix=</option></term>
 
-        <listitem><para>Printed paths are suffixed by the specified string.</para></listitem>
+        <listitem><para>Printed paths are suffixed by the specified string.</para>
+
+        <xi:include href="version-info.xml" xpointer="v215"/></listitem>
       </varlistentry>
 
+      <xi:include href="standard-options.xml" xpointer="no-pager"/>
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -72,10 +81,10 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>file-hierarchy</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>file-hierarchy</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

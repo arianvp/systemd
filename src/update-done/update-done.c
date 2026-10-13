@@ -1,21 +1,37 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
-#include "fileio-label.h"
-#include "selinux-util.h"
+#include "build.h"
+#include "chase.h"
+#include "dlopen-note.h"
+#include "errno-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "label-util.h"
+#include "log.h"
+#include "main-func.h"
+#include "parse-argument.h"
+#include "string-util.h"
 #include "time-util.h"
+#include "verbs.h"
 
-#define MESSAGE                                                         \
-        "# This file was created by systemd-update-done. Its only \n"   \
-        "# purpose is to hold a timestamp of the time this directory\n" \
-        "# was updated. See man:systemd-update-done.service(8).\n"
+static char *arg_root = NULL;
 
-static int apply_timestamp(const char *path, struct timespec *ts) {
-        _cleanup_free_ char *message = NULL;
+STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+
+COMMAND(
+        "systemd-update-done\0",
+        "Mark /etc/ and /var/ as fully updated.",
+        .man_pages = "systemd-update-done(8)\0",
+);
+
+static int save_timestamp(const char *dir, struct timespec *ts) {
+        _cleanup_free_ char *message = NULL, *dirpath = NULL;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         /*
@@ -23,39 +39,95 @@ static int apply_timestamp(const char *path, struct timespec *ts) {
          * to support filesystems which cannot store nanosecond-precision timestamps.
          */
 
+        fd = chase_and_open(dir, arg_root,
+                            CHASE_PREFIX_ROOT | CHASE_WARN | CHASE_MUST_BE_DIRECTORY,
+                            O_DIRECTORY | O_CLOEXEC | O_CREAT,
+                            &dirpath);
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to open %s%s: %m", strempty(arg_root), dir);
+
         if (asprintf(&message,
-                     MESSAGE
+                     "# This file was created by systemd-update-done. The timestamp below is the\n"
+                     "# modification time of /usr/ for which the most recent updates of %s have\n"
+                     "# been applied. See man:systemd-update-done.service(8) for details.\n"
                      "TIMESTAMP_NSEC=" NSEC_FMT "\n",
+                     dir,
                      timespec_load_nsec(ts)) < 0)
                 return log_oom();
 
-        r = write_string_file_atomic_label_ts(path, message, ts);
-        if (r == -EROFS)
-                return log_debug("Cannot create \"%s\", file system is read-only.", path);
-        if (r < 0)
-                return log_error_errno(r, "Failed to write \"%s\": %m", path);
+        r = write_string_file_full(fd, ".updated", message,
+                                   WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                                   ts, NULL);
+        if (r == -EROFS && !arg_root)
+                log_debug_errno(r, "Cannot create \"%s/.updated\", file system is read-only.", dirpath);
+        else if (r < 0)
+                return log_error_errno(r, "Failed to write \"%s/.updated\": %m", dirpath);
+        else
+                log_debug("%s/.updated updated to TIMESTAMP_NSEC="NSEC_FMT, dirpath, timespec_load_nsec(ts));
+
         return 0;
 }
 
-int main(int argc, char *argv[]) {
-        struct stat st;
-        int r, q = 0;
+static int parse_argv(int argc, char *argv[]) {
+        int r;
 
-        log_setup_service();
+        assert(argc >= 0);
+        assert(argv);
 
-        if (stat("/usr", &st) < 0) {
-                log_error_errno(errno, "Failed to stat /usr: %m");
-                return EXIT_FAILURE;
-        }
+        OptionParser opts = { argc, argv };
 
-        r = mac_selinux_init();
-        if (r < 0) {
-                log_error_errno(r, "SELinux setup failed: %m");
-                return EXIT_FAILURE;
-        }
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-        r = apply_timestamp("/etc/.updated", &st.st_mtim);
-        q = apply_timestamp("/var/.updated", &st.st_mtim);
+                OPTION_COMMON_VERSION:
+                        return version();
 
-        return r < 0 || q < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+                OPTION_LONG("root", "PATH", "Operate on root directory PATH"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ true, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
+                }
+
+        if (option_parser_get_n_args(&opts) > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
+
+        return 1;
 }
+
+
+static int run(int argc, char *argv[]) {
+        struct stat st;
+        int r;
+
+        LIBSELINUX_NOTE(recommended);
+
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
+
+        log_setup();
+
+        r = chase_and_stat("/usr", arg_root,
+                           CHASE_PREFIX_ROOT | CHASE_WARN | CHASE_MUST_BE_DIRECTORY,
+                           /* ret_path= */ NULL,
+                           &st);
+        if (r < 0)
+                return log_error_errno(r, "Failed to stat %s/usr/: %m", strempty(arg_root));
+
+        r = mac_init();
+        if (r < 0)
+                return r;
+
+        r = 0;
+        RET_GATHER(r, save_timestamp("/etc/", &st.st_mtim));
+        RET_GATHER(r, save_timestamp("/var/", &st.st_mtim));
+        return r;
+}
+
+DEFINE_MAIN_FUNCTION(run);

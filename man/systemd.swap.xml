@@ -1,11 +1,9 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd.swap"
-          xmlns:xi="http://www.w3.org/2001/XInclude">
-
+<refentry id="systemd.swap" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
     <title>systemd.swap</title>
     <productname>systemd</productname>
@@ -37,9 +35,9 @@
     this unit type. See
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for the common options of all unit configuration files. The common
-    configuration items are configured in the generic <literal>[Unit]</literal> and
-    <literal>[Install]</literal> sections. The swap specific configuration options are
-    configured in the <literal>[Swap]</literal> section.</para>
+    configuration items are configured in the generic [Unit] and
+    [Install] sections. The swap specific configuration options are
+    configured in the [Swap] section.</para>
 
     <para>Additional options are listed in
     <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
@@ -54,11 +52,14 @@
     unit.</para>
 
     <para>Swap units must be named after the devices or files they control. Example: the swap device <filename
-    noindex='true'>/dev/sda5</filename> must be configured in a unit file <filename>dev-sda5.swap</filename>. For
+    index="false">/dev/sda5</filename> must be configured in a unit file <filename>dev-sda5.swap</filename>. For
     details about the escaping logic used to convert a file system path to a unit name, see
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. Note that swap
     units cannot be templated, nor is possible to add multiple names to a swap unit by creating additional symlinks to
     it.</para>
+
+    <para>Note that swap support on Linux is privileged, swap units are hence only available in the system
+    service manager (and root's user service manager), but not in unprivileged user's service manager.</para>
   </refsect1>
 
   <refsect1>
@@ -71,7 +72,7 @@
 
       <itemizedlist>
         <listitem><para>All swap units automatically get the
-        <varname>BindsTo=</varname> and <varname>After=</varname>
+        <varname>Requires=</varname> and <varname>After=</varname>
         dependencies on the device units or the mount units of the files
         they are activated from.</para></listitem>
       </itemizedlist>
@@ -89,9 +90,15 @@
       <para>The following dependencies are added unless <varname>DefaultDependencies=no</varname> is set:</para>
 
       <itemizedlist>
-        <listitem><para>Swap units automatically acquire a <varname>Conflicts=</varname> and a
+        <listitem><para>Local swap units automatically acquire a <varname>Conflicts=</varname> and a
         <varname>Before=</varname> dependency on <filename>umount.target</filename> so that they are deactivated at
         shutdown as well as a <varname>Before=swap.target</varname> dependency.</para></listitem>
+
+        <listitem><para>Network swap units (those with <option>_netdev</option> in their options) automatically acquire
+        <varname>After=</varname> dependencies on <filename>remote-fs-pre.target</filename> and
+        <filename>network.target</filename>, plus <varname>After=</varname> and <varname>Wants=</varname> dependencies
+        on <filename>network-online.target</filename>, and a <varname>Before=</varname> dependency on
+        <filename>remote-fs.target</filename> instead of <filename>swap.target</filename>.</para></listitem>
       </itemizedlist>
     </refsect2>
   </refsect1>
@@ -123,10 +130,13 @@
 
         <listitem><para>With <option>noauto</option>, the swap unit
         will not be added as a dependency for
-        <filename>swap.target</filename>. This means that it will not
+        <filename>swap.target</filename> (or <filename>remote-fs.target</filename> for network swap devices,
+        see <option>_netdev</option> below). This means that it will not
         be activated automatically during boot, unless it is pulled in
         by some other unit. The <option>auto</option> option has the
         opposite meaning and is the default.</para>
+
+        <xi:include href="version-info.xml" xpointer="v218"/>
         </listitem>
       </varlistentry>
 
@@ -135,9 +145,11 @@
 
         <listitem><para>With <option>nofail</option>, the swap unit
         will be only wanted, not required by
-        <filename>swap.target</filename>. This means that the boot
-        will continue even if this swap device is not activated
+        <filename>swap.target</filename> (or <filename>remote-fs.target</filename> for network swap
+        devices). This means that the boot will continue even if this swap device is not activated
         successfully.</para>
+
+        <xi:include href="version-info.xml" xpointer="v218"/>
         </listitem>
       </varlistentry>
 
@@ -158,7 +170,24 @@
         and the discussion of
         <citerefentry project='man-pages'><refentrytitle>wipefs</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         in <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v240"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>_netdev</option></term>
+
+        <listitem><para>Marks this swap device as requiring network access. This is useful for swap on
+        network block devices (e.g. iSCSI).</para>
+
+        <para>Network swap units are ordered between <filename>remote-fs-pre.target</filename> and
+        <filename>remote-fs.target</filename>, instead of being ordered before
+        <filename>swap.target</filename>. They also pull in <filename>network-online.target</filename> and
+        are ordered after it and <filename>network.target</filename>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/>
+        </listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -166,13 +195,17 @@
   <refsect1>
     <title>Options</title>
 
-    <para>Swap files must include a [Swap] section, which carries
+    <para>Swap unit files may include [Unit] and [Install] sections, which are described in
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    </para>
+
+    <para>Swap unit files must include a [Swap] section, which carries
     information about the swap device it supervises. A number of
     options that may be used in this section are shared with other
     unit types. These options are documented in
-    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry> and
+    <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
     The options specific to the [Swap] section of swap units are the
     following:</para>
 
@@ -180,15 +213,18 @@
 
       <varlistentry>
         <term><varname>What=</varname></term>
-        <listitem><para>Takes an absolute path of a device node or file to use for paging. See <citerefentry
+        <listitem><para>Takes an absolute path or a fstab-style identifier of a device node or file to use
+        for paging. See <citerefentry
         project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
         details. If this refers to a device node, a dependency on the respective device unit is automatically
         created. (See
-        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry> for more
-        information.) If this refers to a file, a dependency on the respective mount unit is automatically
-        created. (See <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for more information.) This option is mandatory. Note that the usual specifier expansion is applied to this
-        setting, literal percent characters should hence be written as <literal>%%</literal>.</para></listitem>
+        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for more information.) If this refers to a file, a dependency on the respective mount unit is
+        automatically created. (See
+        <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+        more information.) This option is mandatory. Note that the usual specifier expansion is applied to
+        this setting, literal percent characters should hence be written as
+        <literal class='specifiers'>%%</literal>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -207,7 +243,9 @@
         options among other functionality, if the swap backing device supports the discard or trim operation. (See
         <citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         for more information.) Note that the usual specifier expansion is applied to this setting, literal percent
-        characters should hence be written as <literal>%%</literal>.</para></listitem>
+        characters should hence be written as <literal>%%</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v217"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -230,29 +268,25 @@
       </varlistentry>
     </variablelist>
 
-    <para>Check
-    <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    and
-    <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for more settings.</para>
+    <xi:include href="systemd.service.xml" xpointer="shared-unit-options" />
   </refsect1>
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-fstab-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

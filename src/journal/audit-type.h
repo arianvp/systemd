@@ -1,14 +1,13 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <alloca.h>
-#include <stdio.h>
+#include <stdio.h>      /* IWYU pragma: keep */
 
-#include "alloc-util.h"
-#include "macro.h"
+#include "forward.h"
 
-const char *audit_type_to_string(int type);
-int audit_type_from_string(const char *s);
+#include "alloc-util.h" /* IWYU pragma: keep */
+
+DECLARE_STRING_TABLE_LOOKUP(audit_type, int);
 
 /* This is inspired by DNS TYPEnnn formatting */
 #define audit_type_name_alloca(type)                                    \

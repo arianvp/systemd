@@ -1,93 +1,67 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
-#include <stdint.h>
-#include <linux/if_packet.h>
+#include <netinet/in.h>
 
-#include "sd-dhcp-client.h"
+#include "sd-dhcp-lease.h"
 
-#include "dhcp-protocol.h"
-#include "list.h"
-#include "util.h"
-
-struct sd_dhcp_route {
-        struct in_addr dst_addr;
-        struct in_addr gw_addr;
-        unsigned char dst_prefixlen;
-
-        uint8_t option;
-};
-
-struct sd_dhcp_raw_option {
-        LIST_FIELDS(struct sd_dhcp_raw_option, options);
-
-        uint8_t tag;
-        uint8_t length;
-        void *data;
-};
+#include "dhcp-forward.h"
+#include "dhcp-message.h"
+#include "time-util.h"
 
 struct sd_dhcp_lease {
         unsigned n_ref;
 
+        sd_dhcp_message *message;
+
         /* each 0 if unset */
-        uint32_t t1;
-        uint32_t t2;
-        uint32_t lifetime;
+        usec_t t1;
+        usec_t t2;
+        usec_t lifetime;
+        triple_timestamp timestamp;
+        usec_t ipv6_only_preferred_usec;
 
         /* each 0 if unset */
         be32_t address;
         be32_t server_address;
-        be32_t next_server;
-
-        bool have_subnet_mask;
         be32_t subnet_mask;
-
-        bool have_broadcast;
         be32_t broadcast;
 
         struct in_addr *router;
         size_t router_size;
 
-        struct in_addr *dns;
-        size_t dns_size;
+        DHCPServerData servers[_SD_DHCP_LEASE_SERVER_TYPE_MAX];
 
-        struct in_addr *ntp;
-        size_t ntp_size;
+        sd_dns_resolver *dnr;
+        size_t n_dnr;
 
-        struct sd_dhcp_route *static_route;
-        size_t static_route_size, static_route_allocated;
+        struct sd_dhcp_route *static_routes;
+        size_t n_static_routes;
+        struct sd_dhcp_route *classless_routes;
+        size_t n_classless_routes;
 
         uint16_t mtu; /* 0 if unset */
 
         char *domainname;
         char **search_domains;
         char *hostname;
-        char *root_path;
-
-        void *client_id;
-        size_t client_id_len;
-
-        void *vendor_specific;
-        size_t vendor_specific_len;
+        char *captive_portal;
 
         char *timezone;
 
-        LIST_HEAD(struct sd_dhcp_raw_option, private_options);
+        uint8_t sixrd_ipv4masklen;
+        uint8_t sixrd_prefixlen;
+        struct in6_addr sixrd_prefix;
+        struct in_addr *sixrd_br_addresses;
+        size_t sixrd_n_br_addresses;
 };
 
 int dhcp_lease_new(sd_dhcp_lease **ret);
 
-int dhcp_lease_parse_options(uint8_t code, uint8_t len, const void *option, void *userdata);
-int dhcp_lease_parse_search_domains(const uint8_t *option, size_t len, char ***domains);
-int dhcp_lease_insert_private_option(sd_dhcp_lease *lease, uint8_t tag, const void *data, uint8_t len);
+void dhcp_lease_set_timestamp(sd_dhcp_lease *lease, const triple_timestamp *timestamp);
 
-int dhcp_lease_set_default_subnet_mask(sd_dhcp_lease *lease);
-
-int dhcp_lease_set_client_id(sd_dhcp_lease *lease, const void *client_id, size_t client_id_len);
-
-int dhcp_lease_save(sd_dhcp_lease *lease, const char *lease_file);
-int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file);
+int dhcp_client_parse_message(sd_dhcp_client *client, const struct iovec *iov, sd_dhcp_lease **ret);

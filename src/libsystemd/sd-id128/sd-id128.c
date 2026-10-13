@@ -1,46 +1,76 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <threads.h>
 
 #include "sd-id128.h"
 
 #include "alloc-util.h"
+#include "chase.h"
 #include "fd-util.h"
 #include "hexdecoct.h"
+#include "hmac.h"
 #include "id128-util.h"
-#include "io-util.h"
-#include "khash.h"
-#include "macro.h"
-#include "missing.h"
+#include "keyring-util.h"
+#include "path-util.h"
 #include "random-util.h"
+#include "stat-util.h"
+#include "string-util.h"
 #include "user-util.h"
-#include "util.h"
 
-_public_ char *sd_id128_to_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_STRING_MAX]) {
-        unsigned n;
+_public_ char *sd_id128_to_string(sd_id128_t id, char s[static SD_ID128_STRING_MAX]) {
+        size_t k = 0;
 
         assert_return(s, NULL);
 
-        for (n = 0; n < 16; n++) {
-                s[n*2] = hexchar(id.bytes[n] >> 4);
-                s[n*2+1] = hexchar(id.bytes[n] & 0xF);
+        for (size_t n = 0; n < sizeof(sd_id128_t); n++) {
+                s[k++] = hexchar(id.bytes[n] >> 4);
+                s[k++] = hexchar(id.bytes[n] & 0xF);
         }
 
-        s[32] = 0;
+        assert(k == SD_ID128_STRING_MAX - 1);
+        s[k] = 0;
 
         return s;
 }
 
-_public_ int sd_id128_from_string(const char s[], sd_id128_t *ret) {
-        unsigned n, i;
+_public_ char *sd_id128_to_uuid_string(sd_id128_t id, char s[static SD_ID128_UUID_STRING_MAX]) {
+        size_t k = 0;
+
+        assert_return(s, NULL);
+
+        /* Similar to sd_id128_to_string() but formats the result as UUID instead of plain hex chars */
+
+        for (size_t n = 0; n < sizeof(sd_id128_t); n++) {
+
+                if (IN_SET(n, 4, 6, 8, 10))
+                        s[k++] = '-';
+
+                s[k++] = hexchar(id.bytes[n] >> 4);
+                s[k++] = hexchar(id.bytes[n] & 0xF);
+        }
+
+        assert(k == SD_ID128_UUID_STRING_MAX - 1);
+        s[k] = 0;
+
+        return s;
+}
+
+_public_ int sd_id128_from_string(const char *s, sd_id128_t *ret) {
+        size_t n, i;
         sd_id128_t t;
         bool is_guid = false;
 
         assert_return(s, -EINVAL);
 
-        for (n = 0, i = 0; n < 16;) {
+        const char *u = startswith_no_case(s, "urn:uuid:");
+        if (u) {
+                s = u;
+                is_guid = true;
+        }
+
+        for (n = 0, i = 0; n < sizeof(sd_id128_t);) {
                 int a, b;
 
                 if (s[i] == '-') {
@@ -70,7 +100,7 @@ _public_ int sd_id128_from_string(const char s[], sd_id128_t *ret) {
                 t.bytes[n++] = (a << 4) | b;
         }
 
-        if (i != (is_guid ? 36 : 32))
+        if (i != (is_guid ? SD_ID128_UUID_STRING_MAX : SD_ID128_STRING_MAX) - 1)
                 return -EINVAL;
 
         if (s[i] != 0)
@@ -81,38 +111,92 @@ _public_ int sd_id128_from_string(const char s[], sd_id128_t *ret) {
         return 0;
 }
 
+_public_ int sd_id128_string_equal(const char *s, sd_id128_t id) {
+        sd_id128_t parsed;
+        int r;
+
+        if (!s)
+                return false;
+
+        /* Checks if the specified string matches a valid string representation of the specified 128 bit ID/uuid */
+
+        r = sd_id128_from_string(s, &parsed);
+        if (r < 0)
+                return r;
+
+        return sd_id128_equal(parsed, id);
+}
+
 _public_ int sd_id128_get_machine(sd_id128_t *ret) {
         static thread_local sd_id128_t saved_machine_id = {};
         int r;
 
-        assert_return(ret, -EINVAL);
-
         if (sd_id128_is_null(saved_machine_id)) {
-                r = id128_read("/etc/machine-id", ID128_PLAIN, &saved_machine_id);
+                r = id128_read("/etc/machine-id", ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, &saved_machine_id);
                 if (r < 0)
                         return r;
-
-                if (sd_id128_is_null(saved_machine_id))
-                        return -ENOMEDIUM;
         }
 
-        *ret = saved_machine_id;
+        if (ret)
+                *ret = saved_machine_id;
         return 0;
+}
+
+int id128_get_machine_at(int rfd, sd_id128_t *ret) {
+        int r;
+
+        assert(wildcard_fd_is_valid(rfd));
+
+        r = dir_fd_is_root_or_cwd(rfd);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return sd_id128_get_machine(ret);
+
+        _cleanup_close_ int fd =
+                chase_and_openat(rfd, rfd, "/etc/machine-id", CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
+        if (fd < 0)
+                return fd;
+
+        return id128_read_fd(fd, ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, ret);
+}
+
+int id128_get_machine(const char *root, sd_id128_t *ret) {
+        if (empty_or_root(root))
+                return sd_id128_get_machine(ret);
+
+        _cleanup_close_ int fd =
+                chase_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT|CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
+        if (fd < 0)
+                return fd;
+
+        return id128_read_fd(fd, ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, ret);
+}
+
+int id128_get_boot(sd_id128_t *ret) {
+        int r;
+
+        assert(ret);
+
+        r = id128_read("/proc/sys/kernel/random/boot_id", ID128_FORMAT_UUID | ID128_REFUSE_NULL, ret);
+        if (r == -ENOENT && proc_mounted() == 0)
+                return -ENOSYS;
+
+        return r;
 }
 
 _public_ int sd_id128_get_boot(sd_id128_t *ret) {
         static thread_local sd_id128_t saved_boot_id = {};
         int r;
 
-        assert_return(ret, -EINVAL);
-
         if (sd_id128_is_null(saved_boot_id)) {
-                r = id128_read("/proc/sys/kernel/random/boot_id", ID128_UUID, &saved_boot_id);
+                r = id128_get_boot(&saved_boot_id);
                 if (r < 0)
                         return r;
         }
 
-        *ret = saved_boot_id;
+        if (ret)
+                *ret = saved_boot_id;
         return 0;
 }
 
@@ -121,7 +205,6 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
         char *d, *p, *g, *u, *e;
         unsigned long perms;
         key_serial_t key;
-        size_t sz = 256;
         uid_t uid;
         gid_t gid;
         int r, c;
@@ -133,51 +216,38 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
 
         key = request_key("user", "invocation_id", NULL, 0);
         if (key == -1) {
-                /* Keyring support not available? No invocation key stored? */
-                if (IN_SET(errno, ENOSYS, ENOKEY))
+                /* Keyring support not available? Keyring access locked down? No invocation key stored? */
+                if (ERRNO_IS_NOT_SUPPORTED(errno) ||
+                    ERRNO_IS_PRIVILEGE(errno) ||
+                    errno == ENOKEY)
                         return -ENXIO;
 
                 return -errno;
         }
 
-        for (;;) {
-                description = new(char, sz);
-                if (!description)
-                        return -ENOMEM;
-
-                c = keyctl(KEYCTL_DESCRIBE, key, (unsigned long) description, sz, 0);
-                if (c < 0)
-                        return -errno;
-
-                if ((size_t) c <= sz)
-                        break;
-
-                sz = c;
-                free(description);
-        }
-
-        /* The kernel returns a final NUL in the string, verify that. */
-        assert(description[c-1] == 0);
+        r = keyring_describe(key, &description);
+        if (r < 0)
+                return r;
 
         /* Chop off the final description string */
         d = strrchr(description, ';');
         if (!d)
-                return -EIO;
+                return -EUCLEAN;
         *d = 0;
 
         /* Look for the permissions */
         p = strrchr(description, ';');
         if (!p)
-                return -EIO;
+                return -EUCLEAN;
 
         errno = 0;
         perms = strtoul(p + 1, &e, 16);
         if (errno > 0)
                 return -errno;
         if (e == p + 1) /* Read at least one character */
-                return -EIO;
+                return -EUCLEAN;
         if (e != d) /* Must reached the end */
-                return -EIO;
+                return -EUCLEAN;
 
         if ((perms & ~MAX_PERMS) != 0)
                 return -EPERM;
@@ -187,7 +257,7 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
         /* Look for the group ID */
         g = strrchr(description, ';');
         if (!g)
-                return -EIO;
+                return -EUCLEAN;
         r = parse_gid(g + 1, &gid);
         if (r < 0)
                 return r;
@@ -198,7 +268,7 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
         /* Look for the user ID */
         u = strrchr(description, ';');
         if (!u)
-                return -EIO;
+                return -EUCLEAN;
         r = parse_uid(u + 1, &uid);
         if (r < 0)
                 return r;
@@ -209,13 +279,14 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
         if (c < 0)
                 return -errno;
         if (c != sizeof(sd_id128_t))
-                return -EIO;
+                return -EUCLEAN;
 
         return 0;
 }
 
 static int get_invocation_from_environment(sd_id128_t *ret) {
         const char *e;
+        int r;
 
         assert(ret);
 
@@ -223,90 +294,63 @@ static int get_invocation_from_environment(sd_id128_t *ret) {
         if (!e)
                 return -ENXIO;
 
-        return sd_id128_from_string(e, ret);
+        r = sd_id128_from_string(e, ret);
+        return r == -EINVAL ? -EUCLEAN : r;
 }
 
 _public_ int sd_id128_get_invocation(sd_id128_t *ret) {
         static thread_local sd_id128_t saved_invocation_id = {};
         int r;
 
-        assert_return(ret, -EINVAL);
-
         if (sd_id128_is_null(saved_invocation_id)) {
                 /* We first check the environment. The environment variable is primarily relevant for user
                  * services, and sufficiently safe as long as no privilege boundary is involved. */
                 r = get_invocation_from_environment(&saved_invocation_id);
-                if (r < 0 && r != -ENXIO)
-                        return r;
-
-                /* The kernel keyring is relevant for system services (as for user services we don't store
-                 * the invocation ID in the keyring, as there'd be no trust benefit in that). */
-                r = get_invocation_from_keyring(&saved_invocation_id);
+                if (r == -ENXIO)
+                        /* The kernel keyring is relevant for system services (as for user services we don't
+                         * store the invocation ID in the keyring, as there'd be no trust benefit in that). */
+                        r = get_invocation_from_keyring(&saved_invocation_id);
                 if (r < 0)
                         return r;
+
+                if (sd_id128_is_null(saved_invocation_id))
+                        return -ENOMEDIUM;
         }
 
-        *ret = saved_invocation_id;
+        if (ret)
+                *ret = saved_invocation_id;
         return 0;
-}
-
-static sd_id128_t make_v4_uuid(sd_id128_t id) {
-        /* Stolen from generate_random_uuid() of drivers/char/random.c
-         * in the kernel sources */
-
-        /* Set UUID version to 4 --- truly random generation */
-        id.bytes[6] = (id.bytes[6] & 0x0F) | 0x40;
-
-        /* Set the UUID variant to DCE */
-        id.bytes[8] = (id.bytes[8] & 0x3F) | 0x80;
-
-        return id;
 }
 
 _public_ int sd_id128_randomize(sd_id128_t *ret) {
         sd_id128_t t;
-        int r;
 
         assert_return(ret, -EINVAL);
 
-        /* We allow usage if x86-64 RDRAND here. It might not be trusted enough for keeping secrets, but it should be
-         * fine for UUIDS. */
-        r = genuine_random_bytes(&t, sizeof t, RANDOM_ALLOW_RDRAND);
-        if (r < 0)
-                return r;
+        random_bytes(&t, sizeof(t));
 
         /* Turn this into a valid v4 UUID, to be nice. Note that we
          * only guarantee this for newly generated UUIDs, not for
          * pre-existing ones. */
 
-        *ret = make_v4_uuid(t);
+        *ret = id128_make_v4_uuid(t);
         return 0;
 }
 
-static int get_app_specific(sd_id128_t base, sd_id128_t app_id, sd_id128_t *ret) {
-        _cleanup_(khash_unrefp) khash *h = NULL;
-        sd_id128_t result;
-        const void *p;
-        int r;
+_public_ int sd_id128_get_app_specific(sd_id128_t base, sd_id128_t app_id, sd_id128_t *ret) {
+        assert_cc(sizeof(sd_id128_t) < SHA256_DIGEST_SIZE); /* Check that we don't need to pad with zeros. */
+        union {
+                uint8_t hmac[SHA256_DIGEST_SIZE];
+                sd_id128_t result;
+        } buf;
 
-        assert(ret);
+        assert_return(ret, -EINVAL);
+        assert_return(!sd_id128_is_null(app_id), -ENXIO);
 
-        r = khash_new_with_key(&h, "hmac(sha256)", &base, sizeof(base));
-        if (r < 0)
-                return r;
+        hmac_sha256(&base, sizeof(base), &app_id, sizeof(app_id), buf.hmac);
 
-        r = khash_put(h, &app_id, sizeof(app_id));
-        if (r < 0)
-                return r;
-
-        r = khash_digest_data(h, &p);
-        if (r < 0)
-                return r;
-
-        /* We chop off the trailing 16 bytes */
-        memcpy(&result, p, MIN(khash_get_size(h), sizeof(result)));
-
-        *ret = make_v4_uuid(result);
+        /* Take only the first half. */
+        *ret = id128_make_v4_uuid(buf.result);
         return 0;
 }
 
@@ -320,7 +364,7 @@ _public_ int sd_id128_get_machine_app_specific(sd_id128_t app_id, sd_id128_t *re
         if (r < 0)
                 return r;
 
-        return get_app_specific(id, app_id, ret);
+        return sd_id128_get_app_specific(id, app_id, ret);
 }
 
 _public_ int sd_id128_get_boot_app_specific(sd_id128_t app_id, sd_id128_t *ret) {
@@ -333,5 +377,18 @@ _public_ int sd_id128_get_boot_app_specific(sd_id128_t app_id, sd_id128_t *ret) 
         if (r < 0)
                 return r;
 
-        return get_app_specific(id, app_id, ret);
+        return sd_id128_get_app_specific(id, app_id, ret);
+}
+
+_public_ int sd_id128_get_invocation_app_specific(sd_id128_t app_id, sd_id128_t *ret) {
+        sd_id128_t id;
+        int r;
+
+        assert_return(ret, -EINVAL);
+
+        r = sd_id128_get_invocation(&id);
+        if (r < 0)
+                return r;
+
+        return sd_id128_get_app_specific(id, app_id, ret);
 }

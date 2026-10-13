@@ -1,30 +1,30 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <linux/rfkill.h>
 #include <poll.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-device.h"
 
 #include "alloc-util.h"
+#include "device-private.h"
 #include "device-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "io-util.h"
+#include "list.h"
 #include "main-func.h"
-#include "mkdir.h"
 #include "parse-util.h"
-#include "proc-cmdline.h"
+#include "reboot-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "udev-util.h"
-#include "util.h"
-#include "list.h"
 
 /* Note that any write is delayed until exit and the rfkill state will not be
  * stored for rfkill indices that disappear after a change. */
@@ -75,15 +75,15 @@ static int find_device(
         assert(event);
         assert(ret);
 
-        if (asprintf(&sysname, "rfkill%i", event->idx) < 0)
+        if (asprintf(&sysname, "rfkill%u", event->idx) < 0)
                 return log_oom();
 
         r = sd_device_new_from_subsystem_sysname(&device, "rfkill", sysname);
         if (r < 0)
-                return log_full_errno(IN_SET(r, -ENOENT, -ENXIO, -ENODEV) ? LOG_DEBUG : LOG_ERR, r,
+                return log_full_errno(ERRNO_IS_DEVICE_ABSENT(r) ? LOG_DEBUG : LOG_ERR, r,
                                       "Failed to open device '%s': %m", sysname);
 
-        r = sd_device_get_sysattr_value(device, "name", &name);
+        r = device_get_sysattr_safe_string(device, "name", &name);
         if (r < 0)
                 return log_device_debug_errno(device, r, "Device has no name, ignoring: %m");
 
@@ -135,15 +135,13 @@ static int determine_state_file(
 
 static int load_state(Context *c, const struct rfkill_event *event) {
         _cleanup_free_ char *state_file = NULL, *value = NULL;
-        struct rfkill_event we;
-        ssize_t l;
         int b, r;
 
         assert(c);
         assert(c->rfkill_fd >= 0);
         assert(event);
 
-        if (shall_restore_state() == 0)
+        if (!shall_restore_state())
                 return 0;
 
         r = determine_state_file(event, &state_file);
@@ -168,35 +166,36 @@ static int load_state(Context *c, const struct rfkill_event *event) {
         if (b < 0)
                 return log_error_errno(b, "Failed to parse state file %s: %m", state_file);
 
-        we = (struct rfkill_event) {
-                .op = RFKILL_OP_CHANGE,
+        struct rfkill_event we = {
                 .idx = event->idx,
+                .op = RFKILL_OP_CHANGE,
                 .soft = b,
         };
+        assert_cc(offsetof(struct rfkill_event, op) < RFKILL_EVENT_SIZE_V1);
+        assert_cc(offsetof(struct rfkill_event, soft) < RFKILL_EVENT_SIZE_V1);
 
-        l = write(c->rfkill_fd, &we, sizeof(we));
+        ssize_t l = write(c->rfkill_fd, &we, sizeof we);
         if (l < 0)
-                return log_error_errno(errno, "Failed to restore rfkill state for %i: %m", event->idx);
-        if (l != sizeof(we))
+                return log_error_errno(errno, "Failed to restore rfkill state for %u: %m", event->idx);
+        if ((size_t)l < RFKILL_EVENT_SIZE_V1) /* l cannot be < 0 here. Cast to fix -Werror=sign-compare */
                 return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                                       "Couldn't write rfkill event structure, too short.");
+                                       "Couldn't write rfkill event structure, too short (wrote %zd of %zu bytes).",
+                                       l, sizeof we);
+        log_debug("Writing struct rfkill_event successful (%zd of %zu bytes).", l, sizeof we);
 
         log_debug("Loaded state '%s' from %s.", one_zero(b), state_file);
         return 0;
 }
 
 static void save_state_queue_remove(Context *c, int idx, const char *state_file) {
-        struct write_queue_item *item, *tmp;
-
         assert(c);
 
-        LIST_FOREACH_SAFE(queue, item, tmp, c->write_queue) {
+        LIST_FOREACH(queue, item, c->write_queue)
                 if ((state_file && streq(item->file, state_file)) || idx == item->rfkill_idx) {
                         log_debug("Canceled previous save state of '%s' to %s.", one_zero(item->state), item->file);
                         LIST_REMOVE(queue, c->write_queue, item);
                         write_queue_item_free(item);
                 }
-        }
 }
 
 static int save_state_queue(Context *c, const struct rfkill_event *event) {
@@ -259,8 +258,7 @@ static void context_save_and_clear(Context *c) {
 
         assert(c);
 
-        while ((i = c->write_queue)) {
-                LIST_REMOVE(queue, c->write_queue, i);
+        while ((i = LIST_POP(queue, c->write_queue))) {
                 (void) save_state_write_one(i);
                 write_queue_item_free(i);
         }
@@ -269,14 +267,14 @@ static void context_save_and_clear(Context *c) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(context_save_and_clear) Context c = { .rfkill_fd = -1 };
+        _cleanup_(context_save_and_clear) Context c = { .rfkill_fd = -EBADF };
         bool ready = false;
         int r, n;
 
         if (argc > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program requires no arguments.");
 
-        log_setup_service();
+        log_setup();
 
         umask(0022);
 
@@ -294,7 +292,7 @@ static int run(int argc, char *argv[]) {
                                 return 0;
                         }
 
-                        return log_error_errno(errno, "Failed to open /dev/rfkill: %m");
+                        return log_error_errno(errno, "Failed to open %s: %m", "/dev/rfkill");
                 }
         } else {
                 c.rfkill_fd = SD_LISTEN_FDS_START;
@@ -305,69 +303,72 @@ static int run(int argc, char *argv[]) {
         }
 
         for (;;) {
-                struct rfkill_event event;
-                const char *type;
-                ssize_t l;
+                struct rfkill_event event = {};
 
-                l = read(c.rfkill_fd, &event, sizeof(event));
+                ssize_t l = read(c.rfkill_fd, &event, sizeof event);
                 if (l < 0) {
-                        if (errno == EAGAIN) {
+                        if (errno != EAGAIN)
+                                return log_error_errno(errno, "Failed to read from /dev/rfkill: %m");
 
-                                if (!ready) {
-                                        /* Notify manager that we are
-                                         * now finished with
-                                         * processing whatever was
-                                         * queued */
-                                        (void) sd_notify(false, "READY=1");
-                                        ready = true;
-                                }
-
-                                /* Hang around for a bit, maybe there's more coming */
-
-                                r = fd_wait_for_event(c.rfkill_fd, POLLIN, EXIT_USEC);
-                                if (r == -EINTR)
-                                        continue;
+                        if (!ready) {
+                                /* Notify manager that we are now finished with processing whatever was
+                                 * queued */
+                                r = sd_notify(false, "READY=1");
                                 if (r < 0)
-                                        return log_error_errno(r, "Failed to poll() on device: %m");
-                                if (r > 0)
-                                        continue;
+                                        log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 
-                                log_debug("All events read and idle, exiting.");
-                                break;
+                                ready = true;
                         }
 
-                        log_error_errno(errno, "Failed to read from /dev/rfkill: %m");
+                        /* Hang around for a bit, maybe there's more coming */
+
+                        r = fd_wait_for_event(c.rfkill_fd, POLLIN, EXIT_USEC);
+                        if (r == -EINTR)
+                                continue;
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to poll() on device: %m");
+                        if (r > 0)
+                                continue;
+
+                        log_debug("All events read and idle, exiting.");
+                        break;
                 }
 
-                if (l != RFKILL_EVENT_SIZE_V1)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Read event structure of invalid size.");
+                if ((size_t)l < RFKILL_EVENT_SIZE_V1) /* l cannot be < 0 here. Cast to fix -Werror=sign-compare */
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read of struct rfkill_event: (%zd < %zu)",
+                                               l, (size_t) RFKILL_EVENT_SIZE_V1); /* Casting necessary to make compiling with different kernel versions happy */
+                log_debug("Reading struct rfkill_event: got %zd bytes.", l);
 
-                type = rfkill_type_to_string(event.type);
+                /* The event structure has more fields. We only care about the first few, so it's OK if we
+                 * don't read the full structure. */
+                assert_cc(offsetof(struct rfkill_event, op) < RFKILL_EVENT_SIZE_V1);
+                assert_cc(offsetof(struct rfkill_event, type) < RFKILL_EVENT_SIZE_V1);
+
+                const char *type = rfkill_type_to_string(event.type);
                 if (!type) {
-                        log_debug("An rfkill device of unknown type %i discovered, ignoring.", event.type);
+                        log_debug("An rfkill device of unknown type %u discovered, ignoring.", event.type);
                         continue;
                 }
 
                 switch (event.op) {
 
                 case RFKILL_OP_ADD:
-                        log_debug("A new rfkill device has been added with index %i and type %s.", event.idx, type);
+                        log_debug("A new rfkill device has been added with index %u and type %s.", event.idx, type);
                         (void) load_state(&c, &event);
                         break;
 
                 case RFKILL_OP_DEL:
-                        log_debug("An rfkill device has been removed with index %i and type %s", event.idx, type);
+                        log_debug("An rfkill device has been removed with index %u and type %s", event.idx, type);
                         (void) save_state_cancel(&c, &event);
                         break;
 
                 case RFKILL_OP_CHANGE:
-                        log_debug("An rfkill device has changed state with index %i and type %s", event.idx, type);
+                        log_debug("An rfkill device has changed state with index %u and type %s", event.idx, type);
                         (void) save_state_queue(&c, &event);
                         break;
 
                 default:
-                        log_debug("Unknown event %i from /dev/rfkill for index %i and type %s, ignoring.", event.op, event.idx, type);
-                        break;
+                        log_debug("Unknown event %u from /dev/rfkill for index %u and type %s, ignoring.", event.op, event.idx, type);
                 }
         }
 

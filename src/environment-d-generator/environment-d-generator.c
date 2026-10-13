@@ -1,31 +1,46 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <stdio.h>
 
 #include "sd-path.h"
 
+#include "alloc-util.h"
 #include "conf-files.h"
-#include "def.h"
+#include "constants.h"
 #include "env-file.h"
 #include "escape.h"
+#include "glyph-util.h"
 #include "log.h"
-#include "path-lookup.h"
+#include "main-func.h"
+#include "string-util.h"
+#include "strv.h"
 
 static int environment_dirs(char ***ret) {
         _cleanup_strv_free_ char **dirs = NULL;
         _cleanup_free_ char *c = NULL;
         int r;
 
-        dirs = strv_new(CONF_PATHS_USR("environment.d"), NULL);
+        assert(ret);
+
+        dirs = strv_new(CONF_PATHS("environment.d"));
         if (!dirs)
                 return -ENOMEM;
 
         /* ~/.config/systemd/environment.d */
-        r = sd_path_home(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
+        r = sd_path_lookup(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
         if (r < 0)
                 return r;
 
-        r = strv_extend_front(&dirs, c);
+        r = strv_consume_prepend(&dirs, TAKE_PTR(c));
         if (r < 0)
                 return r;
+
+        if (DEBUG_LOGGING) {
+                _cleanup_free_ char *t = NULL;
+
+                t = strv_join(dirs, "\n\t");
+                log_debug("Looking for environment.d files in (higher priority first):\n\t%s", strna(t));
+        }
 
         *ret = TAKE_PTR(dirs);
         return 0;
@@ -33,14 +48,13 @@ static int environment_dirs(char ***ret) {
 
 static int load_and_print(void) {
         _cleanup_strv_free_ char **dirs = NULL, **files = NULL, **env = NULL;
-        char **i;
         int r;
 
         r = environment_dirs(&dirs);
         if (r < 0)
                 return r;
 
-        r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char **) dirs);
+        r = conf_files_list_strv(&files, ".conf", /* root= */ NULL, CONF_FILES_WARN, (const char **) dirs);
         if (r < 0)
                 return r;
 
@@ -48,6 +62,8 @@ static int load_and_print(void) {
          * that in case of failure, a partial update is better than none. */
 
         STRV_FOREACH(i, files) {
+                log_debug("Reading %s%s", *i, glyph(GLYPH_ELLIPSIS));
+
                 r = merge_env_file(&env, NULL, *i);
                 if (r == -ENOMEM)
                         return r;
@@ -60,7 +76,7 @@ static int load_and_print(void) {
                 t = strchr(*i, '=');
                 assert(t);
 
-                q = shell_maybe_quote(t + 1, ESCAPE_BACKSLASH);
+                q = shell_maybe_quote(t + 1, 0);
                 if (!q)
                         return log_oom();
 
@@ -70,20 +86,18 @@ static int load_and_print(void) {
         return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         int r;
 
-        log_parse_environment();
-        log_open();
+        log_setup();
 
-        if (argc > 1) {
-                log_error("This program takes no arguments.");
-                return EXIT_FAILURE;
-        }
+        if (argc > 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
         r = load_and_print();
         if (r < 0)
-                log_error_errno(r, "Failed to load environment.d: %m");
-
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+                return log_error_errno(r, "Failed to load environment.d: %m");
+        return 0;
 }
+
+DEFINE_MAIN_FUNCTION(run);

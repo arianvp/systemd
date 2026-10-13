@@ -1,18 +1,16 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <getopt.h>
-#include <limits.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
+#include "binfmt-util.h"
+#include "build.h"
 #include "conf-files.h"
-#include "def.h"
+#include "constants.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "log.h"
@@ -22,204 +20,207 @@
 #include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
-static bool arg_cat_config = false;
+static CatFlags arg_cat_flags = CAT_CONFIG_OFF;
 static PagerFlags arg_pager_flags = 0;
+static bool arg_unregister = false;
 
-static int delete_rule(const char *rule) {
-        _cleanup_free_ char *x = NULL, *fn = NULL;
-        char *e;
+COMMAND(
+        "systemd-binfmt\0",
+        "Register binary formats with the kernel.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_pages = "systemd-binfmt.service(8)\0",
+        .pager_flags = &arg_pager_flags,
+);
 
-        assert(rule);
-        assert(rule[0]);
-
-        x = strdup(rule);
-        if (!x)
-                return log_oom();
-
-        e = strchrnul(x+1, x[0]);
-        *e = 0;
-
-        if (!filename_is_valid(x + 1))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Rule file name '%s' is not valid, refusing.", x + 1);
-
-        fn = strappend("/proc/sys/fs/binfmt_misc/", x+1);
-        if (!fn)
-                return log_oom();
-
+static int delete_rule(const char *rulename) {
+        const char *fn = strjoina("/proc/sys/fs/binfmt_misc/", rulename);
         return write_string_file(fn, "-1", WRITE_STRING_FILE_DISABLE_BUFFER);
 }
 
-static int apply_rule(const char *rule) {
+static int apply_rule(const char *filename, unsigned line, const char *rule) {
+        assert(filename);
+        assert(line > 0);
+        assert(rule);
+        assert(rule[0]);
+
+        _cleanup_free_ char *rulename = NULL;
         int r;
 
-        (void) delete_rule(rule);
+        rulename = strdupcspn(rule + 1, CHAR_TO_STR(rule[0]));
+        if (!rulename)
+                return log_oom();
+
+        if (!filename_is_valid(rulename) ||
+            STR_IN_SET(rulename, "register", "status"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s:%u: Rule name '%s' is not valid, refusing.",
+                                       filename, line, rulename);
+        r = delete_rule(rulename);
+        if (r < 0 && r != -ENOENT)
+                log_warning_errno(r, "%s:%u: Failed to delete rule '%s', ignoring: %m",
+                                  filename, line, rulename);
+        if (r >= 0)
+                log_debug("%s:%u: Rule '%s' deleted.", filename, line, rulename);
 
         r = write_string_file("/proc/sys/fs/binfmt_misc/register", rule, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
-                return log_error_errno(r, "Failed to add binary format: %m");
+                return log_error_errno(r, "%s:%u: Failed to add binary format '%s': %m",
+                                       filename, line, rulename);
 
+        log_debug("%s:%u: Binary format '%s' registered.", filename, line, rulename);
         return 0;
 }
 
-static int apply_file(const char *path, bool ignore_enoent) {
+static int apply_file(const char *filename, bool ignore_enoent) {
         _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_free_ char *pp = NULL;
         int r;
 
-        assert(path);
+        assert(filename);
 
-        r = search_and_fopen(path, "re", NULL, (const char**) CONF_PATHS_STRV("binfmt.d"), &f);
+        r = search_and_fopen(filename, "re", NULL, (const char**) CONF_PATHS_STRV("binfmt.d"), &f, &pp);
         if (r < 0) {
                 if (ignore_enoent && r == -ENOENT)
                         return 0;
 
-                return log_error_errno(r, "Failed to open file '%s': %m", path);
+                return log_error_errno(r, "Failed to open file '%s': %m", filename);
         }
 
-        log_debug("apply: %s", path);
-        for (;;) {
-                _cleanup_free_ char *line = NULL;
-                char *p;
+        log_debug("Applying %s%s", pp, glyph(GLYPH_ELLIPSIS));
+        for (unsigned line = 1;; line++) {
+                _cleanup_free_ char *text = NULL;
                 int k;
 
-                k = read_line(f, LONG_LINE_MAX, &line);
+                k = read_stripped_line(f, LONG_LINE_MAX, &text);
                 if (k < 0)
-                        return log_error_errno(k, "Failed to read file '%s': %m", path);
+                        return log_error_errno(k, "Failed to read file '%s': %m", pp);
                 if (k == 0)
                         break;
 
-                p = strstrip(line);
-                if (isempty(p))
+                if (isempty(text))
                         continue;
-                if (strchr(COMMENTS, p[0]))
+                if (strchr(COMMENTS, text[0]))
                         continue;
 
-                k = apply_rule(p);
-                if (k < 0 && r == 0)
-                        r = k;
+                RET_GATHER(r, apply_rule(filename, line, text));
         }
 
         return r;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+static int cat_config(char **files) {
+        pager_open(arg_pager_flags);
 
-        r = terminal_urlify_man("systemd-binfmt.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Registers binary formats with the kernel.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "     --cat-config       Show configuration files\n"
-               "     --no-pager         Do not pipe output into a pager\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
-
-        return 0;
+        return cat_files(NULL, files, arg_cat_flags);
 }
 
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_CAT_CONFIG,
-                ARG_NO_PAGER,
-        };
-
-        static const struct option options[] = {
-                { "help",       no_argument, NULL, 'h'            },
-                { "version",    no_argument, NULL, ARG_VERSION    },
-                { "cat-config", no_argument, NULL, ARG_CAT_CONFIG },
-                { "no-pager",   no_argument, NULL, ARG_NO_PAGER   },
-                {}
-        };
-
-        int c;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(ret_args);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_CAT_CONFIG:
-                        arg_cat_config = true;
+                OPTION_COMMON_CAT_CONFIG:
+                        arg_cat_flags = CAT_CONFIG_ON;
                         break;
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_TLDR:
+                        arg_cat_flags = CAT_TLDR;
+                        break;
+
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("unregister", NULL, "Unregister all existing entries"):
+                        arg_unregister = true;
+                        break;
 
-                default:
-                        assert_not_reached("Unhandled option");
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (arg_cat_config && argc > optind)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Positional arguments are not allowed with --cat-config");
+        char **args = option_parser_get_args(&opts);
 
+        if ((arg_unregister || arg_cat_flags != CAT_CONFIG_OFF) && !strv_isempty(args))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Positional arguments are not allowed with --cat-config/--tldr or --unregister.");
+
+        *ret_args = args;
         return 1;
 }
 
+static int binfmt_mounted_and_writable_warn(void) {
+        int r;
+
+        r = binfmt_mounted_and_writable();
+        if (r < 0)
+                return log_error_errno(r, "Failed to check if /proc/sys/fs/binfmt_misc is mounted: %m");
+        if (r == 0)
+                log_debug("/proc/sys/fs/binfmt_misc is not mounted in read-write mode, skipping.");
+
+        return r;
+}
+
 static int run(int argc, char *argv[]) {
-        int r, k;
+        int r;
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
-                return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+                return r;
 
-        log_setup_service();
+        log_setup();
 
         umask(0022);
 
         r = 0;
 
-        if (argc > optind) {
-                int i;
+        if (arg_unregister)
+                return disable_binfmt();
 
-                for (i = optind; i < argc; i++) {
-                        k = apply_file(argv[i], false);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+        if (!strv_isempty(args)) {
+                r = binfmt_mounted_and_writable_warn();
+                if (r <= 0)
+                        return r;
+
+                STRV_FOREACH(f, args)
+                        RET_GATHER(r, apply_file(*f, false));
+
         } else {
                 _cleanup_strv_free_ char **files = NULL;
-                char **f;
 
-                r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char**) CONF_PATHS_STRV("binfmt.d"));
+                r = conf_files_list_strv(&files, ".conf", /* root= */ NULL, CONF_FILES_WARN, (const char**) CONF_PATHS_STRV("binfmt.d"));
                 if (r < 0)
                         return log_error_errno(r, "Failed to enumerate binfmt.d files: %m");
 
-                if (arg_cat_config) {
-                        (void) pager_open(arg_pager_flags);
+                if (arg_cat_flags != CAT_CONFIG_OFF)
+                        return cat_config(files);
 
-                        return cat_files(NULL, files, 0);
-                }
+                r = binfmt_mounted_and_writable_warn();
+                if (r <= 0)
+                        return r;
 
                 /* Flush out all rules */
-                (void) write_string_file("/proc/sys/fs/binfmt_misc/status", "-1", WRITE_STRING_FILE_DISABLE_BUFFER);
+                r = write_string_file("/proc/sys/fs/binfmt_misc/status", "-1", WRITE_STRING_FILE_DISABLE_BUFFER);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to flush binfmt_misc rules, ignoring: %m");
+                else
+                        log_debug("Flushed all binfmt_misc rules.");
 
-                STRV_FOREACH(f, files) {
-                        k = apply_file(*f, true);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+                STRV_FOREACH(f, files)
+                        RET_GATHER(r, apply_file(*f, true));
         }
 
         return r;

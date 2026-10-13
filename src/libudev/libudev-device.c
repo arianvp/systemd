@@ -1,19 +1,5 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <ctype.h>
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/sockios.h>
-#include <net/if.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "libudev.h"
@@ -22,9 +8,9 @@
 #include "alloc-util.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "errno-util.h"
 #include "libudev-device-internal.h"
-#include "parse-util.h"
-#include "time-util.h"
+#include "libudev-list-internal.h"
 
 /**
  * SECTION:libudev-device
@@ -35,6 +21,38 @@
  * filesystem. Devices usually belong to a kernel subsystem, and have
  * a unique name inside that subsystem.
  */
+
+/**
+ * udev_device:
+ *
+ * Opaque object representing one kernel sys device.
+ */
+struct udev_device {
+        struct udev *udev;
+
+        /* real device object */
+        sd_device *device;
+
+        /* legacy */
+        unsigned n_ref;
+
+        struct udev_device *parent;
+        bool parent_set;
+        int parent_errno;
+
+        struct udev_list *properties;
+        uint64_t properties_generation;
+        struct udev_list *all_tags, *current_tags;
+        uint64_t all_tags_generation, current_tags_generation;
+        struct udev_list *devlinks;
+        uint64_t devlinks_generation;
+        bool properties_read:1;
+        bool all_tags_read:1;
+        bool current_tags_read:1;
+        bool devlinks_read:1;
+        struct udev_list *sysattrs;
+        bool sysattrs_read;
+};
 
 /**
  * udev_device_get_seqnum:
@@ -50,7 +68,7 @@ _public_ unsigned long long udev_device_get_seqnum(struct udev_device *udev_devi
 
         assert_return_errno(udev_device, 0, EINVAL);
 
-        if (device_get_seqnum(udev_device->device, &seqnum) < 0)
+        if (sd_device_get_seqnum(udev_device->device, &seqnum) < 0)
                 return 0;
 
         return seqnum;
@@ -87,7 +105,7 @@ _public_ dev_t udev_device_get_devnum(struct udev_device *udev_device) {
  *
  * Returns: the driver name string, or #NULL if there is no driver attached.
  **/
-_public_ const char *udev_device_get_driver(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_driver(struct udev_device *udev_device) {
         const char *driver;
         int r;
 
@@ -108,7 +126,7 @@ _public_ const char *udev_device_get_driver(struct udev_device *udev_device) {
  *
  * Returns: the devtype name of the udev device, or #NULL if it cannot be determined
  **/
-_public_ const char *udev_device_get_devtype(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_devtype(struct udev_device *udev_device) {
         const char *devtype;
         int r;
 
@@ -132,7 +150,7 @@ _public_ const char *udev_device_get_devtype(struct udev_device *udev_device) {
  *
  * Returns: the subsystem name of the udev device, or #NULL if it cannot be determined
  **/
-_public_ const char *udev_device_get_subsystem(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_subsystem(struct udev_device *udev_device) {
         const char *subsystem;
         int r;
 
@@ -154,7 +172,7 @@ _public_ const char *udev_device_get_subsystem(struct udev_device *udev_device) 
  *
  * Returns: the property string, or #NULL if there is no such property.
  **/
-_public_ const char *udev_device_get_property_value(struct udev_device *udev_device, const char *key) {
+_public_ const char* udev_device_get_property_value(struct udev_device *udev_device, const char *key) {
         const char *value;
         int r;
 
@@ -167,10 +185,27 @@ _public_ const char *udev_device_get_property_value(struct udev_device *udev_dev
         return value;
 }
 
-struct udev_device *udev_device_new(struct udev *udev, sd_device *device) {
+struct udev_device* udev_device_new(struct udev *udev, sd_device *device) {
+        _cleanup_(udev_list_freep) struct udev_list *properties = NULL, *all_tags = NULL, *current_tags = NULL, *sysattrs = NULL, *devlinks = NULL;
         struct udev_device *udev_device;
 
         assert(device);
+
+        properties = udev_list_new(true);
+        if (!properties)
+                return_with_errno(NULL, ENOMEM);
+        all_tags = udev_list_new(true);
+        if (!all_tags)
+                return_with_errno(NULL, ENOMEM);
+        current_tags = udev_list_new(true);
+        if (!current_tags)
+                return_with_errno(NULL, ENOMEM);
+        sysattrs = udev_list_new(true);
+        if (!sysattrs)
+                return_with_errno(NULL, ENOMEM);
+        devlinks = udev_list_new(true);
+        if (!devlinks)
+                return_with_errno(NULL, ENOMEM);
 
         udev_device = new(struct udev_device, 1);
         if (!udev_device)
@@ -180,12 +215,12 @@ struct udev_device *udev_device_new(struct udev *udev, sd_device *device) {
                 .n_ref = 1,
                 .udev = udev,
                 .device = sd_device_ref(device),
+                .properties = TAKE_PTR(properties),
+                .all_tags = TAKE_PTR(all_tags),
+                .current_tags = TAKE_PTR(current_tags),
+                .sysattrs = TAKE_PTR(sysattrs),
+                .devlinks = TAKE_PTR(devlinks),
         };
-
-        udev_list_init(&udev_device->properties, true);
-        udev_list_init(&udev_device->tags, true);
-        udev_list_init(&udev_device->sysattrs, true);
-        udev_list_init(&udev_device->devlinks, true);
 
         return udev_device;
 }
@@ -204,7 +239,7 @@ struct udev_device *udev_device_new(struct udev *udev, sd_device *device) {
  *
  * Returns: a new udev device, or #NULL, if it does not exist
  **/
-_public_ struct udev_device *udev_device_new_from_syspath(struct udev *udev, const char *syspath) {
+_public_ struct udev_device* udev_device_new_from_syspath(struct udev *udev, const char *syspath) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
@@ -231,7 +266,7 @@ _public_ struct udev_device *udev_device_new_from_syspath(struct udev *udev, con
  *
  * Returns: a new udev device, or #NULL, if it does not exist
  **/
-_public_ struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, dev_t devnum) {
+_public_ struct udev_device* udev_device_new_from_devnum(struct udev *udev, char type, dev_t devnum) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
@@ -260,7 +295,7 @@ _public_ struct udev_device *udev_device_new_from_devnum(struct udev *udev, char
  *
  * Returns: a new udev device, or #NULL, if it does not exist
  **/
-_public_ struct udev_device *udev_device_new_from_device_id(struct udev *udev, const char *id) {
+_public_ struct udev_device* udev_device_new_from_device_id(struct udev *udev, const char *id) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
@@ -286,7 +321,7 @@ _public_ struct udev_device *udev_device_new_from_device_id(struct udev *udev, c
  *
  * Returns: a new udev device, or #NULL, if it does not exist
  **/
-_public_ struct udev_device *udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname) {
+_public_ struct udev_device* udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
@@ -302,7 +337,7 @@ _public_ struct udev_device *udev_device_new_from_subsystem_sysname(struct udev 
  * @udev: udev library context
  *
  * Create new udev device, and fill in information from the
- * current process environment. This only works reliable if
+ * current process environment. This only works reliably if
  * the process is called from a udev rule. It is usually used
  * for tools executed from IMPORT= rules.
  *
@@ -311,7 +346,7 @@ _public_ struct udev_device *udev_device_new_from_subsystem_sysname(struct udev 
  *
  * Returns: a new udev device, or #NULL, if it does not exist
  **/
-_public_ struct udev_device *udev_device_new_from_environment(struct udev *udev) {
+_public_ struct udev_device* udev_device_new_from_environment(struct udev *udev) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         int r;
 
@@ -322,7 +357,7 @@ _public_ struct udev_device *udev_device_new_from_environment(struct udev *udev)
         return udev_device_new(udev, device);
 }
 
-static struct udev_device *device_new_from_parent(struct udev_device *child) {
+static struct udev_device* device_new_from_parent(struct udev_device *child) {
         sd_device *parent;
         int r;
 
@@ -353,15 +388,18 @@ static struct udev_device *device_new_from_parent(struct udev_device *child) {
  *
  * Returns: a new udev device, or #NULL, if it no parent exist.
  **/
-_public_ struct udev_device *udev_device_get_parent(struct udev_device *udev_device) {
+_public_ struct udev_device* udev_device_get_parent(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
         if (!udev_device->parent_set) {
                 udev_device->parent_set = true;
                 udev_device->parent = device_new_from_parent(udev_device);
+                udev_device->parent_errno = udev_device->parent ? 0 : errno;
         }
 
-        /* TODO: errno will differ here in case parent == NULL */
+        if (!udev_device->parent)
+                errno = udev_device->parent_errno;
+
         return udev_device->parent;
 }
 
@@ -386,7 +424,11 @@ _public_ struct udev_device *udev_device_get_parent(struct udev_device *udev_dev
  *
  * Returns: a new udev device, or #NULL if no matching parent exists.
  **/
-_public_ struct udev_device *udev_device_get_parent_with_subsystem_devtype(struct udev_device *udev_device, const char *subsystem, const char *devtype) {
+_public_ struct udev_device* udev_device_get_parent_with_subsystem_devtype(
+                struct udev_device *udev_device,
+                const char *subsystem,
+                const char *devtype) {
+
         sd_device *parent;
         int r;
 
@@ -417,22 +459,23 @@ _public_ struct udev_device *udev_device_get_parent_with_subsystem_devtype(struc
  *
  * Returns: the udev library context
  **/
-_public_ struct udev *udev_device_get_udev(struct udev_device *udev_device) {
+_public_ struct udev* udev_device_get_udev(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
         return udev_device->udev;
 }
 
-static struct udev_device *udev_device_free(struct udev_device *udev_device) {
+static struct udev_device* udev_device_free(struct udev_device *udev_device) {
         assert(udev_device);
 
         sd_device_unref(udev_device->device);
         udev_device_unref(udev_device->parent);
 
-        udev_list_cleanup(&udev_device->properties);
-        udev_list_cleanup(&udev_device->sysattrs);
-        udev_list_cleanup(&udev_device->tags);
-        udev_list_cleanup(&udev_device->devlinks);
+        udev_list_free(udev_device->properties);
+        udev_list_free(udev_device->sysattrs);
+        udev_list_free(udev_device->all_tags);
+        udev_list_free(udev_device->current_tags);
+        udev_list_free(udev_device->devlinks);
 
         return mfree(udev_device);
 }
@@ -466,7 +509,7 @@ DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(struct udev_device, udev_device, udev_devic
  *
  * Returns: the devpath of the udev device
  **/
-_public_ const char *udev_device_get_devpath(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_devpath(struct udev_device *udev_device) {
         const char *devpath;
         int r;
 
@@ -488,7 +531,7 @@ _public_ const char *udev_device_get_devpath(struct udev_device *udev_device) {
  *
  * Returns: the sys path of the udev device
  **/
-_public_ const char *udev_device_get_syspath(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_syspath(struct udev_device *udev_device) {
         const char *syspath;
         int r;
 
@@ -509,7 +552,7 @@ _public_ const char *udev_device_get_syspath(struct udev_device *udev_device) {
  *
  * Returns: the name string of the device
  **/
-_public_ const char *udev_device_get_sysname(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_sysname(struct udev_device *udev_device) {
         const char *sysname;
         int r;
 
@@ -530,7 +573,7 @@ _public_ const char *udev_device_get_sysname(struct udev_device *udev_device) {
  *
  * Returns: the trailing number string of the device name
  **/
-_public_ const char *udev_device_get_sysnum(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_sysnum(struct udev_device *udev_device) {
         const char *sysnum;
         int r;
 
@@ -554,7 +597,7 @@ _public_ const char *udev_device_get_sysnum(struct udev_device *udev_device) {
  *
  * Returns: the device node file name of the udev device, or #NULL if no device node exists
  **/
-_public_ const char *udev_device_get_devnode(struct udev_device *udev_device) {
+_public_ const char* udev_device_get_devnode(struct udev_device *udev_device) {
         const char *devnode;
         int r;
 
@@ -580,24 +623,22 @@ _public_ const char *udev_device_get_devnode(struct udev_device *udev_device) {
  *
  * Returns: the first entry of the device node link list
  **/
-_public_ struct udev_list_entry *udev_device_get_devlinks_list_entry(struct udev_device *udev_device) {
+_public_ struct udev_list_entry* udev_device_get_devlinks_list_entry(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
         if (device_get_devlinks_generation(udev_device->device) != udev_device->devlinks_generation ||
             !udev_device->devlinks_read) {
-                const char *devlink;
-
-                udev_list_cleanup(&udev_device->devlinks);
+                udev_list_cleanup(udev_device->devlinks);
 
                 FOREACH_DEVICE_DEVLINK(udev_device->device, devlink)
-                        if (!udev_list_entry_add(&udev_device->devlinks, devlink, NULL))
+                        if (!udev_list_entry_add(udev_device->devlinks, devlink, NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->devlinks_read = true;
                 udev_device->devlinks_generation = device_get_devlinks_generation(udev_device->device);
         }
 
-        return udev_list_get_entry(&udev_device->devlinks);
+        return udev_list_get_entry(udev_device->devlinks);
 }
 
 /**
@@ -612,24 +653,22 @@ _public_ struct udev_list_entry *udev_device_get_devlinks_list_entry(struct udev
  *
  * Returns: the first entry of the property list
  **/
-_public_ struct udev_list_entry *udev_device_get_properties_list_entry(struct udev_device *udev_device) {
+_public_ struct udev_list_entry* udev_device_get_properties_list_entry(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
         if (device_get_properties_generation(udev_device->device) != udev_device->properties_generation ||
             !udev_device->properties_read) {
-                const char *key, *value;
-
-                udev_list_cleanup(&udev_device->properties);
+                udev_list_cleanup(udev_device->properties);
 
                 FOREACH_DEVICE_PROPERTY(udev_device->device, key, value)
-                        if (!udev_list_entry_add(&udev_device->properties, key, value))
+                        if (!udev_list_entry_add(udev_device->properties, key, value))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->properties_read = true;
                 udev_device->properties_generation = device_get_properties_generation(udev_device->device);
         }
 
-        return udev_list_get_entry(&udev_device->properties);
+        return udev_list_get_entry(udev_device->properties);
 }
 
 /**
@@ -637,17 +676,17 @@ _public_ struct udev_list_entry *udev_device_get_properties_list_entry(struct ud
  * @udev_device: udev device
  *
  * This is only valid if the device was received through a monitor. Devices read from
- * sys do not have an action string. Usual actions are: add, remove, change, online,
- * offline.
+ * sys do not have an action string. Usual actions are: add, remove, change, move,
+ * online, offline.
  *
  * Returns: the kernel action value, or #NULL if there is no action value available.
  **/
-_public_ const char *udev_device_get_action(struct udev_device *udev_device) {
-        DeviceAction action;
+_public_ const char* udev_device_get_action(struct udev_device *udev_device) {
+        sd_device_action_t action;
 
         assert_return_errno(udev_device, NULL, EINVAL);
 
-        if (device_get_action(udev_device->device, &action) < 0)
+        if (sd_device_get_action(udev_device->device, &action) < 0)
                 return NULL;
 
         return device_action_to_string(action);
@@ -688,7 +727,7 @@ _public_ unsigned long long int udev_device_get_usec_since_initialized(struct ud
  *
  * Returns: the content of a sys attribute file, or #NULL if there is no sys attribute value.
  **/
-_public_ const char *udev_device_get_sysattr_value(struct udev_device *udev_device, const char *sysattr) {
+_public_ const char* udev_device_get_sysattr_value(struct udev_device *udev_device, const char *sysattr) {
         const char *value;
         int r;
 
@@ -733,22 +772,20 @@ _public_ int udev_device_set_sysattr_value(struct udev_device *udev_device, cons
  *
  * Returns: the first entry of the property list
  **/
-_public_ struct udev_list_entry *udev_device_get_sysattr_list_entry(struct udev_device *udev_device) {
+_public_ struct udev_list_entry* udev_device_get_sysattr_list_entry(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
         if (!udev_device->sysattrs_read) {
-                const char *sysattr;
-
-                udev_list_cleanup(&udev_device->sysattrs);
+                udev_list_cleanup(udev_device->sysattrs);
 
                 FOREACH_DEVICE_SYSATTR(udev_device->device, sysattr)
-                        if (!udev_list_entry_add(&udev_device->sysattrs, sysattr, NULL))
+                        if (!udev_list_entry_add(udev_device->sysattrs, sysattr, NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->sysattrs_read = true;
         }
 
-        return udev_list_get_entry(&udev_device->sysattrs);
+        return udev_list_get_entry(udev_device->sysattrs);
 }
 
 /**
@@ -787,24 +824,40 @@ _public_ int udev_device_get_is_initialized(struct udev_device *udev_device) {
  *
  * Returns: the first entry of the tag list
  **/
-_public_ struct udev_list_entry *udev_device_get_tags_list_entry(struct udev_device *udev_device) {
+_public_ struct udev_list_entry* udev_device_get_tags_list_entry(struct udev_device *udev_device) {
         assert_return_errno(udev_device, NULL, EINVAL);
 
-        if (device_get_tags_generation(udev_device->device) != udev_device->tags_generation ||
-            !udev_device->tags_read) {
-                const char *tag;
-
-                udev_list_cleanup(&udev_device->tags);
+        if (device_get_tags_generation(udev_device->device) != udev_device->all_tags_generation ||
+            !udev_device->all_tags_read) {
+                udev_list_cleanup(udev_device->all_tags);
 
                 FOREACH_DEVICE_TAG(udev_device->device, tag)
-                        if (!udev_list_entry_add(&udev_device->tags, tag, NULL))
+                        if (!udev_list_entry_add(udev_device->all_tags, tag, NULL))
                                 return_with_errno(NULL, ENOMEM);
 
-                udev_device->tags_read = true;
-                udev_device->tags_generation = device_get_tags_generation(udev_device->device);
+                udev_device->all_tags_read = true;
+                udev_device->all_tags_generation = device_get_tags_generation(udev_device->device);
         }
 
-        return udev_list_get_entry(&udev_device->tags);
+        return udev_list_get_entry(udev_device->all_tags);
+}
+
+_public_ struct udev_list_entry* udev_device_get_current_tags_list_entry(struct udev_device *udev_device) {
+        assert_return_errno(udev_device, NULL, EINVAL);
+
+        if (device_get_tags_generation(udev_device->device) != udev_device->current_tags_generation ||
+            !udev_device->current_tags_read) {
+                udev_list_cleanup(udev_device->current_tags);
+
+                FOREACH_DEVICE_CURRENT_TAG(udev_device->device, tag)
+                        if (!udev_list_entry_add(udev_device->current_tags, tag, NULL))
+                                return_with_errno(NULL, ENOMEM);
+
+                udev_device->current_tags_read = true;
+                udev_device->current_tags_generation = device_get_tags_generation(udev_device->device);
+        }
+
+        return udev_list_get_entry(udev_device->current_tags);
 }
 
 /**
@@ -820,4 +873,16 @@ _public_ int udev_device_has_tag(struct udev_device *udev_device, const char *ta
         assert_return(udev_device, 0);
 
         return sd_device_has_tag(udev_device->device, tag) > 0;
+}
+
+_public_ int udev_device_has_current_tag(struct udev_device *udev_device, const char *tag) {
+        assert_return(udev_device, 0);
+
+        return sd_device_has_current_tag(udev_device->device, tag) > 0;
+}
+
+sd_device* udev_device_get_sd_device(struct udev_device *udev_device) {
+        assert(udev_device);
+
+        return udev_device->device;
 }

@@ -1,5 +1,6 @@
-# networkctl(1) completion                               -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# shellcheck shell=bash
+# systemd-id128(1) completion                         -*- shell-script -*-
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -26,14 +27,15 @@ __contains_word () {
 
 _systemd_id128() {
     local i verb comps
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local -A OPTS=(
-        [STANDALONE]='-h --help --version -p --pretty'
-        [ARG]='-a --app-specific'
+        [STANDALONE]='-h --help --version -p --pretty --value -u --uuid --no-legend --no-pager -j'
+        [ARG]='-a --app-specific --json'
     )
 
     local -A VERBS=(
-        [STANDALONE]='new machine-id boot-id invocation-id help'
+        [STANDALONE]='new machine-id boot-id invocation-id var-partition-uuid help'
+        [ARG]='show'
     )
 
     _init_completion || return
@@ -42,6 +44,9 @@ _systemd_id128() {
         case $prev in
             --app-specific|-a)
                 comps=""
+                ;;
+            --json)
+                comps="short pretty off"
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
@@ -61,10 +66,16 @@ _systemd_id128() {
         fi
     done
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
     elif __contains_word "$verb" ${VERBS[STANDALONE]}; then
         comps=''
+    elif __contains_word "$verb" ${VERBS[ARG]}; then
+        case $verb in
+            show)
+                comps="$(IFS='\n ' systemd-id128 show --no-legend)"
+                ;;
+        esac
     fi
 
     COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

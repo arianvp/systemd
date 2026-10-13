@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # systemd-cgtop(1) completion                  -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word() {
     local w word=$1; shift
@@ -25,11 +26,13 @@ __contains_word() {
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 _systemd_cgtop() {
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local comps
 
     local -A OPTS=(
@@ -56,6 +59,9 @@ _systemd_cgtop() {
     fi
 
     COMPREPLY=( $(compgen -W '${OPTS[*]}' -- "$cur") )
+    if [ -d /sys/fs/cgroup/ ]; then
+        COMPREPLY+=( $(cd /sys/fs/cgroup/ && compgen -o nospace -o dirnames "$cur") )
+    fi
 }
 
 complete -F _systemd_cgtop systemd-cgtop

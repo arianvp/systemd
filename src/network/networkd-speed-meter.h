@@ -1,5 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
+
+#include "networkd-forward.h"
 
 /* Default interval is 10sec. The speed meter periodically make networkd
  * to be woke up. So, too small interval value is not desired.
@@ -7,6 +9,5 @@
 #define SPEED_METER_DEFAULT_TIME_INTERVAL (10 * USEC_PER_SEC)
 #define SPEED_METER_MINIMUM_TIME_INTERVAL (100 * USEC_PER_MSEC)
 
-typedef struct Manager Manager;
-
+void link_get_bit_rates(Link *link, uint64_t *ret_tx, uint64_t *ret_rx);
 int manager_start_speed_meter(Manager *m);

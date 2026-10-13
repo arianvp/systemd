@@ -1,325 +1,1007 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <dirent.h>
-#include <errno.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
+#include "alloc-util.h"
+#include "chase.h"
 #include "conf-files.h"
-#include "def.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "fileio.h"
+#include "glyph-util.h"
 #include "hashmap.h"
 #include "log.h"
-#include "macro.h"
-#include "missing.h"
+#include "nulstr-util.h"
 #include "path-util.h"
 #include "set.h"
-#include "sort-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
 
-static int files_add(
-                Hashmap *h,
-                Set *masked,
-                const char *suffix,
+ConfFile* conf_file_free(ConfFile *c) {
+        if (!c)
+                return NULL;
+
+        free(c->filename);
+        free(c->result);
+        free(c->original_path);
+        free(c->resolved_path);
+        safe_close(c->fd);
+
+        return mfree(c);
+}
+
+DEFINE_POINTER_ARRAY_FREE_FUNC(ConfFile*, conf_file_free);
+
+static int conf_files_log_level(ConfFilesFlags flags) {
+        return FLAGS_SET(flags, CONF_FILES_WARN) ? LOG_WARNING : LOG_DEBUG;
+}
+
+static int prepare_dirs(
                 const char *root,
-                unsigned flags,
-                const char *path) {
+                ConfFilesFlags flags,
+                char * const *dirs,
+                char **ret_root,
+                int *ret_rfd,
+                char ***ret_dirs) {
 
-        _cleanup_closedir_ DIR *dir = NULL;
-        const char *dirpath;
-        struct dirent *de;
+        _cleanup_free_ char *root_abs = NULL;
+        _cleanup_strv_free_ char **dirs_abs = NULL;
         int r;
 
-        assert(h);
-        assert((flags & CONF_FILES_FILTER_MASKED) == 0 || masked);
-        assert(path);
+        assert(ret_root);
+        assert(ret_rfd);
+        assert(ret_dirs || strv_isempty(dirs));
 
-        dirpath = prefix_roota(root, path);
+        int log_level = conf_files_log_level(flags);
 
-        dir = opendir(dirpath);
-        if (!dir) {
-                if (errno == ENOENT)
-                        return 0;
+        r = empty_or_root_harder_to_null(&root);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to determine if '%s' points to the root directory: %m", strempty(root));
 
-                return log_debug_errno(errno, "Failed to open directory '%s': %m", dirpath);
+        if (ret_dirs) {
+                dirs_abs = strv_copy(dirs);
+                if (!dirs_abs)
+                        return log_oom_full(log_level);
         }
 
-        FOREACH_DIRENT(de, dir, return -errno) {
-                struct stat st;
-                char *p, *key;
+        _cleanup_close_ int rfd = XAT_FDROOT;
+        if (root) {
+                /* When a non-trivial root is specified, we will prefix the result later. Hence, it is not
+                 * necessary to modify each config directories here. but needs to normalize the root directory. */
+                r = path_make_absolute_cwd(root, &root_abs);
+                if (r < 0)
+                        return log_full_errno(log_level, r, "Failed to make '%s' absolute: %m", root);
+
+                path_simplify(root_abs);
+
+                rfd = open(root, O_CLOEXEC|O_DIRECTORY|O_PATH);
+                if (rfd < 0)
+                        return log_full_errno(log_level, errno, "Failed to open '%s': %m", root_abs);
+
+        } else if (ret_dirs) {
+                /* When an empty root or "/" is specified, we will open "/" below, hence we need to make
+                 * each config directory absolute if relative. */
+                r = path_strv_make_absolute_cwd(dirs_abs);
+                if (r < 0)
+                        return log_full_errno(log_level, r, "Failed to make directories absolute: %m");
+        }
+
+        *ret_root = TAKE_PTR(root_abs);
+        *ret_rfd = TAKE_FD(rfd);
+        if (ret_dirs)
+                *ret_dirs = TAKE_PTR(dirs_abs);
+        return 0;
+}
+
+static int conf_file_prefix_root(ConfFile *c, const char *root, ConfFilesFlags flags) {
+        char *p;
+        int r;
+
+        assert(c);
+
+        if (FLAGS_SET(flags, CONF_FILES_DONT_PREFIX_ROOT))
+                return 0;
+
+        int log_level = conf_files_log_level(flags);
+
+        r = chaseat_prefix_root(c->result, root, &p);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->result, root);
+        free_and_replace(c->result, p);
+
+        r = chaseat_prefix_root(c->resolved_path, root, &p);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->resolved_path, root);
+        free_and_replace(c->resolved_path, p);
+
+        /* Do not use chaseat_prefix_root(), as it is for the result of chaseat(), but the path is not chased. */
+        p = path_join(empty_to_root(root), skip_leading_slash(c->original_path));
+        if (!p)
+                return log_oom_full(log_level);
+
+        path_simplify(p);
+        return free_and_replace(c->original_path, p);
+}
+
+static bool conf_files_need_stat(ConfFilesFlags flags) {
+        return (flags & (CONF_FILES_FILTER_MASKED | CONF_FILES_REGULAR | CONF_FILES_DIRECTORY | CONF_FILES_EXECUTABLE)) != 0;
+}
+
+static ChaseFlags conf_files_chase_flags(ConfFilesFlags flags) {
+        ChaseFlags chase_flags = 0;
+
+        if (!conf_files_need_stat(flags) || FLAGS_SET(flags, CONF_FILES_FILTER_MASKED_BY_SYMLINK))
+                /* Even if no verification is requested, let's unconditionally call chaseat(),
+                 * to drop unsafe symlinks. */
+                chase_flags |= CHASE_NONEXISTENT;
+
+        return chase_flags;
+}
+
+static int conf_file_chase_and_verify(
+                const char *root,          /* for logging, can be NULL */
+                int rfd,
+                const char *original_path, /* for logging */
+                const char *path,
+                const char *name,
+                Set **masked,              /* optional */
+                ConfFilesFlags flags,
+                char **ret_path,
+                int *ret_fd,
+                struct stat *ret_stat) {
+
+        _cleanup_free_ char *resolved_path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        struct stat st = {};
+        int r;
+
+        assert(wildcard_fd_is_valid(rfd));
+        assert(original_path);
+        assert(path);
+        assert(name);
+
+        int log_level = conf_files_log_level(flags);
+
+        root = empty_to_root(root);
+
+        r = chaseat(rfd, rfd, path, conf_files_chase_flags(flags), &resolved_path, &fd);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to chase '%s%s': %m",
+                                      root, skip_leading_slash(original_path));
+        if (r == 0) {
+                if (FLAGS_SET(flags, CONF_FILES_FILTER_MASKED_BY_SYMLINK)) {
+                        /* If the path points to /dev/null in a image or so, then the device node may not exist. */
+                        if (path_equal(skip_leading_slash(resolved_path), "dev/null")) {
+                                if (masked) {
+                                        /* Mark this one as masked */
+                                        r = set_put_strdup(masked, name);
+                                        if (r < 0)
+                                                return log_oom_full(log_level);
+                                }
+
+                                return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL),
+                                                       "File '%s%s' is a mask (symlink to /dev/null).",
+                                                       root, skip_leading_slash(original_path));
+                        }
+                }
+
+                if (conf_files_need_stat(flags))
+                        /* If we need to have stat, skip the entry. */
+                        return log_full_errno(log_level, SYNTHETIC_ERRNO(ENOENT), "Failed to chase '%s%s': %m",
+                                              root, skip_leading_slash(original_path));
+        }
+
+        /* Even if we do not need stat, let's take stat now. The caller may use the info later. */
+        if (fd >= 0 && fstat(fd, &st) < 0)
+                return log_full_errno(log_level, errno, "Failed to stat '%s%s': %m",
+                                      root, skip_leading_slash(original_path));
+
+        /* Is this a masking entry? */
+        if (FLAGS_SET(flags, CONF_FILES_FILTER_MASKED_BY_SYMLINK) && stat_may_be_dev_null(&st)) {
+                if (masked) {
+                        /* Mark this one as masked */
+                        r = set_put_strdup(masked, name);
+                        if (r < 0)
+                                return log_oom_full(log_level);
+                }
+
+                return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL),
+                                       "File '%s%s' is a mask (symlink to /dev/null).",
+                                       root, skip_leading_slash(original_path));
+        }
+
+        if (FLAGS_SET(flags, CONF_FILES_FILTER_MASKED_BY_EMPTY) && stat_is_empty(&st)) {
+                if (masked) {
+                        /* Mark this one as masked */
+                        r = set_put_strdup(masked, name);
+                        if (r < 0)
+                                return log_oom_full(log_level);
+                }
+
+                return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL),
+                                       "File '%s%s' is a mask (an empty file).",
+                                       root, skip_leading_slash(original_path));
+        }
+
+        if (FLAGS_SET(flags, CONF_FILES_REGULAR|CONF_FILES_DIRECTORY)) {
+                if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADFD),
+                                               "File '%s%s' is neither a regular file or directory.",
+                                               root, skip_leading_slash(original_path));
+        } else {
+                /* Is this node a regular file? */
+                if (FLAGS_SET(flags, CONF_FILES_REGULAR)) {
+                        r = stat_verify_regular(&st);
+                        if (r < 0)
+                                return log_debug_errno(r, "File '%s%s' is not a regular file: %m",
+                                                       root, skip_leading_slash(original_path));
+                }
+
+                /* Is this node a directory? */
+                if (FLAGS_SET(flags, CONF_FILES_DIRECTORY)) {
+                        r = stat_verify_directory(&st);
+                        if (r < 0)
+                                return log_debug_errno(r, "File '%s%s' is not a directory: %m",
+                                                       root, skip_leading_slash(original_path));
+                }
+        }
+
+        /* Does this node have the executable bit set?
+         * As requested: check if the file is marked executable. Note that we don't check access(X_OK) here,
+         * as we care about whether the file is marked executable at all, and not whether it is executable
+         * for us, because if so, such errors are stuff we should log about. */
+        if (FLAGS_SET(flags, CONF_FILES_EXECUTABLE) && (st.st_mode & 0111) == 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOEXEC),
+                                       "File '%s%s' is not marked executable.",
+                                       root, skip_leading_slash(original_path));
+
+        if (ret_path)
+                *ret_path = TAKE_PTR(resolved_path);
+        if (ret_fd)
+                *ret_fd = TAKE_FD(fd);
+        if (ret_stat)
+                *ret_stat = st;
+
+        return 0;
+}
+
+int conf_file_new_at(
+                const char *path,
+                const char *root,
+                int rfd,
+                ConfFilesFlags flags,
+                ConfFile **ret) {
+        int r;
+
+        assert(path);
+        assert(wildcard_fd_is_valid(rfd));
+        assert(ret);
+
+        int log_level = conf_files_log_level(flags);
+
+        _cleanup_free_ char *_root = NULL;
+        if (DEBUG_LOGGING && !root) {
+                (void) fd_get_path(rfd, &_root);
+                root = _root;
+        }
+
+        _cleanup_(conf_file_freep) ConfFile *c = new(ConfFile, 1);
+        if (!c)
+                return log_oom_full(log_level);
+
+        *c = (ConfFile) {
+                .original_path = strdup(path),
+                .fd = -EBADF,
+        };
+
+        if (!c->original_path)
+                return log_oom_full(log_level);
+
+        r = path_extract_filename(path, &c->filename);
+        if (r < 0)
+                return log_full_errno(log_level, r, "Failed to extract filename from '%s': %m", path);
+
+        _cleanup_free_ char *dirpath = NULL, *resolved_dirpath = NULL;
+        r = path_extract_directory(path, &dirpath);
+        if (r < 0 && r != -EDESTADDRREQ)
+                return log_full_errno(log_level, r, "Failed to extract directory from '%s': %m", path);
+        if (r >= 0) {
+                r = chaseat(rfd, rfd, dirpath,
+                            CHASE_MUST_BE_DIRECTORY | conf_files_chase_flags(flags),
+                            &resolved_dirpath, /* ret_fd= */ NULL);
+                if (r < 0)
+                        return log_full_errno(log_level, r, "Failed to chase '%s%s': %m", empty_to_root(root), skip_leading_slash(dirpath));
+        }
+
+        c->result = path_join(resolved_dirpath, c->filename);
+        if (!c->result)
+                return log_oom_full(log_level);
+
+        r = conf_file_chase_and_verify(
+                        root,
+                        rfd,
+                        c->original_path,
+                        c->result,
+                        c->filename,
+                        /* masked= */ NULL,
+                        flags,
+                        &c->resolved_path,
+                        &c->fd,
+                        &c->st);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(c);
+        return 0;
+}
+
+int conf_file_new(const char *path, const char *root, ConfFilesFlags flags, ConfFile **ret) {
+        int r;
+
+        assert(path);
+        assert(ret);
+
+        _cleanup_free_ char *root_abs = NULL;
+        _cleanup_close_ int rfd = -EBADF;
+        r = prepare_dirs(root, flags, /* dirs= */ NULL, &root_abs, &rfd, /* ret_dirs= */ NULL);
+        if (r < 0)
+                return r;
+
+        _cleanup_free_ char *path_abs = NULL;
+        if (!root_abs) {
+                r = path_make_absolute_cwd(path, &path_abs);
+                if (r < 0)
+                        return log_full_errno(conf_files_log_level(flags), r, "Failed to make '%s' absolute: %m", path);
+
+                path = path_abs;
+        }
+
+        _cleanup_(conf_file_freep) ConfFile *c = NULL;
+        r = conf_file_new_at(path, root_abs, rfd, flags, &c);
+        if (r < 0)
+                return r;
+
+        r = conf_file_prefix_root(c, root_abs, flags);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(c);
+        return 0;
+}
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                conf_file_hash_ops,
+                char, string_hash_func, string_compare_func,
+                ConfFile, conf_file_free);
+
+static int files_add(
+                DIR *dir,
+                const char *original_dirpath,
+                const char *resolved_dirpath,
+                const char *root, /* for logging, can be NULL */
+                int rfd,
+                Hashmap **files,
+                Set **masked,
+                const char *suffix,
+                ConfFilesFlags flags) {
+
+        int r;
+
+        assert(dir);
+        assert(original_dirpath);
+        assert(resolved_dirpath);
+        assert(wildcard_fd_is_valid(rfd));
+        assert(files);
+        assert(masked);
+
+        int log_level = conf_files_log_level(flags);
+
+        root = empty_to_root(root);
+
+        FOREACH_DIRENT(de, dir, return log_full_errno(log_level, errno, "Failed to read directory '%s%s': %m",
+                                                      root, skip_leading_slash(original_dirpath))) {
+
+                _cleanup_free_ char *original_path = path_join(original_dirpath, de->d_name);
+                if (!original_path)
+                        return log_oom_full(log_level);
 
                 /* Does this match the suffix? */
-                if (suffix && !endswith(de->d_name, suffix))
+                if (suffix && !endswith(de->d_name, suffix)) {
+                        log_debug("Skipping file '%s%s', suffix is not '%s'.", root, skip_leading_slash(original_path), suffix);
                         continue;
+                }
 
                 /* Has this file already been found in an earlier directory? */
-                if (hashmap_contains(h, de->d_name)) {
-                        log_debug("Skipping overridden file '%s/%s'.", dirpath, de->d_name);
+                if (hashmap_contains(*files, de->d_name)) {
+                        log_debug("Skipping overridden file '%s%s'.", root, skip_leading_slash(original_path));
                         continue;
                 }
 
                 /* Has this been masked in an earlier directory? */
-                if ((flags & CONF_FILES_FILTER_MASKED) && set_contains(masked, de->d_name)) {
-                        log_debug("File '%s/%s' is masked by previous entry.", dirpath, de->d_name);
+                if ((flags & CONF_FILES_FILTER_MASKED) != 0 && set_contains(*masked, de->d_name)) {
+                        log_debug("File '%s%s' is masked by previous entry.", root, skip_leading_slash(original_path));
                         continue;
                 }
 
-                /* Read file metadata if we shall validate the check for file masks, for node types or whether the node is marked executable. */
-                if (flags & (CONF_FILES_FILTER_MASKED|CONF_FILES_REGULAR|CONF_FILES_DIRECTORY|CONF_FILES_EXECUTABLE))
-                        if (fstatat(dirfd(dir), de->d_name, &st, 0) < 0) {
-                                log_debug_errno(errno, "Failed to stat '%s/%s', ignoring: %m", dirpath, de->d_name);
-                                continue;
-                        }
+                _cleanup_free_ char *p = path_join(resolved_dirpath, de->d_name);
+                if (!p)
+                        return log_oom_full(log_level);
 
-                /* Is this a masking entry? */
-                if ((flags & CONF_FILES_FILTER_MASKED))
-                        if (null_or_empty(&st)) {
-                                /* Mark this one as masked */
-                                r = set_put_strdup(masked, de->d_name);
-                                if (r < 0)
-                                        return r;
-
-                                log_debug("File '%s/%s' is a mask.", dirpath, de->d_name);
-                                continue;
-                        }
-
-                /* Does this node have the right type? */
-                if (flags & (CONF_FILES_REGULAR|CONF_FILES_DIRECTORY))
-                        if (!((flags & CONF_FILES_DIRECTORY) && S_ISDIR(st.st_mode)) &&
-                            !((flags & CONF_FILES_REGULAR) && S_ISREG(st.st_mode))) {
-                                log_debug("Ignoring '%s/%s', as it is not a of the right type.", dirpath, de->d_name);
-                                continue;
-                        }
-
-                /* Does this node have the executable bit set? */
-                if (flags & CONF_FILES_EXECUTABLE)
-                        /* As requested: check if the file is marked executable. Note that we don't check access(X_OK)
-                         * here, as we care about whether the file is marked executable at all, and not whether it is
-                         * executable for us, because if so, such errors are stuff we should log about. */
-
-                        if ((st.st_mode & 0111) == 0) { /* not executable */
-                                log_debug("Ignoring '%s/%s', as it is not marked executable.", dirpath, de->d_name);
-                                continue;
-                        }
-
-                if (flags & CONF_FILES_BASENAME) {
-                        p = strdup(de->d_name);
-                        if (!p)
-                                return -ENOMEM;
-
-                        key = p;
-                } else {
-                        p = strjoin(dirpath, "/", de->d_name);
-                        if (!p)
-                                return -ENOMEM;
-
-                        key = basename(p);
-                }
-
-                r = hashmap_put(h, key, p);
-                if (r < 0) {
-                        free(p);
-                        return log_debug_errno(r, "Failed to add item to hashmap: %m");
-                }
-
-                assert(r > 0);
-        }
-
-        return 0;
-}
-
-static int base_cmp(char * const *a, char * const *b) {
-        return strcmp(basename(*a), basename(*b));
-}
-
-static int conf_files_list_strv_internal(char ***strv, const char *suffix, const char *root, unsigned flags, char **dirs) {
-        _cleanup_hashmap_free_ Hashmap *fh = NULL;
-        _cleanup_set_free_free_ Set *masked = NULL;
-        char **files, **p;
-        int r;
-
-        assert(strv);
-
-        /* This alters the dirs string array */
-        if (!path_strv_resolve_uniq(dirs, root))
-                return -ENOMEM;
-
-        fh = hashmap_new(&path_hash_ops);
-        if (!fh)
-                return -ENOMEM;
-
-        if (flags & CONF_FILES_FILTER_MASKED) {
-                masked = set_new(&path_hash_ops);
-                if (!masked)
-                        return -ENOMEM;
-        }
-
-        STRV_FOREACH(p, dirs) {
-                r = files_add(fh, masked, suffix, root, flags, *p);
+                _cleanup_free_ char *resolved_path = NULL;
+                _cleanup_close_ int fd = -EBADF;
+                struct stat st;
+                r = conf_file_chase_and_verify(
+                                root,
+                                rfd,
+                                original_path,
+                                p,
+                                de->d_name,
+                                masked,
+                                flags,
+                                &resolved_path,
+                                &fd,
+                                &st);
                 if (r == -ENOMEM)
                         return r;
                 if (r < 0)
-                        log_debug_errno(r, "Failed to search for files in %s, ignoring: %m", *p);
+                        continue;
+
+                _cleanup_(conf_file_freep) ConfFile *c = new(ConfFile, 1);
+                if (!c)
+                        return log_oom_full(log_level);
+
+                *c = (ConfFile) {
+                        .filename = strdup(de->d_name),
+                        .result = TAKE_PTR(p),
+                        .original_path = TAKE_PTR(original_path),
+                        .resolved_path = TAKE_PTR(resolved_path),
+                        .fd = TAKE_FD(fd),
+                        .st = st,
+                };
+
+                if (!c->filename)
+                        return log_oom_full(log_level);
+
+                r = hashmap_ensure_put(files, &conf_file_hash_ops, c->filename, c);
+                if (r < 0) {
+                        assert(r == -ENOMEM);
+                        return log_oom_full(log_level);
+                }
+                assert(r > 0);
+
+                TAKE_PTR(c);
         }
-
-        files = hashmap_get_strv(fh);
-        if (!files)
-                return -ENOMEM;
-
-        typesafe_qsort(files, hashmap_size(fh), base_cmp);
-        *strv = files;
 
         return 0;
 }
 
-int conf_files_insert(char ***strv, const char *root, char **dirs, const char *path) {
-        /* Insert a path into strv, at the place honouring the usual sorting rules:
-         * - we first compare by the basename
-         * - and then we compare by dirname, allowing just one file with the given
-         *   basename.
-         * This means that we will
-         * - add a new entry if basename(path) was not on the list,
-         * - do nothing if an entry with higher priority was already present,
-         * - do nothing if our new entry matches the existing entry,
-         * - replace the existing entry if our new entry has higher priority.
-         */
-        size_t i, n;
-        char *t;
+static int dump_files(Hashmap *fh, const char *root, ConfFilesFlags flags, ConfFile ***ret_files, size_t *ret_n_files) {
+        ConfFile **files = NULL;
+        size_t n_files = 0;
         int r;
 
-        n = strv_length(*strv);
-        for (i = 0; i < n; i++) {
-                int c;
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
-                c = base_cmp((char* const*) *strv + i, (char* const*) &path);
-                if (c == 0) {
-                        char **dir;
+        assert(ret_files);
+        assert(ret_n_files);
 
-                        /* Oh, there already is an entry with a matching name (the last component). */
+        /* The entries in the array given by hashmap_dump_sorted() are still owned by the hashmap. */
+        r = hashmap_dump_sorted(fh, (void***) &files, &n_files);
+        if (r < 0)
+                return log_oom_full(conf_files_log_level(flags));
 
-                        STRV_FOREACH(dir, dirs) {
-                                _cleanup_free_ char *rdir = NULL;
-                                char *p1, *p2;
+        /* Hence, we need to remove them from the hashmap. */
+        FOREACH_ARRAY(i, files, n_files)
+                assert_se(hashmap_remove(fh, (*i)->filename) == *i);
 
-                                rdir = prefix_root(root, *dir);
-                                if (!rdir)
-                                        return -ENOMEM;
+        if (root)
+                FOREACH_ARRAY(i, files, n_files) {
+                        r = conf_file_prefix_root(*i, root, flags);
+                        if (r < 0)
+                                return r;
+                }
 
-                                p1 = path_startswith((*strv)[i], rdir);
-                                if (p1)
-                                        /* Existing entry with higher priority
-                                         * or same priority, no need to do anything. */
-                                        return 0;
+        *ret_files = TAKE_PTR(files);
+        *ret_n_files = n_files;
+        return 0;
+}
 
-                                p2 = path_startswith(path, *dir);
-                                if (p2) {
-                                        /* Our new entry has higher priority */
+static int copy_and_sort_files_from_hashmap(
+                Hashmap *fh,
+                const char *suffix,
+                const char *root,
+                ConfFilesFlags flags,
+                char ***ret) {
 
-                                        t = prefix_root(root, path);
-                                        if (!t)
-                                                return log_oom();
+        _cleanup_strv_free_ char **results = NULL;
+        _cleanup_free_ ConfFile **files = NULL;
+        size_t n_files = 0, n_results = 0;
+        int r;
 
-                                        return free_and_replace((*strv)[i], t);
-                                }
+        assert(ret);
+
+        int log_level = conf_files_log_level(flags);
+
+        /* The entries in the array given by hashmap_dump_sorted() are still owned by the hashmap.
+         * Hence, do not use conf_file_free_array() for 'entries' */
+        r = hashmap_dump_sorted(fh, (void***) &files, &n_files);
+        if (r < 0)
+                return log_oom_full(log_level);
+
+        FOREACH_ARRAY(i, files, n_files) {
+                ConfFile *c = *i;
+                const char *add = NULL;
+
+                if (FLAGS_SET(flags, CONF_FILES_BASENAME))
+                        add = c->filename;
+                else if (root && !FLAGS_SET(flags, CONF_FILES_DONT_PREFIX_ROOT)) {
+                        _cleanup_free_ char *p = NULL;
+
+                        r = chaseat_prefix_root(c->result, root, &p);
+                        if (r < 0)
+                                return log_full_errno(log_level, r, "Failed to prefix '%s' with root '%s': %m", c->result, root);
+
+                        if (FLAGS_SET(flags, CONF_FILES_TRUNCATE_SUFFIX) && suffix) {
+                                char *e = endswith(p, suffix);
+                                if (!e)
+                                        continue;
+
+                                *e = 0;
                         }
 
-                } else if (c > 0)
-                        /* Following files have lower priority, let's go insert our
-                         * new entry. */
-                        break;
+                        if (strv_consume_with_size(&results, &n_results, TAKE_PTR(p)) < 0)
+                                return log_oom_full(log_level);
 
-                /* … we are not there yet, let's continue */
+                        continue;
+                } else
+                        add = c->result;
+
+                if (FLAGS_SET(flags, CONF_FILES_TRUNCATE_SUFFIX)) {
+                        const char *e = endswith(add, suffix);
+                        if (!e)
+                                continue;
+
+                        _cleanup_free_ char *n = strndup(add, e - add);
+                        if (!n)
+                                return log_oom_full(log_level);
+
+                        r = strv_consume_with_size(&results, &n_results, TAKE_PTR(n));
+                } else
+                        r = strv_extend_with_size(&results, &n_results, add);
+                if (r < 0)
+                        return log_oom_full(log_level);
         }
 
-        /* The new file has lower priority than all the existing entries */
-        t = prefix_root(root, path);
-        if (!t)
-                return -ENOMEM;
+        *ret = TAKE_PTR(results);
+        return 0;
+}
 
-        r = strv_insert(strv, i, t);
+static int insert_replacement(Hashmap **fh, ConfFile *replacement, ConfFilesFlags flags, const ConfFile **ret) {
+        _cleanup_(conf_file_freep) ConfFile *c = ASSERT_PTR(replacement);
+        int r;
+
+        assert(fh);
+        assert(ret);
+
+        /* This consumes the input ConfFile. */
+
+        ConfFile *existing = hashmap_get(*fh, c->filename);
+        if (existing) {
+                log_debug("An entry with higher priority '%s' -> '%s' already exists, ignoring the replacement: %s",
+                          existing->filename, existing->result, c->original_path);
+                *ret = NULL;
+                return 0;
+        }
+
+        r = hashmap_ensure_put(fh, &conf_file_hash_ops, c->filename, c);
+        if (r < 0) {
+                assert(r == -ENOMEM);
+                return log_oom_full(conf_files_log_level(flags));
+        }
+        assert(r > 0);
+
+        log_debug("Inserted replacement: '%s' -> '%s'", c->filename, c->result);
+
+        *ret = TAKE_PTR(c);
+        return 0;
+}
+
+static int conf_files_list_impl(
+                const char *suffix,
+                const char *root, /* for logging, can be NULL */
+                int rfd,
+                ConfFilesFlags flags,
+                const char * const *dirs,
+                const char *replacement,
+                Hashmap **ret,
+                const ConfFile **ret_inserted) {
+
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_set_free_ Set *masked = NULL;
+        _cleanup_(conf_file_freep) ConfFile *c = NULL;
+        const ConfFile *inserted = NULL;
+        int r;
+
+        assert(wildcard_fd_is_valid(rfd));
+        assert(ret);
+
+        root = empty_to_root(root);
+
+        if (replacement) {
+                r = conf_file_new_at(replacement, root, rfd, flags & CONF_FILES_WARN, &c);
+                if (r < 0)
+                        return r;
+        }
+
+        STRV_FOREACH(p, dirs) {
+                _cleanup_closedir_ DIR *dir = NULL;
+                _cleanup_free_ char *path = NULL;
+
+                r = chase_and_opendirat(rfd, rfd, *p, 0, &path, &dir);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_full_errno(conf_files_log_level(flags), r,
+                                               "Failed to chase and open directory '%s%s', ignoring: %m",
+                                               root, skip_leading_slash(*p));
+                        continue;
+                }
+
+                if (c && streq_ptr(path_startswith(c->result, path), c->filename)) {
+                        r = insert_replacement(&fh, TAKE_PTR(c), flags, &inserted);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = files_add(dir, *p, path, root, rfd, &fh, &masked, suffix, flags);
+                if (r == -ENOMEM)
+                        return r;
+        }
+
+        if (c) {
+                r = insert_replacement(&fh, TAKE_PTR(c), flags, &inserted);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(fh);
+        if (ret_inserted)
+                *ret_inserted = inserted;
+        return 0;
+}
+
+int conf_files_list_strv(
+                char ***ret,
+                const char *suffix,
+                const char *root,
+                ConfFilesFlags flags,
+                const char * const *dirs) {
+
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_close_ int rfd = -EBADF;
+        _cleanup_free_ char *root_abs = NULL;
+        _cleanup_strv_free_ char **dirs_abs = NULL;
+        int r;
+
+        assert(ret);
+
+        r = prepare_dirs(root, flags, (char**) dirs, &root_abs, &rfd, &dirs_abs);
         if (r < 0)
-                free(t);
+                return r;
 
-        return r;
+        r = conf_files_list_impl(suffix, root_abs, rfd, flags, (const char * const *) dirs_abs,
+                                 /* replacement= */ NULL, &fh, /* ret_inserted= */ NULL);
+        if (r < 0)
+                return r;
+
+        return copy_and_sort_files_from_hashmap(fh, suffix, empty_to_root(root_abs), flags, ret);
 }
 
-int conf_files_list_strv(char ***strv, const char *suffix, const char *root, unsigned flags, const char* const* dirs) {
-        _cleanup_strv_free_ char **copy = NULL;
+int conf_files_list_strv_full(
+                const char *suffix,
+                const char *root,
+                ConfFilesFlags flags,
+                const char * const *dirs,
+                ConfFile ***ret_files,
+                size_t *ret_n_files) {
 
-        assert(strv);
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_close_ int rfd = -EBADF;
+        _cleanup_free_ char *root_abs = NULL;
+        _cleanup_strv_free_ char **dirs_abs = NULL;
+        int r;
 
-        copy = strv_copy((char**) dirs);
-        if (!copy)
-                return -ENOMEM;
+        assert(ret_files);
+        assert(ret_n_files);
 
-        return conf_files_list_strv_internal(strv, suffix, root, flags, copy);
+        r = prepare_dirs(root, flags, (char**) dirs, &root_abs, &rfd, &dirs_abs);
+        if (r < 0)
+                return r;
+
+        r = conf_files_list_impl(suffix, root_abs, rfd, flags, (const char * const *) dirs_abs,
+                                 /* replacement= */ NULL, &fh, /* ret_inserted= */ NULL);
+        if (r < 0)
+                return r;
+
+        return dump_files(fh, empty_to_root(root_abs), flags, ret_files, ret_n_files);
 }
 
-int conf_files_list(char ***strv, const char *suffix, const char *root, unsigned flags, const char *dir, ...) {
-        _cleanup_strv_free_ char **dirs = NULL;
-        va_list ap;
+int conf_files_list_strv_at(
+                char ***ret,
+                const char *suffix,
+                int rfd,
+                ConfFilesFlags flags,
+                const char * const *dirs) {
 
-        assert(strv);
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_free_ char *root = NULL;
+        int r;
 
-        va_start(ap, dir);
-        dirs = strv_new_ap(dir, ap);
-        va_end(ap);
+        assert(wildcard_fd_is_valid(rfd));
+        assert(ret);
 
-        if (!dirs)
-                return -ENOMEM;
+        if (DEBUG_LOGGING)
+                (void) fd_get_path(rfd, &root); /* for logging */
 
-        return conf_files_list_strv_internal(strv, suffix, root, flags, dirs);
+        r = conf_files_list_impl(suffix, root, rfd, flags, dirs, /* replacement= */ NULL, &fh, /* ret_inserted= */ NULL);
+        if (r < 0)
+                return r;
+
+        return copy_and_sort_files_from_hashmap(fh, suffix, /* root= */ NULL, flags, ret);
 }
 
-int conf_files_list_nulstr(char ***strv, const char *suffix, const char *root, unsigned flags, const char *dirs) {
+int conf_files_list_strv_at_full(
+                const char *suffix,
+                int rfd,
+                ConfFilesFlags flags,
+                const char * const *dirs,
+                ConfFile ***ret_files,
+                size_t *ret_n_files) {
+
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_free_ char *root = NULL;
+        int r;
+
+        assert(wildcard_fd_is_valid(rfd));
+        assert(ret_files);
+        assert(ret_n_files);
+
+        if (DEBUG_LOGGING)
+                (void) fd_get_path(rfd, &root); /* for logging */
+
+        r = conf_files_list_impl(suffix, root, rfd, flags, dirs, /* replacement= */ NULL, &fh, /* ret_inserted= */ NULL);
+        if (r < 0)
+                return r;
+
+        return dump_files(fh, /* root= */ NULL, flags, ret_files, ret_n_files);
+}
+
+int conf_files_list(char ***ret, const char *suffix, const char *root, ConfFilesFlags flags, const char *dir) {
+        return conf_files_list_strv(ret, suffix, root, flags, STRV_MAKE_CONST(dir));
+}
+
+int conf_files_list_full(const char *suffix, const char *root, ConfFilesFlags flags, const char *dir, ConfFile ***ret_files, size_t *ret_n_files) {
+        return conf_files_list_strv_full(suffix, root, flags, STRV_MAKE_CONST(dir), ret_files, ret_n_files);
+}
+
+int conf_files_list_at(char ***ret, const char *suffix, int rfd, ConfFilesFlags flags, const char *dir) {
+        return conf_files_list_strv_at(ret, suffix, rfd, flags, STRV_MAKE_CONST(dir));
+}
+
+int conf_files_list_at_full(const char *suffix, int rfd, ConfFilesFlags flags, const char *dir, ConfFile ***ret_files, size_t *ret_n_files) {
+        return conf_files_list_strv_at_full(suffix, rfd, flags, STRV_MAKE_CONST(dir), ret_files, ret_n_files);
+}
+
+int conf_files_list_nulstr(char ***ret, const char *suffix, const char *root, ConfFilesFlags flags, const char *dirs) {
         _cleanup_strv_free_ char **d = NULL;
 
-        assert(strv);
+        assert(ret);
 
         d = strv_split_nulstr(dirs);
         if (!d)
-                return -ENOMEM;
+                return log_oom_full(conf_files_log_level(flags));
 
-        return conf_files_list_strv_internal(strv, suffix, root, flags, d);
+        return conf_files_list_strv(ret, suffix, root, flags, (const char**) d);
+}
+
+int conf_files_list_nulstr_full(const char *suffix, const char *root, ConfFilesFlags flags, const char *dirs, ConfFile ***ret_files, size_t *ret_n_files) {
+        _cleanup_strv_free_ char **d = NULL;
+
+        assert(ret_files);
+        assert(ret_n_files);
+
+        d = strv_split_nulstr(dirs);
+        if (!d)
+                return log_oom_full(conf_files_log_level(flags));
+
+        return conf_files_list_strv_full(suffix, root, flags, (const char**) d, ret_files, ret_n_files);
+}
+
+int conf_files_list_nulstr_at(char ***ret, const char *suffix, int rfd, ConfFilesFlags flags, const char *dirs) {
+        _cleanup_strv_free_ char **d = NULL;
+
+        assert(ret);
+
+        d = strv_split_nulstr(dirs);
+        if (!d)
+                return log_oom_full(conf_files_log_level(flags));
+
+        return conf_files_list_strv_at(ret, suffix, rfd, flags, (const char**) d);
+}
+
+int conf_files_list_nulstr_at_full(const char *suffix, int rfd, ConfFilesFlags flags, const char *dirs, ConfFile ***ret_files, size_t *ret_n_files) {
+        _cleanup_strv_free_ char **d = NULL;
+
+        assert(ret_files);
+        assert(ret_n_files);
+
+        d = strv_split_nulstr(dirs);
+        if (!d)
+                return log_oom_full(conf_files_log_level(flags));
+
+        return conf_files_list_strv_at_full(suffix, rfd, flags, (const char**) d, ret_files, ret_n_files);
 }
 
 int conf_files_list_with_replacement(
                 const char *root,
                 char **config_dirs,
                 const char *replacement,
-                char ***files,
-                char **replace_file) {
+                char ***ret_files,
+                char **ret_inserted) {
 
-        _cleanup_strv_free_ char **f = NULL;
-        _cleanup_free_ char *p = NULL;
+        _cleanup_hashmap_free_ Hashmap *fh = NULL;
+        _cleanup_free_ char *inserted = NULL;
+        ConfFilesFlags flags = CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED_BY_SYMLINK | CONF_FILES_WARN;
+        _cleanup_close_ int rfd = -EBADF;
+        _cleanup_free_ char *root_abs = NULL;
+        _cleanup_strv_free_ char **dirs_abs = NULL;
+        const ConfFile *c = NULL;
         int r;
 
-        assert(config_dirs);
-        assert(files);
-        assert(replace_file || !replacement);
+        assert(ret_files);
 
-        r = conf_files_list_strv(&f, ".conf", root, 0, (const char* const*) config_dirs);
+        r = prepare_dirs(root, flags, config_dirs, &root_abs, &rfd, &dirs_abs);
         if (r < 0)
-                return log_error_errno(r, "Failed to enumerate config files: %m");
+                return r;
 
-        if (replacement) {
-                r = conf_files_insert(&f, root, config_dirs, replacement);
+        r = conf_files_list_impl(".conf", root_abs, rfd, flags, (const char * const *) dirs_abs,
+                                 replacement, &fh, ret_inserted ? &c : NULL);
+        if (r < 0)
+                return r;
+
+        if (c) {
+                r = chaseat_prefix_root(c->result, root_abs, &inserted);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to extend config file list: %m");
-
-                p = prefix_root(root, replacement);
-                if (!p)
-                        return log_oom();
+                        return log_full_errno(conf_files_log_level(flags), r,
+                                              "Failed to prefix '%s' with root '%s': %m",
+                                              c->result, empty_to_root(root_abs));
         }
 
-        *files = TAKE_PTR(f);
-        if (replace_file)
-                *replace_file = TAKE_PTR(p);
+        r = copy_and_sort_files_from_hashmap(fh, ".conf", empty_to_root(root_abs), flags, ret_files);
+        if (r < 0)
+                return r;
+
+        if (ret_inserted)
+                *ret_inserted = TAKE_PTR(inserted);
         return 0;
+}
+
+int conf_files_list_dropins(
+                char ***ret,
+                const char *dropin_dirname,
+                const char *root,
+                int root_fd,
+                ConfFilesFlags flags,
+                const char * const *dirs) {
+
+        _cleanup_strv_free_ char **dropin_dirs = NULL;
+        const char *suffix;
+        int r;
+
+        assert(ret);
+        assert(dropin_dirname);
+        assert(dirs);
+
+        suffix = strjoina("/", dropin_dirname);
+        r = strv_extend_strv_concat(&dropin_dirs, dirs, suffix);
+        if (r < 0)
+                return log_oom_full(conf_files_log_level(flags));
+
+        return conf_files_list_strv_at(ret, ".conf", root_fd, flags, (const char* const*) dropin_dirs);
+}
+
+/**
+ * Open and read a config file.
+ *
+ * The <fn> argument may be:
+ * - '-', meaning stdin.
+ * - a file name without a path. In this case <config_dirs> are searched.
+ * - a path, either relative or absolute. In this case <fn> is opened directly.
+ *
+ * This method is only suitable for configuration files which have a flat layout without dropins.
+ */
+int conf_file_read(
+                const char *root,
+                const char **config_dirs,
+                const char *fn,
+                parse_line_t parse_line,
+                void *userdata,
+                bool ignore_enoent,
+                bool *invalid_config) {
+
+        _cleanup_fclose_ FILE *_f = NULL;
+        _cleanup_free_ char *_fn = NULL;
+        unsigned v = 0;
+        FILE *f;
+        int r = 0;
+
+        assert(fn);
+
+        if (streq(fn, "-")) {
+                f = stdin;
+                fn = "<stdin>";
+
+                log_debug("Reading config from stdin%s", glyph(GLYPH_ELLIPSIS));
+
+        } else if (is_path(fn)) {
+                r = path_make_absolute_cwd(fn, &_fn);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make path absolute: %m");
+                fn = _fn;
+
+                f = _f = fopen(fn, "re");
+                if (!_f)
+                        r = -errno;
+                else
+                        log_debug("Reading config file \"%s\"%s", fn, glyph(GLYPH_ELLIPSIS));
+
+        } else {
+                r = search_and_fopen(fn, "re", root, config_dirs, &_f, &_fn);
+                if (r >= 0) {
+                        f = _f;
+                        fn = _fn;
+                        log_debug("Reading config file \"%s\"%s", fn, glyph(GLYPH_ELLIPSIS));
+                }
+        }
+
+        if (r == -ENOENT && ignore_enoent) {
+                log_debug_errno(r, "Failed to open \"%s\", ignoring: %m", fn);
+                return 0; /* No error, but nothing happened. */
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to read '%s': %m", fn);
+
+        r = 1;  /* We entered the part where we may modify state. */
+
+        for (;;) {
+                _cleanup_free_ char *line = NULL;
+                bool invalid_line = false;
+                int k;
+
+                k = read_stripped_line(f, LONG_LINE_MAX, &line);
+                if (k < 0)
+                        return log_error_errno(k, "Failed to read '%s': %m", fn);
+                if (k == 0)
+                        break;
+
+                v++;
+
+                if (IN_SET(line[0], 0, '#'))
+                        continue;
+
+                k = parse_line(fn, v, line, invalid_config ? &invalid_line : NULL, userdata);
+                if (k < 0 && invalid_line)
+                        /* Allow reporting with a special code if the caller requested this. */
+                        *invalid_config = true;
+                else
+                        /* The first error, if any, becomes our return value. */
+                        RET_GATHER(r, k);
+        }
+
+        if (ferror(f))
+                RET_GATHER(r, log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read from file %s.", fn));
+
+        return r;
 }

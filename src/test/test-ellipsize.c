@@ -1,13 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 
 #include "alloc-util.h"
-#include "def.h"
+#include "ansi-color.h"
+#include "escape.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
-#include "util.h"
+#include "tests.h"
 #include "utf8.h"
 
 static void test_ellipsize_mem_one(const char *s, size_t old_length, size_t new_length) {
@@ -56,30 +57,32 @@ static void test_ellipsize_mem_one(const char *s, size_t old_length, size_t new_
                 assert_se(utf8_console_width(t3) <= max_width);
 
         if (new_length >= old_length) {
-                assert_se(streq(t1, n));
-                assert_se(streq(t2, n));
-                assert_se(streq(t3, n));
+                ASSERT_STREQ(t1, n);
+                ASSERT_STREQ(t2, n);
+                ASSERT_STREQ(t3, n);
         }
 }
 
-static void test_ellipsize_mem(void) {
-        const char *s;
-        ssize_t l, k;
-
+TEST(ellipsize_mem) {
         FOREACH_STRING(s,
                        "_XXXXXXXXXXX_", /* ASCII */
                        "_aąęółśćńżźć_", /* two-byte utf-8 */
                        "გამარჯობა",     /* multi-byte utf-8 */
                        "你好世界",       /* wide characters */
                        "你გą世óoó界")    /* a mix */
-
-                for (l = strlen(s); l >= 0; l--)
-                        for (k = strlen(s) + 1; k >= 0; k--)
+                for (ssize_t l = strlen(s); l >= 0; l--)
+                        for (ssize_t k = strlen(s) + 1; k >= 0; k--)
                                 test_ellipsize_mem_one(s, l, k);
 }
 
+TEST(ellipsize_mem_truncated_utf8) {
+        static const char s[] = { 'a', '\xf0', '\x80', '\x80', '\x80', 'b' };
+
+        ASSERT_NULL(ellipsize_mem(s, 2, 1, 50));
+}
+
 static void test_ellipsize_one(const char *p) {
-        _cleanup_free_ char *t;
+        _cleanup_free_ char *t = NULL;
         t = ellipsize(p, columns(), 70);
         puts(t);
         free(t);
@@ -108,7 +111,7 @@ static void test_ellipsize_one(const char *p) {
         puts(t);
 }
 
-static void test_ellipsize(void) {
+TEST(ellipsize) {
         test_ellipsize_one(DIGITS LETTERS DIGITS LETTERS);
         test_ellipsize_one("한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어한국어");
         test_ellipsize_one("-日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国日本国");
@@ -119,9 +122,69 @@ static void test_ellipsize(void) {
         test_ellipsize_one("shórt");
 }
 
-int main(int argc, char *argv[]) {
-        test_ellipsize_mem();
-        test_ellipsize();
+TEST(ellipsize_ansi) {
+        const char *s = ANSI_HIGHLIGHT_YELLOW_UNDERLINE "yęllow"
+                        ANSI_HIGHLIGHT_GREY_UNDERLINE "grěy"
+                        ANSI_HIGHLIGHT_BLUE_UNDERLINE "blue"
+                        ANSI_NORMAL "nórmął";
+        size_t len = strlen(s);
 
-        return 0;
+        for (unsigned percent = 0; percent <= 100; percent += 15)
+                for (ssize_t x = 21; x >= 0; x--) {
+                        _cleanup_free_ char *t = ellipsize_mem(s, len, x, percent);
+                        printf("%02zd: \"%s\"\n", x, t);
+                        assert_se(utf8_is_valid(t));
+
+                        if (DEBUG_LOGGING) {
+                                _cleanup_free_ char *e = cescape(t);
+                                printf("  : \"%s\"\n", e);
+                        }
+                }
 }
+
+TEST(ellipsize_ansi_cats) {
+        _cleanup_free_ char *e = NULL, *f = NULL, *g = NULL, *h = NULL;
+
+        /* Make sure we don't cut off in the middle of an ANSI escape sequence. */
+
+        e = ellipsize("01" ANSI_NORMAL "23", 4, 0);
+        puts(e);
+        ASSERT_STREQ(e, "01" ANSI_NORMAL "23");
+        f = ellipsize("ab" ANSI_NORMAL "cd", 4, 90);
+        puts(f);
+        ASSERT_STREQ(f, "ab" ANSI_NORMAL "cd");
+
+        g = ellipsize("🐱🐱" ANSI_NORMAL "🐱🐱" ANSI_NORMAL, 5, 0);
+        puts(g);
+        ASSERT_STREQ(g, "…" ANSI_NORMAL "🐱🐱" ANSI_NORMAL);
+        h = ellipsize("🐱🐱" ANSI_NORMAL "🐱🐱" ANSI_NORMAL, 5, 90);
+        puts(h);
+        ASSERT_STREQ(h, "🐱…" ANSI_NORMAL "🐱" ANSI_NORMAL);
+}
+
+TEST(ellipsize_ansi_two_byte) {
+        _cleanup_free_ char *e = NULL, *f = NULL;
+
+        /* Fe escape sequences are just two bytes long (ESC followed by 0x40…0x5F). Make sure they are
+         * skipped over like the longer CSI sequences are, in particular when one terminates the string. */
+
+        e = ellipsize("🐱🐱" "\x1bM" "🐱🐱" "\x1bM", 5, 0);
+        puts(e);
+        ASSERT_STREQ(e, "…" "\x1bM" "🐱🐱" "\x1bM");
+
+        f = ellipsize("ab" "\x1bM" "cd" "\x1bM", 4, 90);
+        puts(f);
+        ASSERT_STREQ(f, "ab" "\x1bM" "cd" "\x1bM");
+}
+
+TEST(ellipsize_esc_infinite_loop) {
+        /* Make sure we don't infinite loop on an ESC in the first half */
+        static const char s[] = { 'A', 'B', 0x1B, ' ', 'D', '\0' };
+        _cleanup_free_ char *t = NULL;
+
+        t = ellipsize_mem(s, 5, 5, 50);
+        assert_se(t);
+        assert_se(memcmp(t, s, 5) == 0);
+}
+
+DEFINE_TEST_MAIN(LOG_INFO);

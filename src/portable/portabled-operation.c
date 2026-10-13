@@ -1,33 +1,42 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
+#include "event-util.h"
 #include "fd-util.h"
+#include "format-util.h"
+#include "log.h"
+#include "portabled.h"
 #include "portabled-operation.h"
 #include "process-util.h"
 
 static int operation_done(sd_event_source *s, const siginfo_t *si, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        Operation *o = userdata;
+        Operation *o = ASSERT_PTR(userdata);
         int r;
 
-        assert(o);
         assert(si);
 
-        log_debug("Operating " PID_FMT " is now complete with code=%s status=%i",
-                  o->pid,
+        log_debug("Operation " PID_FMT " is now complete with code=%s status=%i",
+                  o->pidref.pid,
                   sigchld_code_to_string(si->si_code), si->si_status);
 
-        o->pid = 0;
+        pidref_done(&o->pidref);
 
         if (si->si_code != CLD_EXITED) {
-                r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
+                r = sd_bus_error_set(&error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
                 goto fail;
         }
 
         if (si->si_status == EXIT_SUCCESS)
                 r = 0;
         else if (read(o->errno_fd, &r, sizeof(r)) != sizeof(r)) { /* Try to acquire error code for failed operation */
-                r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Child failed.");
+                r = sd_bus_error_set(&error, SD_BUS_ERROR_FAILED, "Child failed.");
                 goto fail;
         }
 
@@ -66,12 +75,12 @@ fail:
         return 0;
 }
 
-int operation_new(Manager *manager, pid_t child, sd_bus_message *message, int errno_fd, Operation **ret) {
+int operation_new(Manager *manager, PidRef *child, sd_bus_message *message, int errno_fd, Operation **ret) {
         Operation *o;
         int r;
 
         assert(manager);
-        assert(child > 1);
+        assert(pidref_is_set(child));
         assert(message);
         assert(errno_fd >= 0);
 
@@ -79,15 +88,15 @@ int operation_new(Manager *manager, pid_t child, sd_bus_message *message, int er
         if (!o)
                 return -ENOMEM;
 
-        o->extra_fd = -1;
+        o->extra_fd = -EBADF;
 
-        r = sd_event_add_child(manager->event, &o->event_source, child, WEXITED, operation_done, o);
+        r = event_add_child_pidref(manager->event, &o->event_source, child, WEXITED, operation_done, o);
         if (r < 0) {
                 free(o);
                 return r;
         }
 
-        o->pid = child;
+        o->pidref = TAKE_PIDREF(*child);
         o->message = sd_bus_message_ref(message);
         o->errno_fd = errno_fd;
 
@@ -95,7 +104,7 @@ int operation_new(Manager *manager, pid_t child, sd_bus_message *message, int er
         manager->n_operations++;
         o->manager = manager;
 
-        log_debug("Started new operation " PID_FMT ".", child);
+        log_debug("Started new operation " PID_FMT ".", o->pidref.pid);
 
         /* At this point we took ownership of both the child and the errno file descriptor! */
 
@@ -114,8 +123,7 @@ Operation *operation_free(Operation *o) {
         safe_close(o->errno_fd);
         safe_close(o->extra_fd);
 
-        if (o->pid > 1)
-                (void) sigkill_wait(o->pid);
+        pidref_done_sigkill_wait(&o->pidref);
 
         sd_bus_message_unref(o->message);
 

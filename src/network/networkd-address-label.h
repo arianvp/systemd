@@ -1,39 +1,39 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <stdbool.h>
+#include <netinet/in.h>
 
-#include "conf-parser.h"
-#include "in-addr-util.h"
+#include "networkd-forward.h"
 
-typedef struct AddressLabel AddressLabel;
-
-#include "networkd-link.h"
-#include "networkd-network.h"
-#include "networkd-util.h"
-
-typedef struct Network Network;
-typedef struct Link Link;
-typedef struct NetworkConfigSection NetworkConfigSection;
-
-struct AddressLabel {
+typedef struct AddressLabel {
+        Manager *manager;
         Network *network;
-        NetworkConfigSection *section;
+        ConfigSection *section;
 
-        unsigned char prefixlen;
         uint32_t label;
+        struct in6_addr prefix;
+        unsigned char prefixlen;
+        bool prefix_set;
+} AddressLabel;
 
-        union in_addr_union in_addr;
+AddressLabel *address_label_free(AddressLabel *label);
 
-        LIST_FIELDS(AddressLabel, labels);
-};
+void network_drop_invalid_address_labels(Network *network);
+void manager_drop_invalid_address_labels(Manager *manager);
 
-void address_label_free(AddressLabel *label);
+int link_request_static_address_labels(Link *link);
+int manager_request_static_address_labels(Manager *manager);
 
-DEFINE_NETWORK_SECTION_FUNCTIONS(AddressLabel, address_label_free);
+typedef enum IPv6AddressLabelConfParserType {
+        IPV6_ADDRESS_LABEL,
+        IPV6_ADDRESS_LABEL_PREFIX,
+        _IPV6_ADDRESS_LABEL_CONF_PARSER_MAX,
+        _IPV6_ADDRESS_LABEL_CONF_PARSER_INVALID = -EINVAL,
 
-int address_label_configure(AddressLabel *address, Link *link, link_netlink_message_handler_t callback, bool update);
+        IPV6_ADDRESS_LABEL_BY_MANAGER           = 1 << 16,
+        IPV6_ADDRESS_LABEL_SECTION_MASK         = IPV6_ADDRESS_LABEL_BY_MANAGER - 1,
+} IPv6AddressLabelConfParserType;
 
-CONFIG_PARSER_PROTOTYPE(config_parse_address_label);
-CONFIG_PARSER_PROTOTYPE(config_parse_address_label_prefix);
+assert_cc(IPV6_ADDRESS_LABEL_BY_MANAGER >= _IPV6_ADDRESS_LABEL_CONF_PARSER_MAX);
+
+CONFIG_PARSER_PROTOTYPE(config_parse_ipv6_address_label_section);

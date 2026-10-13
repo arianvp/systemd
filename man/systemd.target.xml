@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.target">
   <refentryinfo>
@@ -26,30 +26,30 @@
   <refsect1>
     <title>Description</title>
 
-    <para>A unit configuration file whose name ends in
-    <literal>.target</literal> encodes information about a target unit
-    of systemd, which is used for grouping units and as well-known
-    synchronization points during start-up.</para>
+    <para>A unit configuration file whose name ends in <literal>.target</literal> encodes information about a
+    target unit of systemd. Target units are used to group units and to set synchronization points for
+    ordering dependencies with other unit files.</para>
 
     <para>This unit type has no specific options. See
-    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    for the common options of all unit configuration files. The common
-    configuration items are configured in the generic <literal>[Unit]</literal> and
-    <literal>[Install]</literal> sections. A separate <literal>[Target]</literal> section does not exist,
-    since no target-specific options may be configured.</para>
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry> for the
+    common options of all unit configuration files. The common configuration items are configured in the
+    generic [Unit] and [Install] sections. A separate [Target] section does not exist, since no
+    target-specific options may be configured.</para>
 
-    <para>Target units do not offer any additional functionality on
-    top of the generic functionality provided by units. They exist
-    merely to group units via dependencies (useful as boot targets),
-    and to establish standardized names for synchronization points
-    used in dependencies between units. Among other things, target
-    units are a more flexible replacement for SysV runlevels in the
-    classic SysV init system. (And for compatibility reasons special
-    target units such as <filename>runlevel3.target</filename> exist
-    which are used by the SysV runlevel compatibility code in systemd.
-    See
-    <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    for details).</para>
+    <para>Target units do not offer any additional functionality on top of the generic functionality provided
+    by units. They merely group units, allowing a single target name to be used in <varname>Wants=</varname>
+    and <varname>Requires=</varname> settings to establish a dependency on a set of units defined by the
+    target, and in <varname>Before=</varname> and <varname>After=</varname> settings to establish ordering.
+    Targets establish standardized names for synchronization points during boot and shutdown. Importantly,
+    see <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    for examples and descriptions of standard systemd targets.</para>
+
+    <para>Target units provide a more flexible replacement for SysV runlevels in the classic SysV init
+    system.</para>
+
+    <para>Note that a target unit file must not be empty, lest it be considered a masked unit. It is
+    recommended to provide a [Unit] section which includes informative <varname>Description=</varname> and
+    <varname>Documentation=</varname> options.</para>
   </refsect1>
 
   <refsect1>
@@ -68,20 +68,32 @@
       <varname>DefaultDependencies=no</varname> is set:</para>
 
       <itemizedlist>
-        <listitem><para>Target units will automatically complement all
-        configured dependencies of type <varname>Wants=</varname> or
-        <varname>Requires=</varname> with dependencies of type
-        <varname>After=</varname> unless <varname>DefaultDependencies=no</varname>
-        is set in the specified units. Note that <varname>Wants=</varname> or
-        <varname>Requires=</varname> must be defined in the target unit itself — if
-        you for example define <varname>Wants=</varname>some.target in
-        some.service, the automatic ordering will not be added.</para></listitem>
+        <listitem><para>Target units will automatically complement all configured dependencies of type
+        <varname>Wants=</varname> or <varname>Requires=</varname> with dependencies of type
+        <varname>After=</varname> unless <varname>DefaultDependencies=no</varname> is set in the specified
+        units.</para>
+
+        <para>Note that the reverse is not true. For example, defining <option>Wants=that.target</option> in
+        <filename index='false'>some.service</filename> will not automatically add the
+        <option>After=that.target</option> ordering dependency for <filename>some.service</filename>.
+        Instead, <filename>some.service</filename> should use the primary synchronization function of target
+        type units, by setting a specific <option>After=that.target</option> or
+        <option>Before=that.target</option> ordering dependency in its .service unit file.
+        </para></listitem>
 
         <listitem><para>Target units automatically gain <varname>Conflicts=</varname>
         and <varname>Before=</varname> dependencies against
         <filename>shutdown.target</filename>.</para></listitem>
       </itemizedlist>
     </refsect2>
+  </refsect1>
+
+  <refsect1>
+    <title>Options</title>
+
+    <para>Target unit files may include [Unit] and [Install] sections, which are described in
+    <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    No options specific to this file type are supported.</para>
   </refsect1>
 
   <refsect1>
@@ -98,7 +110,7 @@ Requires=emergency.target systemd-networkd.service
 After=emergency.target systemd-networkd.service
 AllowIsolate=yes</programlisting>
 
-      <para>When adding dependencies to other units, it's important to check if they set
+      <para>When adding dependencies to other units, it is important to check if they set
       <varname>DefaultDependencies=</varname>. Service units, unless they set
       <varname>DefaultDependencies=no</varname>, automatically get a dependency on
       <filename>sysinit.target</filename>. In this case, both
@@ -123,13 +135,13 @@ AllowIsolate=yes</programlisting>
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

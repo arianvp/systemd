@@ -1,10 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "time-util.h"
+#include "journald-forward.h"
 
-typedef struct JournalRateLimit JournalRateLimit;
-
-JournalRateLimit *journal_rate_limit_new(void);
-void journal_rate_limit_free(JournalRateLimit *r);
-int journal_rate_limit_test(JournalRateLimit *r, const char *id, usec_t rl_interval, unsigned rl_burst, int priority, uint64_t available);
+int journal_ratelimit_test(
+                OrderedHashmap **groups_by_id,
+                const char *id,
+                usec_t rl_interval,
+                unsigned rl_burst,
+                int priority,
+                uint64_t available);

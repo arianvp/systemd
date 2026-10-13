@@ -1,18 +1,17 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <netinet/in.h>
 #include <linux/fou.h>
 
 #include "in-addr-util.h"
-#include "netdev/netdev.h"
+#include "netdev.h"
 
 typedef enum FooOverUDPEncapType {
         NETDEV_FOO_OVER_UDP_ENCAP_UNSPEC = FOU_ENCAP_UNSPEC,
         NETDEV_FOO_OVER_UDP_ENCAP_DIRECT = FOU_ENCAP_DIRECT,
         NETDEV_FOO_OVER_UDP_ENCAP_GUE = FOU_ENCAP_GUE,
         _NETDEV_FOO_OVER_UDP_ENCAP_MAX,
-        _NETDEV_FOO_OVER_UDP_ENCAP_INVALID = -1,
+        _NETDEV_FOO_OVER_UDP_ENCAP_INVALID = -EINVAL,
 } FooOverUDPEncapType;
 
 typedef struct FouTunnel {
@@ -34,9 +33,7 @@ typedef struct FouTunnel {
 DEFINE_NETDEV_CAST(FOU, FouTunnel);
 extern const NetDevVTable foutnl_vtable;
 
-const char *fou_encap_type_to_string(FooOverUDPEncapType d) _const_;
-FooOverUDPEncapType fou_encap_type_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(fou_encap_type, FooOverUDPEncapType);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_encap_type);
-CONFIG_PARSER_PROTOTYPE(config_parse_ip_protocol);
 CONFIG_PARSER_PROTOTYPE(config_parse_fou_tunnel_address);

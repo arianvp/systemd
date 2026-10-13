@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-coredump" conditional='ENABLE_COREDUMP'
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -20,61 +20,287 @@
     <refname>systemd-coredump</refname>
     <refname>systemd-coredump.socket</refname>
     <refname>systemd-coredump@.service</refname>
+    <refname>systemd-coredump-register.service</refname>
+    <refname>systemd-coredumpd.service</refname>
     <refpurpose>Acquire, save and process core dumps</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
     <para><filename>/usr/lib/systemd/systemd-coredump</filename></para>
     <para><filename>/usr/lib/systemd/systemd-coredump</filename> <option>--backtrace</option></para>
-    <para><filename>systemd-coredump@.service</filename></para>
+    <para><filename>/usr/lib/systemd/systemd-coredump</filename> <option>--manager</option></para>
+    <para><filename>/usr/lib/systemd/systemd-coredump</filename> <option>--check-requirements</option></para>
     <para><filename>systemd-coredump.socket</filename></para>
+    <para><filename>systemd-coredump@.service</filename></para>
+    <para><filename>systemd-coredump-register.service</filename></para>
+    <para><filename>systemd-coredumpd.service</filename></para>
   </refsynopsisdiv>
 
   <refsect1>
     <title>Description</title>
-    <para><filename>systemd-coredump@.service</filename> is a system service that can acquire core
-    dumps from the kernel and handle them in various ways. The <command>systemd-coredump</command>
-    executable does the actual work. It is invoked twice: once as the handler by the kernel, and the
-    second time in the <filename>systemd-coredump@.service</filename> to actually write the data to
-    the journal.</para>
+    <para><filename>systemd-coredump@.service</filename> is a system service to process core dumps. It will
+    log a summary of the event to
+    <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+    including information about the process identifier, owner, the signal that killed the process, and the
+    stack trace if possible. It may also save the core dump for later processing. See the "Information about
+    the crashed process" section below.</para>
 
-    <para>When the kernel invokes <command>systemd-coredump</command> to handle a core dump, it runs
-    in privileged mode, and will connect to the socket created by the
-    <filename>systemd-coredump.socket</filename> unit, which in turn will spawn an unprivileged
-    <filename>systemd-coredump@.service</filename> instance to process the core dump. Hence
-    <filename>systemd-coredump.socket</filename> and <filename>systemd-coredump@.service</filename>
-    are helper units which do the actual processing of core dumps and are subject to normal service
-    management.</para>
+    <para>The behavior of a specific program upon reception of a signal is governed by a few factors which
+    are described in detail in <citerefentry
+    project='man-pages'><refentrytitle>core</refentrytitle><manvolnum>5</manvolnum></citerefentry>.  In
+    particular, the core dump will only be processed when the related process resource limits
+    (<constant>RLIMIT_CORE</constant>) are sufficient.</para>
 
-    <para>Core dumps can be written to the journal or saved as a file. Once saved they can be retrieved
+    <para>Core dumps can be written to the journal or saved as a file. In both cases, they can be retrieved
     for further processing, for example in
     <citerefentry project='man-pages'><refentrytitle>gdb</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
-    </para>
+    See <citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
+    in particular the <command>list</command> and <command>debug</command> verbs.</para>
 
-    <para>By default, <command>systemd-coredump</command> will log the core dump including a backtrace
-    if possible to the journal and store the core dump itself in an external file in
-    <filename>/var/lib/systemd/coredump</filename>.</para>
+    <para>By default, <command>systemd-coredump</command> will log the core dump to the journal, including a
+    backtrace if possible, and store the core dump (an image of the memory contents of the process) itself in
+    an external file in <filename>/var/lib/systemd/coredump/</filename>. These core dumps are deleted after a
+    few days by default; see <filename>/usr/lib/tmpfiles.d/systemd.conf</filename> for details. Note that the
+    removal of core files from the file system and the purging of journal entries are independent, and the
+    core file may be present without the journal entry, and journal entries may point to since-removed core
+    files. Some metadata is attached to core files in the form of extended attributes, so the core files are
+    useful for some purposes even without the full metadata available in the journal entry.</para>
 
-    <para>The behavior of a specific program upon reception of a signal is governed by a few
-    factors which are described in detail in
-    <citerefentry project='man-pages'><refentrytitle>core</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-    In particular, the core dump will only be processed when the related resource limits are sufficient.
-    </para>
+    <para>For further details see <ulink url="https://systemd.io/COREDUMP">systemd Coredump
+    Handling</ulink>.</para>
 
-    <para>It is also possible to invoke <command>systemd-coredump</command> with
-    <option>--backtrace</option> option. In this case, <command>systemd-coredump</command> expects
-    a journal entry in the journal
-    <ulink url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal Export Format</ulink>
-    on standard input. The entry should contain a <varname>MESSAGE=</varname> field and any additional
-    metadata fields the caller deems reasonable. <command>systemd-coredump</command> will append
-    additional metadata fields in the same way it does for core dumps received from the kernel. In
-    this mode, no core dump is stored in the journal.</para>
+    <refsect2>
+      <title>Overview</title>
+
+      <para>The <command>systemd-coredump</command> executable does the actual work, but is invoked
+      differently depending on the capabilities of the running kernel.</para>
+
+      <para>When the kernel supports the kernel coredump socket protocol (see "Kernel Requirements" below,
+      generally kernel v6.19 or newer), <filename>systemd-coredumpd.service</filename> creates and listens on
+      a Unix socket, and <filename>systemd-coredump-register.service</filename> writes the socket path to
+      <filename>/proc/sys/kernel/core_pattern</filename>. When a process crashes, the kernel connects to the
+      socket, and sends the core dump of the process through the socket. Then,
+      <filename>systemd-coredumpd.service</filename> transfers the core to the corresponding container if the
+      crashed process is in a container environment, otherwise saves the core in the local storage and writes
+      information about the crashed process to journal.</para>
+
+      <para>When the running kernel does not meet those requirements, the executable
+      <command>systemd-coredump</command> is invoked twice: once as the handler by the kernel, and the second
+      time in the <filename>systemd-coredump@.service</filename> to actually write the data to the journal and
+      process and save the core file.</para>
+
+      <para>When the kernel invokes <command>systemd-coredump</command> to handle a core dump this way, it
+      runs in privileged mode, and will connect to the socket created by the
+      <filename>systemd-coredump.socket</filename> unit, which in turn will spawn an unprivileged
+      <filename>systemd-coredump@.service</filename> instance to process the core dump. Hence
+      <filename>systemd-coredump.socket</filename> and <filename>systemd-coredump@.service</filename> are
+      helper units which do the actual processing of core dumps and are subject to normal service
+      management.</para>
+
+      <para>See "Units" below for details on the individual units involved in either mode.</para>
+    </refsect2>
+
+    <refsect2>
+      <title>Command-line Options</title>
+
+      <para><command>systemd-coredump</command> is normally not invoked directly by the user, but by the
+      kernel, or by the units described below. It supports the following modes of invocation:</para>
+
+      <variablelist>
+        <varlistentry>
+          <term>(no option)</term>
+
+          <listitem><para>Handles a single core dump. This is the mode the kernel uses to invoke
+          <command>systemd-coredump</command> directly (via <varname>kernel.core_pattern</varname>) on
+          kernels that do not support the kernel coredump socket protocol, as well as the mode used by
+          <filename>systemd-coredump@.service</filename> to actually process and save a core dump that was
+          handed to it via <filename>systemd-coredump.socket</filename>.</para></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><option>--backtrace</option></term>
+
+          <listitem><para><command>systemd-coredump</command> expects a journal entry in the
+          <ulink url="https://systemd.io/JOURNAL_EXPORT_FORMATS#journal-export-format">Journal Export
+          Format</ulink> on standard input. The entry should contain a <varname>MESSAGE=</varname> field and
+          any additional metadata fields the caller deems reasonable.
+          <command>systemd-coredump</command> will append additional metadata fields in the same way it does
+          for core dumps received from the kernel. In this mode, no core dump is stored in the
+          journal.</para></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><option>--manager</option></term>
+
+          <listitem><para>Runs <command>systemd-coredump</command> as the long-running manager process that
+          listens on the kernel coredump socket, accepts connections from the kernel, and forks off worker
+          processes to process each individual core dump. This is the mode used internally by
+          <filename>systemd-coredumpd.service</filename> and is not intended to be invoked interactively.
+          See "Units" below for details.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><option>--check-requirements</option></term>
+
+          <listitem><para>Checks whether the running kernel and execution environment fulfil the
+          requirements for the kernel coredump socket protocol (see "Kernel Requirements" below), and exits
+          with a non-zero status if they are not met. This is used internally as the
+          <varname>ExecCondition=</varname> of <filename>systemd-coredumpd.service</filename> and
+          <filename>systemd-coredump-register.service</filename>, so that those units are skipped, without
+          being marked as failed, on systems where the feature is unavailable. It is not intended to be
+          invoked interactively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
+      <title>Kernel Requirements for the Coredump Socket</title>
+
+      <para>The kernel coredump socket protocol, used by <filename>systemd-coredumpd.service</filename> and
+      <filename>systemd-coredump-register.service</filename>, requires:</para>
+
+      <itemizedlist>
+        <listitem><para>A kernel that supports the <constant>PIDFD_INFO_COREDUMP</constant> (since kernel
+        v6.16) and <constant>PIDFD_INFO_COREDUMP_SIGNAL</constant> (since kernel v6.19) flags for the
+        <constant>PIDFD_GET_INFO</constant>
+        <citerefentry project='man-pages'><refentrytitle>ioctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        operation on a PID file descriptor (see
+        <citerefentry project='man-pages'><refentrytitle>pidfd_open</refentrytitle><manvolnum>2</manvolnum></citerefentry>).
+        Support for these flags is used as an indicator that the kernel is also new enough to support the
+        request-mode (<literal>@@</literal>-prefixed) kernel coredump socket
+        <varname>kernel.core_pattern</varname>, which was introduced in kernel v6.17.</para></listitem>
+
+        <listitem><para><command>systemd-coredump</command> must be running in the initial PID, USER, and
+        TIME namespaces, i.e. on the host, not inside a container.</para></listitem>
+      </itemizedlist>
+
+      <para>These conditions are checked with <command>systemd-coredump</command>
+      <option>--check-requirements</option> before <filename>systemd-coredumpd.service</filename> and
+      <filename>systemd-coredump-register.service</filename> are started. If the requirements are not met,
+      <command>systemd-coredump</command> instead falls back to the legacy invocation via
+      <filename>systemd-coredump.socket</filename> and <filename>systemd-coredump@.service</filename>.</para>
+    </refsect2>
+
+    <refsect2>
+      <title>Units</title>
+
+      <para>The following units are involved in processing core dumps. Which of them are active depends on
+      whether the kernel coredump socket protocol is available, see "Kernel Requirements" above.</para>
+
+      <variablelist>
+        <varlistentry>
+          <term><filename>systemd-coredumpd.service</filename></term>
+
+          <listitem><para>A long-running manager service, started early at boot on kernels that support the
+          kernel coredump socket protocol. It creates and listens on the <constant>AF_UNIX</constant> socket
+          <filename>/run/systemd/coredumpd/kernel</filename> (this path is also passed to the kernel via
+          <varname>kernel.core_pattern</varname> by <filename>systemd-coredump-register.service</filename>,
+          see below). When the kernel connects to this socket to submit a core dump,
+          <filename>systemd-coredumpd.service</filename> accepts the connection and forks off a worker
+          process to receive and process that specific core dump, up to a limit of 8 concurrently running
+          workers (once this limit is reached, no further connections are accepted until a worker finishes).
+          Workers that run for longer than 5 minutes are killed automatically.</para>
+
+          <para>The configuration in
+          <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+          is read once when <filename>systemd-coredumpd.service</filename> starts. Since the service keeps
+          running afterwards (rather than being invoked anew for every core dump, as
+          <filename>systemd-coredump@.service</filename> is), changes to
+          <filename>coredump.conf</filename> and its drop-ins are <emphasis>not</emphasis> picked up
+          automatically. Reload the service to apply configuration changes, see
+          <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+          for details.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><filename>systemd-coredump-register.service</filename></term>
+
+          <listitem><para>A oneshot unit, automatically pulled in and bound to the lifetime of
+          <filename>systemd-coredumpd.service</filename> (it is not meant to be started or stopped manually).
+          Once <filename>systemd-coredumpd.service</filename> is up, this unit points the kernel at it by
+          setting <varname>kernel.core_pattern</varname> to the request-mode (<literal>@@</literal>-prefixed)
+          socket path <filename>/run/systemd/coredumpd/kernel</filename>, and persists this setting to
+          <filename>/run/sysctl.d/60-coredump.conf</filename> via
+          <citerefentry><refentrytitle>systemd-sysctl</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+          When <filename>systemd-coredumpd.service</filename> is stopped,
+          <filename>systemd-coredump-register.service</filename> is stopped along with it and reverts
+          <varname>kernel.core_pattern</varname> to its previous value.</para>
+
+          <para>Because <filename>/run/sysctl.d/60-coredump.conf</filename> takes precedence, per the usual
+          <citerefentry><refentrytitle>sysctl.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+          ordering rules, over the <filename>/usr/lib/sysctl.d/50-coredump.conf</filename> file described in
+          "Configuration" below, masking or overriding <filename>50-coredump.conf</filename> alone is
+          <emphasis>not</emphasis> sufficient to install a custom <varname>kernel.core_pattern</varname> on a
+          system where <filename>systemd-coredumpd.service</filename> is active. See "Configuration" below
+          for how to prevent this.</para>
+
+          <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><filename>systemd-coredump.socket</filename></term>
+          <term><filename>systemd-coredump@.service</filename></term>
+
+          <listitem><para>Legacy handler units, used on kernels that do not support the kernel coredump
+          socket protocol (see "Kernel Requirements" above). The kernel invokes
+          <command>systemd-coredump</command> directly and in privileged mode for each crash; that instance
+          connects to <filename>systemd-coredump.socket</filename>, which in turn spawns an unprivileged
+          <filename>systemd-coredump@.service</filename> instance to actually process and save the core
+          dump. Unlike <filename>systemd-coredumpd.service</filename>, a fresh
+          <filename>systemd-coredump@.service</filename> instance is started for every core dump, so it
+          always reads the current <filename>coredump.conf</filename> configuration.</para></listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
+
+    <refsect2>
+      <title>Core dumps in Containers/Namespaces</title>
+
+      <para>The <filename>systemd-coredump@.service</filename> service will automatically attempt to extract
+      a stacktrace from a process as it crashes. For this stacktrace symbols will be resolved based on debug
+      information embedded in the crashing ELF image, or equivalent debug information separately available on
+      the host OS. For processes that crash inside of local containers or other mount namespace-based
+      sandboxes, this auxiliary debug information is typically not available on the host (simply because
+      containers typically run different software versions than the
+      host). <filename>systemd-coredump</filename> provides two mechanisms to address this:</para>
+
+      <orderedlist>
+        <listitem><para>For full-OS containers running systemd inside it is a good idea to enable
+        <varname>CoredumpReceive=</varname> on the unit (see
+        <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>),
+        which ensures that coredumps of a container are attempted to be forwarded to
+        <filename>systemd-coredump@.service</filename> running inside the container, i.e the container gets
+        to process and store its own core dumps. Note that
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        defaults to this mode if invoked with the <option>--boot</option> switch. This mode of operation is
+        generally recommended for security reasons: the security-sensitive processing of the core dump is
+        done within the confinements of the container itself, by the container's own code, backed by the
+        container's own storage.</para></listitem>
+
+        <listitem><para>Alternatively, for more restricted containers (that do not run a proper
+        <filename>init</filename> system as PID 1) it is possible to enable processing of the core dump on
+        the host, with access to the debug information data from the container itself. This mode of operation
+        must be enabled via <varname>EnterNamespace=</varname> in
+        <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+        and defaults to off, for security reasons.</para></listitem>
+      </orderedlist>
+
+      <para>If both <varname>CoredumpReceive=</varname> is enabled on the unit of the container the core dump
+      belongs to, and <varname>EnterNamespace=</varname> is enabled in the <filename>coredump.conf</filename>
+      configuration file, the former takes precedence.</para>
+    </refsect2>
   </refsect1>
 
   <refsect1>
     <title>Configuration</title>
-    <para>For programs started by <command>systemd</command> process resource limits can be set by directive
-    <varname>LimitCore=</varname>, see
+    <para>For programs started by <command>systemd</command>, process resource limits can be set by directive
+    <varname>LimitCORE=</varname>, see
     <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
     </para>
 
@@ -94,30 +320,47 @@
     <citerefentry><refentrytitle>systemd-sysctl</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
     </para>
 
-    <para>In order to by used in the <option>--backtrace</option> mode, an appropriate backtrace
+    <para>On systems where <filename>systemd-coredumpd.service</filename> is active (see "Kernel
+    Requirements" and "Units" above), <filename>systemd-coredump-register.service</filename> writes its own
+    <varname>kernel.core_pattern</varname> setting to <filename>/run/sysctl.d/60-coredump.conf</filename>
+    whenever <filename>systemd-coredumpd.service</filename> is running, and this file takes precedence over
+    <filename>/usr/lib/sysctl.d/50-coredump.conf</filename>. As a result, masking or overriding
+    <filename>50-coredump.conf</filename> alone does <emphasis>not</emphasis> override the default
+    <varname>kernel.core_pattern</varname> on such systems, since <filename>60-coredump.conf</filename> will
+    still take effect. To set a custom <varname>kernel.core_pattern</varname> of your own on a system where
+    <filename>systemd-coredumpd.service</filename> is active, stop and disable it:
+    <programlisting>systemctl disable --now systemd-coredumpd.service</programlisting></para>
+
+    <para>In order to be used in the <option>--backtrace</option> mode, an appropriate backtrace
     handler must be installed on the sender side. For example, in case of
     <citerefentry project='die-net'><refentrytitle>python</refentrytitle><manvolnum>1</manvolnum></citerefentry>, this
-    means a <varname>sys.excepthook</varname> must installed, see
-    <ulink url="https://github.com/keszybz/systemd-coredump-python">systemd-coredump-python</ulink>.
+    means a <varname>sys.excepthook</varname> must be installed, see
+    <ulink url="https://github.com/systemd/systemd-coredump-python">systemd-coredump-python</ulink>.
     </para>
 
     <para>The behavior of <command>systemd-coredump</command> itself is configured through the configuration file
     <filename>/etc/systemd/coredump.conf</filename> and corresponding snippets
     <filename>/etc/systemd/coredump.conf.d/*.conf</filename>, see
-    <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>. A new
-    instance of <command>systemd-coredump</command> is invoked upon receiving every core dump. Therefore, changes
-    in these files will take effect the next time a core dump is received.</para>
+    <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>. When
+    core dumps are processed via <filename>systemd-coredump@.service</filename> (see "Units" above), a new
+    instance of <command>systemd-coredump</command> is invoked upon receiving every core dump, and changes in
+    these files will take effect the next time a core dump is received. When core dumps are instead processed
+    by the long-running <filename>systemd-coredumpd.service</filename>, configuration changes require an
+    explicit reload of that service to take effect; see
+    <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+    details.</para>
 
     <para>Resources used by core dump files are restricted in two ways. Parameters like maximum size of acquired
     core dumps and files can be set in files <filename>/etc/systemd/coredump.conf</filename> and snippets mentioned
     above. In addition the storage time of core dump files is restricted by <command>systemd-tmpfiles</command>,
-    corresponding settings are by default in <filename>/usr/lib/tmpfiles.d/systemd.conf</filename>.</para>
+    corresponding settings are by default in <filename>/usr/lib/tmpfiles.d/systemd.conf</filename>. The default is
+    to delete core dumps after a few days; see the above file for details.</para>
 
     <refsect2>
       <title>Disabling coredump processing</title>
 
-      <para>To disable potentially resource-intensive processing by <command>systemd-coredump</command>,
-      set <programlisting>Storage=none
+      <para>To disable potentially resource-intensive processing by <command>systemd-coredump</command>, set
+      <programlisting>Storage=none
 ProcessSizeMax=0</programlisting> in
       <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       </para>
@@ -125,25 +368,393 @@ ProcessSizeMax=0</programlisting> in
   </refsect1>
 
   <refsect1>
-    <title>Usage</title>
-    <para>Data stored in the journal can be viewed with
-    <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    as usual.
-    <citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    can be used to retrieve saved core dumps independent of their location, to display information and to process
-    them e.g. by passing to the GNU debugger (gdb).</para>
+    <title>Information about the crashed process</title>
+
+    <para><citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry> can
+    be used to retrieve saved core dumps independently of their location, to display information, and to
+    process them e.g. by passing to the GNU debugger (gdb).</para>
+
+    <para>Data stored in the journal can be also viewed with
+    <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry> as usual
+    (or from any other process, using the
+    <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry> API).
+    The relevant messages have <constant>MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1</constant>:</para>
+    <programlisting>$ journalctl MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1 -o verbose
+…
+MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1
+COREDUMP_PID=552351
+COREDUMP_UID=1000
+COREDUMP_GID=1000
+COREDUMP_SIGNAL_NAME=SIGSEGV
+COREDUMP_SIGNAL=11
+COREDUMP_CODE=2
+COREDUMP_TIMESTAMP=1614342930000000
+COREDUMP_COMM=Web Content
+COREDUMP_EXE=/usr/lib64/firefox/firefox
+COREDUMP_USER_UNIT=app-gnome-firefox-552136.scope
+COREDUMP_CMDLINE=/usr/lib64/firefox/firefox -contentproc -childID 5 -isForBrowser …
+COREDUMP_CGROUP=/user.slice/user-1000.slice/user@1000.service/app.slice/app-….scope
+COREDUMP_FILENAME=/var/lib/systemd/coredump/core.Web….552351.….zst
+…
+</programlisting>
+
+    <para>The following fields are saved (if known) with the journal entry</para>
+
+    <variablelist class='journal-directives'>
+      <varlistentry>
+        <term><varname>COREDUMP_UID=</varname></term>
+        <term><varname>COREDUMP_PID=</varname></term>
+        <term><varname>COREDUMP_GID=</varname></term>
+        <listitem><para>The process number (PID), owner user number (UID), and group number (GID) of the
+        crashed process.</para>
+
+        <para>When the crashed process was part of a container (or in a process or user namespace in
+        general), those are the values as seen <emphasis>outside</emphasis>, in the namespace where
+        <filename>systemd-coredump</filename> is running.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_BY_PIDFD=</varname></term>
+        <listitem><para>If the crashed process was analyzed using a PIDFD provided by the kernel (requires
+        kernel v6.16) then this field will be present and set to <literal>1</literal>. If this field is
+        not set, then the crashed process was analyzed via a PID, which is known to be subject to race
+        conditions.</para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_TIMESTAMP=</varname></term>
+        <listitem><para>The time of the crash as reported by the kernel (in μs since the epoch).</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_RLIMIT=</varname></term>
+        <listitem><para>The core file size soft resource limit, see
+        <citerefentry project='man-pages'><refentrytitle>getrlimit</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_UNIT=</varname></term>
+        <term><varname>COREDUMP_SLICE=</varname></term>
+        <listitem><para>The system unit and slice names.</para>
+
+        <para>When the crashed process was in container, those are the units names
+        <emphasis>outside</emphasis>, in the main system manager.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_CGROUP=</varname></term>
+
+        <listitem><para>The primary cgroup of the unit of the crashed process.</para>
+
+        <para>When the crashed process was in a container, this is the full path, as seen outside of the
+        container.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_PROC_CGROUP=</varname></term>
+        <listitem><para>Control group information in the format used in
+        <filename>/proc/self/cgroup</filename>. On systems with the unified cgroup hierarchy, this is a
+        single path prefixed with <literal>0::</literal>, and multiple paths prefixed with controller numbers
+        on legacy systems.</para>
+
+        <para>When the crashed process was in a container, this is the full path, as seen outside of the
+        container.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_OWNER_UID=</varname></term>
+        <term><varname>COREDUMP_USER_UNIT=</varname></term>
+        <term><varname>COREDUMP_SESSION=</varname></term>
+        <listitem><para>The numerical UID of the user owning the login session or systemd user unit of the
+        crashed process, the user manager unit, and the session identifier. All three fields are only present
+        for user processes.</para>
+
+        <para>When the crashed process was in container, those are the values <emphasis>outside</emphasis>,
+        in the main system.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_SIGNAL_NAME=</varname></term>
+        <term><varname>COREDUMP_SIGNAL=</varname></term>
+
+        <listitem><para>The terminating signal name (with the <literal>SIG</literal> prefix
+        <footnote><para><citerefentry
+        project='man-pages'><refentrytitle>kill</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        expects signal names <emphasis>without</emphasis> the prefix; <citerefentry
+        project='man-pages'><refentrytitle>kill</refentrytitle><manvolnum>2</manvolnum></citerefentry> uses
+        the prefix; all systemd tools accept signal names both with and without the prefix.
+        </para></footnote>) and numerical value. (Both are included because signal numbers vary by
+        architecture.)</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_CODE=</varname></term>
+
+        <listitem><para>The reason why the signal was sent as a numerical value. The code is defined as
+        field <varname>si_code</varname> in the <varname>siginfo_t</varname> structure and
+        documented in <citerefentry
+        project='man-pages'><refentrytitle>sigaction</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_CWD=</varname></term>
+        <term><varname>COREDUMP_ROOT=</varname></term>
+
+        <listitem><para>The current working directory and root directory of the crashed process.</para>
+
+        <para>When the crashed process is in a container, those paths are relative to the root of the
+        container's mount namespace.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_DUMPABLE=</varname></term>
+
+        <listitem><para>The <constant>PR_GET_DUMPABLE</constant> field as reported by the kernel, see
+        <citerefentry
+        project='man-pages'><refentrytitle>prctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_OPEN_FDS=</varname></term>
+
+        <listitem><para>Information about open file descriptors, in the following format:</para>
+        <programlisting><replaceable>fd</replaceable>:<replaceable>/path/to/file</replaceable>
+pos:     ...
+flags:   ...
+...
+
+<replaceable>fd</replaceable>:<replaceable>/path/to/file</replaceable>
+pos:     ...
+flags:   ...
+...
+</programlisting>
+
+        <para>The first line contains the file descriptor number <replaceable>fd</replaceable> and the path,
+        while subsequent lines show the contents of
+        <filename>/proc/<replaceable>pid</replaceable>/fdinfo/<replaceable>fd</replaceable></filename>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_EXE=</varname></term>
+
+        <listitem><para>The destination of the <filename>/proc/<replaceable>pid</replaceable>/exe</filename>
+        symlink.</para>
+
+        <para>When the crashed process is in a container, that path is relative to the root of the
+        container's mount namespace.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_CMDLINE=</varname></term>
+        <term><varname>COREDUMP_COMM=</varname></term>
+        <term><varname>COREDUMP_ENVIRON=</varname></term>
+        <term><varname>COREDUMP_PROC_AUXV=</varname></term>
+        <term><varname>COREDUMP_PROC_LIMITS=</varname></term>
+        <term><varname>COREDUMP_PROC_MAPS=</varname></term>
+        <term><varname>COREDUMP_PROC_MOUNTINFO=</varname></term>
+        <term><varname>COREDUMP_PROC_STATUS=</varname></term>
+
+        <listitem><para>Fields that map the per-process entries in the <filename>/proc/</filename>
+        filesystem: <filename>/proc/<replaceable>pid</replaceable>/cmdline</filename> (the command line of
+        the crashed process), <filename>/proc/<replaceable>pid</replaceable>/comm</filename> (the command
+        name associated with the process), <filename>/proc/<replaceable>pid</replaceable>/environ</filename>
+        (the environment block of the crashed process),
+        <filename>/proc/<replaceable>pid</replaceable>/auxv</filename> (the auxiliary vector of the crashed
+        process, see <citerefentry
+        project='man-pages'><refentrytitle>getauxval</refentrytitle><manvolnum>3</manvolnum></citerefentry>),
+        <filename>/proc/<replaceable>pid</replaceable>/limits</filename> (the soft and hard resource limits),
+        <filename>/proc/<replaceable>pid</replaceable>/maps</filename> (memory regions visible to the process
+        and their access permissions), <filename>/proc/<replaceable>pid</replaceable>/mountinfo</filename>
+        (mount points in the process's mount namespace),
+        <filename>/proc/<replaceable>pid</replaceable>/status</filename> (various metadata about the
+        process).</para>
+
+        <para>See
+        <citerefentry project='man-pages'><refentrytitle>proc</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for more information.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_HOSTNAME=</varname></term>
+
+        <listitem><para>The system hostname.</para>
+
+        <para>When the crashed process was in container, this is the container hostname.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_CONTAINER_CMDLINE=</varname></term>
+
+        <listitem><para>For processes running in a container, the command line of the process spawning the
+        container (the first parent process with a different mount namespace).</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP=</varname></term>
+
+        <listitem><para>When the core is stored in the journal, the core image itself.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_FILENAME=</varname></term>
+
+        <listitem><para>When the core is stored externally, the path to the core file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_TRUNCATED=</varname></term>
+
+        <listitem><para>Set to <literal>1</literal> when the saved coredump was truncated. (A partial core
+        image may still be processed by some tools, though obviously not all information is available.)
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>COREDUMP_PACKAGE_NAME=</varname></term>
+        <term><varname>COREDUMP_PACKAGE_VERSION=</varname></term>
+        <term><varname>COREDUMP_PACKAGE_JSON=</varname></term>
+
+        <listitem><para>If the executable contained .package metadata ELF notes, they will be parsed and
+        attached. The <varname>package</varname> and <varname>version</varname> of the 'main' ELF module
+        (i.e., the executable) will be appended individually. The JSON-formatted content of all modules will
+        be appended as a single JSON object, each with the module name as the key. For more information about
+        this metadata format and content, see the
+        <ulink url="https://systemd.io/PACKAGE_METADATA_FOR_EXECUTABLE_FILES/">Package Metadata for  Executable Files</ulink>
+        document.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v249"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>MESSAGE=</varname></term>
+
+        <listitem><para>The message generated by <command>systemd-coredump</command> that includes the
+        backtrace if it was successfully generated. When <command>systemd-coredump</command> is invoked with
+        <option>--backtrace</option>, this field is provided by the caller.</para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+    </variablelist>
+
+    <para>Various other fields exist in the journal entry, but pertain to the logging process,
+    i.e. <command>systemd-coredump</command>, not the crashed process. See
+    <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+    </para>
+
+    <para>The following fields are saved (if known) with the external file listed in
+    <varname>COREDUMP_FILENAME=</varname> as extended attributes:</para>
+
+    <variablelist>
+      <varlistentry>
+        <term><varname>user.coredump.pid</varname></term>
+        <term><varname>user.coredump.uid</varname></term>
+        <term><varname>user.coredump.gid</varname></term>
+        <term><varname>user.coredump.signal</varname></term>
+        <term><varname>user.coredump.timestamp</varname></term>
+        <term><varname>user.coredump.rlimit</varname></term>
+        <term><varname>user.coredump.hostname</varname></term>
+        <term><varname>user.coredump.comm</varname></term>
+        <term><varname>user.coredump.exe</varname></term>
+
+        <listitem><para>Those are the same as <varname>COREDUMP_PID=</varname>,
+        <varname>COREDUMP_UID=</varname>, <varname>COREDUMP_GID=</varname>,
+        <varname>COREDUMP_SIGNAL=</varname>, <varname>COREDUMP_TIMESTAMP=</varname>,
+        <varname>COREDUMP_RLIMIT=</varname>, <varname>COREDUMP_HOSTNAME=</varname>,
+        <varname>COREDUMP_COMM=</varname>, and <varname>COREDUMP_EXE=</varname>, described above.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+    </variablelist>
+
+    <para>Those can be viewed using
+    <citerefentry project='man-pages'><refentrytitle>getfattr</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
+    For the core file described in the journal entry shown above:
+    <programlisting>$ getfattr --absolute-names -d /var/lib/systemd/coredump/core.Web….552351.….zst
+# file: /var/lib/systemd/coredump/core.Web….552351.….zst
+user.coredump.pid="552351"
+user.coredump.uid="1000"
+user.coredump.gid="1000"
+user.coredump.signal="11"
+user.coredump.timestamp="1614342930000000"
+user.coredump.comm="Web Content"
+user.coredump.exe="/usr/lib64/firefox/firefox"
+…
+</programlisting>
+    </para>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>core</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sysctl.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-sysctl.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>coredump.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>coredumpctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>core</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sysctl.d</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-sysctl.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><ulink url="https://systemd.io/COREDUMP">systemd Coredump Handling</ulink></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

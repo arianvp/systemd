@@ -1,122 +1,132 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-systemd_logind_sources = files('''
-        logind.c
-        logind.h
-'''.split())
+if conf.get('ENABLE_LOGIND') != 1
+        subdir_done()
+endif
+
+systemd_logind_sources = files(
+        'logind.c',
+)
+systemd_logind_export_sources = files(
+        'logind-action.c',
+        'logind-brightness.c',
+        'logind-button.c',
+        'logind-core.c',
+        'logind-dbus.c',
+        'logind-device.c',
+        'logind-inhibit.c',
+        'logind-polkit.c',
+        'logind-seat-dbus.c',
+        'logind-seat.c',
+        'logind-session-dbus.c',
+        'logind-session-device.c',
+        'logind-session.c',
+        'logind-shutdown.c',
+        'logind-user-dbus.c',
+        'logind-user.c',
+        'logind-utmp.c',
+        'logind-varlink.c',
+        'logind-wall.c',
+)
 
 logind_gperf_c = custom_target(
-        'logind_gperf.c',
         input : 'logind-gperf.gperf',
         output : 'logind-gperf.c',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
-liblogind_core_sources = files('''
-        logind-acl.h
-        logind-action.c
-        logind-action.h
-        logind-brightness.c
-        logind-brightness.h
-        logind-button.c
-        logind-button.h
-        logind-core.c
-        logind-dbus.c
-        logind-dbus.h
-        logind-device.c
-        logind-device.h
-        logind-inhibit.c
-        logind-inhibit.h
-        logind-seat-dbus.c
-        logind-seat-dbus.h
-        logind-seat.c
-        logind-seat.h
-        logind-session-dbus.c
-        logind-session-dbus.h
-        logind-session-device.c
-        logind-session-device.h
-        logind-session.c
-        logind-session.h
-        logind-user-dbus.c
-        logind-user-dbus.h
-        logind-user.c
-        logind-user.h
-        logind-utmp.c
-'''.split())
+generated_sources += logind_gperf_c
+systemd_logind_export_sources += [logind_gperf_c]
 
-liblogind_core_sources += [logind_gperf_c]
+loginctl_sources = files(
+        'loginctl.c',
+        'sysfs-show.c',
+)
 
-logind_acl_c = files('logind-acl.c')
-if conf.get('HAVE_ACL') == 1
-        liblogind_core_sources += logind_acl_c
-endif
+executables += [
+        libexec_template + {
+                'name' : 'systemd-logind',
+                'dbus' : true,
+                'sources' : systemd_logind_sources,
+                'export' : systemd_logind_export_sources,
+                'dependencies' : [
+                        libacl_cflags,
+                ],
+        },
+        executable_template + {
+                'name' : 'loginctl',
+                'public' : true,
+                'sources' : loginctl_sources,
+                'dependencies' : [
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                ],
+        },
+        executable_template + {
+                'name' : 'systemd-inhibit',
+                'public' : true,
+                'sources' : files('inhibit.c'),
+        },
+        libexec_template + {
+                'name' : 'systemd-user-runtime-dir',
+                'sources' : files('user-runtime-dir.c'),
+        },
+        test_template + {
+                'sources' : files('test-inhibit.c'),
+                'type' : 'manual',
+        },
+        test_template + {
+                'sources' : files('test-login-tables.c'),
+                'import' : ['systemd-logind'],
+        },
+        test_template + {
+                'sources' : files('test-session-properties.c'),
+                'type' : 'manual',
+        },
+]
 
-liblogind_core = static_library(
-        'logind-core',
-        liblogind_core_sources,
-        include_directories : includes,
-        dependencies : [libacl])
+simple_tests += files(
+        'test-login-shared.c'
+)
 
-loginctl_sources = files('''
-        loginctl.c
-        sysfs-show.h
-        sysfs-show.c
-'''.split())
+modules += [
+        pam_template + {
+                'name' : 'pam_systemd',
+                'conditions' : ['HAVE_PAM'],
+                'sources' : files('pam_systemd.c'),
+                'version-script' : meson.current_source_dir() / 'pam_systemd.sym',
+        },
+        pam_template + {
+                'name' : 'pam_systemd_loadkey',
+                'conditions' : ['HAVE_PAM'],
+                'sources' : files('pam_systemd_loadkey.c'),
+                'version-script' : meson.current_source_dir() / 'pam_systemd_loadkey.sym',
+        },
+]
 
-user_runtime_dir_sources = files('''
-        user-runtime-dir.c
-'''.split())
+custom_target(
+        input : 'logind.conf.in',
+        output : 'logind.conf',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : install_sysconfdir_samples,
+        install_dir : pkgconfigfiledir)
 
-if conf.get('ENABLE_LOGIND') == 1
-        logind_conf = configure_file(
-                input : 'logind.conf.in',
-                output : 'logind.conf',
-                configuration : substs)
-        install_data(logind_conf,
-                     install_dir : pkgsysconfdir)
+custom_target(
+        input : 'systemd-user.in',
+        output : 'systemd-user',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : pamconfdir != 'no',
+        install_dir : pamconfdir)
 
-        pam_systemd_sym = 'src/login/pam_systemd.sym'
-        pam_systemd_c = files('pam_systemd.c')
-
-        install_data('org.freedesktop.login1.conf',
-                     install_dir : dbuspolicydir)
-        install_data('org.freedesktop.login1.service',
-                     install_dir : dbussystemservicedir)
-        install_data('org.freedesktop.login1.policy',
-                     install_dir : polkitpolicydir)
-
-        install_data('70-power-switch.rules', install_dir : udevrulesdir)
-
-        seat_rules = configure_file(
-                input : '71-seat.rules.in',
-                output : '71-seat.rules',
-                configuration : substs)
-        install_data(seat_rules,
-                     install_dir : udevrulesdir)
-
-        custom_target(
-                '70-uaccess.rules',
-                input : '70-uaccess.rules.m4',
-                output: '70-uaccess.rules',
-                command : [meson_apply_m4, config_h, '@INPUT@'],
-                capture : true,
-                install : conf.get('HAVE_ACL') == 1,
-                install_dir : udevrulesdir)
-
-        custom_target(
-                '73-seat-late.rules',
-                input : '73-seat-late.rules.m4',
-                output: '73-seat-late.rules',
-                command : [meson_apply_m4, config_h, '@INPUT@'],
-                capture : true,
-                install : true,
-                install_dir : udevrulesdir)
-
-        custom_target(
-                'systemd-user',
-                input : 'systemd-user.m4',
-                output: 'systemd-user',
-                command : [meson_apply_m4, config_h, '@INPUT@'],
-                capture : true,
-                install : pamconfdir != 'no',
-                install_dir : pamconfdir)
-endif
+install_data(
+        'org.freedesktop.login1.conf',
+        install_dir : dbuspolicydir)
+install_data(
+        'org.freedesktop.login1.service',
+        install_dir : dbussystemservicedir)
+install_data(
+        'org.freedesktop.login1.policy',
+        install_dir : polkitpolicydir)
+install_data(
+        '10-systemd-logind-root-ignore-inhibitors.rules.example',
+        install_dir : polkitrulesdir)

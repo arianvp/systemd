@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=Log filtering unit
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/tests/testdata/TEST-04-JOURNAL.units/logs-filtering-syslog.py
+SyslogLevel=notice
+LogLevelMax=info

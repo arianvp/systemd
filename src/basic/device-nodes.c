@@ -1,22 +1,22 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "device-nodes.h"
+#include "path-util.h"
+#include "stat-util.h"
+#include "stdio-util.h"
+#include "string-util.h"
 #include "utf8.h"
 
-int whitelisted_char_for_devnode(char c, const char *white) {
-
-        if ((c >= '0' && c <= '9') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
-            strchr("#+-.:=@_", c) != NULL ||
-            (white != NULL && strchr(white, c) != NULL))
-                return 1;
-
-        return 0;
+int allow_listed_char_for_devnode(char c, const char *additional) {
+        return
+                ascii_isdigit(c) ||
+                ascii_isalpha(c) ||
+                strchr("#+-.:=@_", c) ||
+                (additional && strchr(additional, c));
 }
 
 int encode_devnode_name(const char *str, char *str_enc, size_t len) {
@@ -28,22 +28,22 @@ int encode_devnode_name(const char *str, char *str_enc, size_t len) {
         for (i = 0, j = 0; str[i] != '\0'; i++) {
                 int seqlen;
 
-                seqlen = utf8_encoded_valid_unichar(str + i, (size_t) -1);
+                seqlen = utf8_encoded_valid_unichar(str + i, SIZE_MAX);
                 if (seqlen > 1) {
 
-                        if (len-j < (size_t)seqlen)
+                        if (len-j < (size_t) seqlen)
                                 return -EINVAL;
 
                         memcpy(&str_enc[j], &str[i], seqlen);
                         j += seqlen;
                         i += (seqlen-1);
 
-                } else if (str[i] == '\\' || !whitelisted_char_for_devnode(str[i], NULL)) {
+                } else if (str[i] == '\\' || !allow_listed_char_for_devnode(str[i], NULL)) {
 
-                        if (len-j < 4)
+                        if (len-j < 5)
                                 return -EINVAL;
 
-                        sprintf(&str_enc[j], "\\x%02x", (unsigned char) str[i]);
+                        assert_se(snprintf_ok(&str_enc[j], 5, "\\x%02x", (unsigned char) str[i]));
                         j += 4;
 
                 } else {
@@ -60,4 +60,32 @@ int encode_devnode_name(const char *str, char *str_enc, size_t len) {
 
         str_enc[j] = '\0';
         return 0;
+}
+
+int devnode_same(const char *a, const char *b) {
+        struct stat sa, sb;
+        int r;
+
+        assert(a);
+        assert(b);
+
+        if (!valid_device_node_path(a) || !valid_device_node_path(b))
+                return -EINVAL;
+
+        if (stat(a, &sa) < 0)
+                return -errno;
+        r = stat_verify_device_node(&sa);
+        if (r < 0)
+                return r;
+
+        if (stat(b, &sb) < 0)
+                return -errno;
+        r = stat_verify_device_node(&sb);
+        if (r < 0)
+                return r;
+
+        if (((sa.st_mode ^ sb.st_mode) & S_IFMT) != 0) /* both inode same device node type? */
+                return false;
+
+        return sa.st_rdev == sb.st_rdev;
 }

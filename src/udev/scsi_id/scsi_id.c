@@ -1,45 +1,30 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright © IBM Corp. 2003
  * Copyright © SUSE Linux Products GmbH, 2006
  */
 
 #include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
+#include "device-nodes.h"
+#include "extract-word.h"
 #include "fd-util.h"
-#include "libudev-util.h"
+#include "fileio.h"
+#include "main-func.h"
+#include "parse-util.h"
 #include "scsi_id.h"
 #include "string-util.h"
+#include "strv.h"
 #include "strxcpyx.h"
 #include "udev-util.h"
-
-static const struct option options[] = {
-        { "device",             required_argument, NULL, 'd' },
-        { "config",             required_argument, NULL, 'f' },
-        { "page",               required_argument, NULL, 'p' },
-        { "blacklisted",        no_argument,       NULL, 'b' },
-        { "whitelisted",        no_argument,       NULL, 'g' },
-        { "replace-whitespace", no_argument,       NULL, 'u' },
-        { "sg-version",         required_argument, NULL, 's' },
-        { "verbose",            no_argument,       NULL, 'v' },
-        { "version",            no_argument,       NULL, 'V' }, /* don't advertise -V */
-        { "export",             no_argument,       NULL, 'x' },
-        { "help",               no_argument,       NULL, 'h' },
-        {}
-};
+#include "utf8.h"
+#include "verbs.h"
 
 static bool all_good = false;
 static bool dev_specified = false;
@@ -55,85 +40,48 @@ static char model_enc_str[256];
 static char revision_str[16];
 static char type_str[16];
 
-static void set_type(const char *from, char *to, size_t len) {
-        int type_num;
-        char *eptr;
-        const char *type = "generic";
+COMMAND(
+        "scsi_id\0",
+        "Identify SCSI devices.",
+        .argspec = "[DEVICE]\0",
+);
 
-        type_num = strtoul(from, &eptr, 0);
-        if (eptr != from) {
-                switch (type_num) {
-                case 0:
-                        type = "disk";
-                        break;
-                case 1:
-                        type = "tape";
-                        break;
-                case 4:
-                        type = "optical";
-                        break;
-                case 5:
-                        type = "cd";
-                        break;
-                case 7:
-                        type = "optical";
-                        break;
-                case 0xe:
-                        type = "disk";
-                        break;
-                case 0xf:
-                        type = "optical";
-                        break;
-                default:
-                        break;
-                }
+static void set_type(unsigned type_num, char *to, size_t len) {
+        const char *type;
+
+        switch (type_num) {
+        case 0:
+                type = "disk";
+                break;
+        case 1:
+                type = "tape";
+                break;
+        case 4:
+                type = "optical";
+                break;
+        case 5:
+                type = "cd";
+                break;
+        case 7:
+                type = "optical";
+                break;
+        case 0xe:
+                type = "disk";
+                break;
+        case 0xf:
+                type = "optical";
+                break;
+        case 0x14:
+                /*
+                 * Use "zbc" here to be brief and consistent with "lsscsi" command.
+                 * Other tools, e.g., "sg3_utils" would say "host managed zoned block".
+                 */
+                type = "zbc";
+                break;
+        default:
+                type = "generic";
         }
         strscpy(to, len, type);
-}
-
-/*
- * get_value:
- *
- * buf points to an '=' followed by a quoted string ("foo") or a string ending
- * with a space or ','.
- *
- * Return a pointer to the NUL terminated string, returns NULL if no
- * matches.
- */
-static char *get_value(char **buffer) {
-        static const char *quote_string = "\"\n";
-        static const char *comma_string = ",\n";
-        char *val;
-        const char *end;
-
-        if (**buffer == '"') {
-                /*
-                 * skip leading quote, terminate when quote seen
-                 */
-                (*buffer)++;
-                end = quote_string;
-        } else {
-                end = comma_string;
-        }
-        val = strsep(buffer, end);
-        if (val && end == quote_string)
-                /*
-                 * skip trailing quote
-                 */
-                (*buffer)++;
-
-        while (isspace(**buffer))
-                (*buffer)++;
-
-        return val;
-}
-
-static int argc_count(char *opts) {
-        int i = 0;
-        while (*opts != '\0')
-                if (*opts++ == ' ')
-                        i++;
-        return i;
 }
 
 /*
@@ -145,49 +93,29 @@ static int argc_count(char *opts) {
  *
  * vendor and model can end in '\n'.
  */
-static int get_file_options(const char *vendor, const char *model,
-                            int *argc, char ***newargv) {
-        _cleanup_free_ char *buffer = NULL;
-        _cleanup_fclose_ FILE *f;
-        char *buf;
-        char *str1;
-        char *vendor_in, *model_in, *options_in; /* read in from file */
-        int lineno;
-        int c;
-        int retval = 0;
+static int get_file_options(const char *vendor, const char *model, char ***ret_argv) {
+        _cleanup_free_ char *vendor_in = NULL, *model_in = NULL, *options_in = NULL; /* read in from file */
+        _cleanup_strv_free_ char **options_argv = NULL;
+        int r;
 
-        f = fopen(config_file, "re");
+        _cleanup_fclose_ FILE *f = fopen(config_file, "re");
         if (!f) {
                 if (errno == ENOENT)
-                        return 1;
-                else {
-                        log_error_errno(errno, "can't open %s: %m", config_file);
-                        return -1;
-                }
+                        goto finish;
+                return log_error_errno(errno, "Cannot open %s: %m", config_file);
         }
 
-        /*
-         * Allocate a buffer rather than put it on the stack so we can
-         * keep it around to parse any options (any allocated newargv
-         * points into this buffer for its strings).
-         */
-        buffer = malloc(MAX_BUFFER_LEN);
-        if (!buffer)
-                return log_oom();
+        for (int lineno = 0;;) {
+                _cleanup_free_ char *buffer = NULL, *key = NULL, *value = NULL;
+                const char *buf;
 
-        *newargv = NULL;
-        lineno = 0;
-        for (;;) {
-                vendor_in = model_in = options_in = NULL;
-
-                buf = fgets(buffer, MAX_BUFFER_LEN, f);
-                if (!buf)
+                r = read_line(f, MAX_BUFFER_LEN, &buffer);
+                if (r < 0)
+                        return log_error_errno(r, "read_line() on line %d of %s failed: %m", lineno, config_file);
+                if (r == 0)
                         break;
+                buf = buffer;
                 lineno++;
-                if (buf[strlen(buffer) - 1] != '\n') {
-                        log_error("Config file line %d too long", lineno);
-                        break;
-                }
 
                 while (isspace(*buf))
                         buf++;
@@ -200,45 +128,37 @@ static int get_file_options(const char *vendor, const char *model,
                 if (*buf == '#')
                         continue;
 
-                str1 = strsep(&buf, "=");
-                if (str1 && strcaseeq(str1, "VENDOR")) {
-                        str1 = get_value(&buf);
-                        if (!str1) {
-                                retval = log_oom();
-                                break;
-                        }
-                        vendor_in = str1;
+                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
+                if (r < 2)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
 
-                        str1 = strsep(&buf, "=");
-                        if (str1 && strcaseeq(str1, "MODEL")) {
-                                str1 = get_value(&buf);
-                                if (!str1) {
-                                        retval = log_oom();
-                                        break;
-                                }
-                                model_in = str1;
-                                str1 = strsep(&buf, "=");
+                if (strcaseeq(key, "VENDOR")) {
+                        vendor_in = TAKE_PTR(value);
+
+                        key = mfree(key);
+                        r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
+                        if (r < 2)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
+
+                        if (strcaseeq(key, "MODEL")) {
+                                model_in = TAKE_PTR(value);
+
+                                key = mfree(key);
+                                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
+                                if (r < 2)
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
                         }
                 }
 
-                if (str1 && strcaseeq(str1, "OPTIONS")) {
-                        str1 = get_value(&buf);
-                        if (!str1) {
-                                retval = log_oom();
-                                break;
-                        }
-                        options_in = str1;
-                }
+                if (strcaseeq(key, "OPTIONS"))
+                        options_in = TAKE_PTR(value);
 
                 /*
                  * Only allow: [vendor=foo[,model=bar]]options=stuff
                  */
-                if (!options_in || (!vendor_in && model_in)) {
-                        log_error("Error parsing config file line %d '%s'", lineno, buffer);
-                        retval = -1;
-                        break;
-                }
-                if (vendor == NULL) {
+                if (!options_in || (!vendor_in && model_in))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
+                if (!vendor) {
                         if (!vendor_in)
                                 break;
                 } else if (vendor_in &&
@@ -253,245 +173,214 @@ static int get_file_options(const char *vendor, const char *model,
                                  */
                                 break;
                 }
+
+                vendor_in = mfree(vendor_in);
+                model_in = mfree(model_in);
+                options_in = mfree(options_in);
+
         }
 
-        if (retval == 0) {
-                if (vendor_in != NULL || model_in != NULL ||
-                    options_in != NULL) {
-                        /*
-                         * Something matched. Allocate newargv, and store
-                         * values found in options_in.
-                         */
-                        strcpy(buffer, options_in);
-                        c = argc_count(buffer) + 2;
-                        *newargv = calloc(c, sizeof(**newargv));
-                        if (!*newargv)
-                                retval = log_oom();
-                        else {
-                                *argc = c;
-                                c = 0;
-                                /*
-                                 * argv[0] at 0 is skipped by getopt, but
-                                 * store the buffer address there for
-                                 * later freeing
-                                 */
-                                (*newargv)[c] = buffer;
-                                for (c = 1; c < *argc; c++)
-                                        (*newargv)[c] = strsep(&buffer, " \t");
-                                buffer = NULL;
-                        }
-                } else {
-                        /* No matches  */
-                        retval = 1;
-                }
-        }
-        return retval;
+        if (!vendor_in && !model_in && !options_in)
+                goto finish;  /* No matches  */
+
+        /* Something matched. Allocate newargv, and store values found in options_in. */
+        options_argv = strv_split(options_in, " \t");
+        if (!options_argv)
+                return log_oom();
+        r = strv_prepend(&options_argv, ""); /* argv[0] is skipped */
+        if (r < 0)
+                return r;
+
+ finish:
+        *ret_argv = TAKE_PTR(options_argv);
+        return !!*ret_argv;  /* true if something matched, false otherwise */
 }
 
-static void help(void) {
-        printf("Usage: %s [OPTION...] DEVICE\n\n"
-               "SCSI device identification.\n\n"
-               "  -h --help                        Print this message\n"
-               "     --version                     Print version of the program\n\n"
-               "  -d --device=                     Device node for SG_IO commands\n"
-               "  -f --config=                     Location of config file\n"
-               "  -p --page=0x80|0x83|pre-spc3-83  SCSI page (0x80, 0x83, pre-spc3-83)\n"
-               "  -s --sg-version=3|4              Use SGv3 or SGv4\n"
-               "  -b --blacklisted                 Treat device as blacklisted\n"
-               "  -g --whitelisted                 Treat device as whitelisted\n"
-               "  -u --replace-whitespace          Replace all whitespace by underscores\n"
-               "  -v --verbose                     Verbose logging\n"
-               "  -x --export                      Print values as environment keys\n"
-               , program_invocation_short_name);
+static int parse_page_code(const char *value, enum page_code *ret) {
+        assert(value);
+        assert(ret);
 
+        if (streq(value, "0x80"))
+                *ret = PAGE_80;
+        else if (streq(value, "0x83"))
+                *ret = PAGE_83;
+        else if (streq(value, "pre-spc3-83"))
+                *ret = PAGE_83_PRE_SPC3;
+        else
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Unknown page code '%s'", value);
+        return 0;
 }
 
-static int set_options(int argc, char **argv,
-                       char *maj_min_dev) {
-        int option;
+static int set_options(int argc, char **argv, char *maj_min_dev) {
+        assert(argc >= 0);
+        assert(argv);
 
-        /*
-         * optind is a global extern used by getopt. Since we can call
-         * set_options twice (once for command line, and once for config
-         * file) we have to reset this back to 1.
-         */
-        optind = 1;
-        while ((option = getopt_long(argc, argv, "d:f:gp:uvVxhbs:", options, NULL)) >= 0)
-                switch (option) {
-                case 'b':
+        OptionParser opts = { argc, argv };
+        int r;
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION: {}
+                OPTION_SHORT('V', NULL, /* help= */ NULL): /* -V is accepted but not documented. */
+                        return version();
+
+                OPTION('d', "device", "PATH", "Device node for SG_IO commands"):
+                        dev_specified = true;
+                        strscpy(maj_min_dev, MAX_PATH_LEN, opts.arg);
+                        break;
+
+                OPTION('f', "config", "PATH", "Location of config file"):
+                        strscpy(config_file, MAX_PATH_LEN, opts.arg);
+                        break;
+
+                OPTION('p', "page", "0x80|0x83|pre-spc3-83", "SCSI page"):
+                        r = parse_page_code(opts.arg, &default_page_code);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION('s', "sg-version", "3|4", "Use SGv3 or SGv4"):
+                        r = safe_atoi(opts.arg, &sg_version);
+                        if (r < 0)
+                                return log_error_errno(r, "Invalid SG version '%s'", opts.arg);
+                        if (!IN_SET(sg_version, 3, 4))
+                                return log_error_errno(SYNTHETIC_ERRNO(ERANGE),
+                                                       "Unknown SG version '%s'", opts.arg);
+                        break;
+
+                OPTION('b', "denylisted", NULL, "Treat device as denylisted"): {}
+                OPTION('b', "blacklisted", NULL, /* help= */ NULL): /* backward compat */
                         all_good = false;
                         break;
 
-                case 'd':
-                        dev_specified = true;
-                        strscpy(maj_min_dev, MAX_PATH_LEN, optarg);
-                        break;
-
-                case 'f':
-                        strscpy(config_file, MAX_PATH_LEN, optarg);
-                        break;
-
-                case 'g':
+                OPTION('g', "allowlisted", NULL, "Treat device as allowlisted"): {}
+                OPTION('g', "whitelisted", NULL, /* help= */ NULL): /* backward compat */
                         all_good = true;
                         break;
 
-                case 'h':
-                        help();
-                        exit(EXIT_SUCCESS);
-
-                case 'p':
-                        if (streq(optarg, "0x80"))
-                                default_page_code = PAGE_80;
-                        else if (streq(optarg, "0x83"))
-                                default_page_code = PAGE_83;
-                        else if (streq(optarg, "pre-spc3-83"))
-                                default_page_code = PAGE_83_PRE_SPC3;
-                        else
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Unknown page code '%s'",
-                                                       optarg);
-                        break;
-
-                case 's':
-                        sg_version = atoi(optarg);
-                        if (sg_version < 3 || sg_version > 4)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Unknown SG version '%s'",
-                                                       optarg);
-                        break;
-
-                case 'u':
+                OPTION('u', "replace-whitespace", NULL, "Replace all whitespace by underscores"):
                         reformat_serial = true;
                         break;
 
-                case 'v':
+                OPTION('v', "verbose", NULL, "Verbose logging"):
                         log_set_target(LOG_TARGET_CONSOLE);
                         log_set_max_level(LOG_DEBUG);
                         log_open();
                         break;
 
-                case 'V':
-                        printf("%s\n", GIT_VERSION);
-                        exit(EXIT_SUCCESS);
-
-                case 'x':
+                OPTION('x', "export", NULL, "Print values as environment keys"):
                         export = true;
                         break;
 
-                case '?':
-                        return -1;
-
-                default:
-                        assert_not_reached("Unknown option");
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc && !dev_specified) {
+        char **args = option_parser_get_args(&opts);
+        if (!strv_isempty(args) && !dev_specified) {
                 dev_specified = true;
-                strscpy(maj_min_dev, MAX_PATH_LEN, argv[optind]);
+                strscpy(maj_min_dev, MAX_PATH_LEN, args[0]);
         }
 
-        return 0;
+        return 1;
 }
 
-static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, int *page_code) {
-        int retval;
-        int newargc;
-        char **newargv = NULL;
-        int option;
+static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, enum page_code *page_code) {
+        int r;
+
+        assert(dev_scsi);
+        assert(good_bad);
+        assert(page_code);
 
         *good_bad = all_good;
         *page_code = default_page_code;
 
-        retval = get_file_options(vendor_str, model_str, &newargc, &newargv);
+        _cleanup_strv_free_ char **newargv = NULL;
+        r = get_file_options(vendor_str, model_str, &newargv);
+        if (r <= 0)
+                return r;
 
-        optind = 1; /* reset this global extern */
-        while (retval == 0) {
-                option = getopt_long(newargc, newargv, "bgp:", options, NULL);
-                if (option == -1)
-                        break;
+        size_t newargc = strv_length(newargv);
+        if (newargc > INT_MAX)
+                return log_oom();  /* Close enough :) */
 
-                switch (option) {
-                case 'b':
+        OptionParser opts = { newargc, newargv };
+
+        /* We reuse the option parser, but only a subset of the options is supported here.
+         * If any others are encountered, return an error. */
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                if (opts.opt->short_code == 'b')
                         *good_bad = 0;
-                        break;
-
-                case 'g':
+                else if (opts.opt->short_code == 'g')
                         *good_bad = 1;
-                        break;
-
-                case 'p':
-                        if (streq(optarg, "0x80")) {
-                                *page_code = PAGE_80;
-                        } else if (streq(optarg, "0x83")) {
-                                *page_code = PAGE_83;
-                        } else if (streq(optarg, "pre-spc3-83")) {
-                                *page_code = PAGE_83_PRE_SPC3;
-                        } else {
-                                log_error("Unknown page code '%s'", optarg);
-                                retval = -1;
-                        }
-                        break;
-
-                default:
-                        log_error("Unknown or bad option '%c' (0x%x)", option, option);
-                        retval = -1;
-                        break;
+                else if (opts.opt->short_code == 'p') {
+                        r = parse_page_code(opts.arg, page_code);
+                        if (r < 0)
+                                return r;
+                } else {
+                        _cleanup_free_ char *synopsis =
+                                option_get_synopsis(opts.opt, "/", /* show_metavar=*/ false);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Option %s not supported in the config file.",
+                                               strnull(synopsis));
                 }
-        }
 
-        if (newargv) {
-                free(newargv[0]);
-                free(newargv);
-        }
-        return retval;
+        return 0;
 }
 
 static int set_inq_values(struct scsi_id_device *dev_scsi, const char *path) {
-        int retval;
+        int r;
 
         dev_scsi->use_sg = sg_version;
 
-        retval = scsi_std_inquiry(dev_scsi, path);
-        if (retval)
-                return retval;
+        r = scsi_std_inquiry(dev_scsi, path);
+        if (r < 0)
+                return r;
 
-        udev_util_encode_string(dev_scsi->vendor, vendor_enc_str, sizeof(vendor_enc_str));
-        udev_util_encode_string(dev_scsi->model, model_enc_str, sizeof(model_enc_str));
+        encode_devnode_name(dev_scsi->vendor, vendor_enc_str, sizeof(vendor_enc_str));
+        encode_devnode_name(dev_scsi->model, model_enc_str, sizeof(model_enc_str));
 
-        util_replace_whitespace(dev_scsi->vendor, vendor_str, sizeof(vendor_str)-1);
-        util_replace_chars(vendor_str, NULL);
-        util_replace_whitespace(dev_scsi->model, model_str, sizeof(model_str)-1);
-        util_replace_chars(model_str, NULL);
+        udev_replace_whitespace(dev_scsi->vendor, vendor_str, sizeof(vendor_str)-1);
+        udev_replace_chars(vendor_str, NULL);
+        udev_replace_whitespace(dev_scsi->model, model_str, sizeof(model_str)-1);
+        udev_replace_chars(model_str, NULL);
         set_type(dev_scsi->type, type_str, sizeof(type_str));
-        util_replace_whitespace(dev_scsi->revision, revision_str, sizeof(revision_str)-1);
-        util_replace_chars(revision_str, NULL);
+        udev_replace_whitespace(dev_scsi->revision, revision_str, sizeof(revision_str)-1);
+        udev_replace_chars(revision_str, NULL);
         return 0;
+}
+
+static bool scsi_string_is_valid(const char *s) {
+        return !isempty(s) && utf8_is_valid(s) && !string_has_cc(s, /* ok= */ NULL);
 }
 
 /*
  * scsi_id: try to get an id, if one is found, printf it to stdout.
- * returns a value passed to exit() - 0 if printed an id, else 1.
  */
 static int scsi_id(char *maj_min_dev) {
         struct scsi_id_device dev_scsi = {};
-        int good_dev;
-        int page_code;
-        int retval = 0;
+        enum page_code page_code;
+        int good_dev, r;
 
-        if (set_inq_values(&dev_scsi, maj_min_dev) < 0) {
-                retval = 1;
-                goto out;
-        }
+        r = set_inq_values(&dev_scsi, maj_min_dev);
+        if (r < 0)
+                return r;
 
         /* get per device (vendor + model) options from the config file */
-        per_dev_options(&dev_scsi, &good_dev, &page_code);
-        if (!good_dev) {
-                retval = 1;
-                goto out;
-        }
+        r = per_dev_options(&dev_scsi, &good_dev, &page_code);
+        if (r < 0)
+                return r;
+        if (!good_dev)
+                return -EIO;
 
         /* read serial number from mode pages (no values for optical drives) */
-        scsi_get_serial(&dev_scsi, maj_min_dev, page_code, MAX_SERIAL_LEN);
+        (void) scsi_get_serial(&dev_scsi, maj_min_dev, page_code, MAX_SERIAL_LEN);
 
         if (export) {
                 char serial_str[MAX_SERIAL_LEN];
@@ -504,94 +393,79 @@ static int scsi_id(char *maj_min_dev) {
                 printf("ID_REVISION=%s\n", revision_str);
                 printf("ID_TYPE=%s\n", type_str);
                 if (dev_scsi.serial[0] != '\0') {
-                        util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
-                        util_replace_chars(serial_str, NULL);
+                        udev_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
+                        udev_replace_chars(serial_str, NULL);
                         printf("ID_SERIAL=%s\n", serial_str);
-                        util_replace_whitespace(dev_scsi.serial_short, serial_str, sizeof(serial_str)-1);
-                        util_replace_chars(serial_str, NULL);
+                        udev_replace_whitespace(dev_scsi.serial_short, serial_str, sizeof(serial_str)-1);
+                        udev_replace_chars(serial_str, NULL);
                         printf("ID_SERIAL_SHORT=%s\n", serial_str);
                 }
-                if (dev_scsi.wwn[0] != '\0') {
+                if (scsi_string_is_valid(dev_scsi.wwn)) {
                         printf("ID_WWN=0x%s\n", dev_scsi.wwn);
-                        if (dev_scsi.wwn_vendor_extension[0] != '\0') {
+                        if (scsi_string_is_valid(dev_scsi.wwn_vendor_extension)) {
                                 printf("ID_WWN_VENDOR_EXTENSION=0x%s\n", dev_scsi.wwn_vendor_extension);
                                 printf("ID_WWN_WITH_EXTENSION=0x%s%s\n", dev_scsi.wwn, dev_scsi.wwn_vendor_extension);
                         } else
                                 printf("ID_WWN_WITH_EXTENSION=0x%s\n", dev_scsi.wwn);
                 }
-                if (dev_scsi.tgpt_group[0] != '\0')
+                if (scsi_string_is_valid(dev_scsi.tgpt_group))
                         printf("ID_TARGET_PORT=%s\n", dev_scsi.tgpt_group);
-                if (dev_scsi.unit_serial_number[0] != '\0')
+                if (scsi_string_is_valid(dev_scsi.unit_serial_number))
                         printf("ID_SCSI_SERIAL=%s\n", dev_scsi.unit_serial_number);
-                goto out;
+                return 0;
         }
 
-        if (dev_scsi.serial[0] == '\0') {
-                retval = 1;
-                goto out;
-        }
+        if (dev_scsi.serial[0] == '\0')
+                return -ENODATA;
 
         if (reformat_serial) {
                 char serial_str[MAX_SERIAL_LEN];
 
-                util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
-                util_replace_chars(serial_str, NULL);
+                udev_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
+                udev_replace_chars(serial_str, NULL);
                 printf("%s\n", serial_str);
-                goto out;
+                return 0;
         }
 
         printf("%s\n", dev_scsi.serial);
-out:
-        return retval;
+        return 0;
 }
 
-int main(int argc, char **argv) {
-        int retval = 0;
+static int run(int argc, char **argv) {
+        _cleanup_strv_free_ char **newargv = NULL;
         char maj_min_dev[MAX_PATH_LEN];
-        int newargc;
-        char **newargv = NULL;
+        int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         /*
          * Get config file options.
          */
-        retval = get_file_options(NULL, NULL, &newargc, &newargv);
-        if (retval < 0) {
-                retval = 1;
-                goto exit;
-        }
-        if (retval == 0) {
-                assert(newargv);
+        r = get_file_options(NULL, NULL, &newargv);
+        if (r < 0)
+                return r;
+        if (r == 1) {
+                size_t newargc = strv_length(newargv);
+                if (newargc > INT_MAX)
+                        return log_oom();  /* Close enough :) */
 
-                if (set_options(newargc, newargv, maj_min_dev) < 0) {
-                        retval = 2;
-                        goto exit;
-                }
+                r = set_options(newargc, newargv, maj_min_dev);
+                if (r <= 0)
+                        return r;
         }
 
         /*
          * Get command line options (overriding any config file settings).
          */
-        if (set_options(argc, argv, maj_min_dev) < 0)
-                exit(EXIT_FAILURE);
+        r = set_options(argc, argv, maj_min_dev);
+        if (r <= 0)
+                return r;
 
-        if (!dev_specified) {
-                log_error("No device specified.");
-                retval = 1;
-                goto exit;
-        }
+        if (!dev_specified)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No device specified.");
 
-        retval = scsi_id(maj_min_dev);
-
-exit:
-        if (newargv) {
-                free(newargv[0]);
-                free(newargv);
-        }
-        log_close();
-        return retval;
+        return scsi_id(maj_min_dev);
 }
+
+DEFINE_MAIN_FUNCTION(run);

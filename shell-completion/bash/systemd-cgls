@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # systemd-cgls(1) completion                  -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word() {
     local w word=$1; shift
@@ -25,24 +26,26 @@ __contains_word() {
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
 __get_units_have_cgroup() {
-    systemctl $1 list-units | {
+    systemctl $1 --full --no-legend --no-pager --plain list-units 2>/dev/null | {
         while read -r a b c d; do
             [[ $c == "active" && ${a##*.} =~ (service|socket|mount|swap|slice|scope) ]] && echo " $a"
         done
-    };
+    }
 }
 
 _systemd_cgls() {
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local i verb comps
 
     local -A OPTS=(
-        [STANDALONE]='-h --help --version --all -l --full -k --no-pager'
-        [ARG]='-M --machine -u --unit --user-unit'
+        [STANDALONE]='-h --help --version --all -l --full -k --no-pager --xattr=no --cgroup-id=no'
+        [ARG]='-c --cgroup-id -M --machine -u --unit --user-unit -x --xattr'
     )
 
     _init_completion || return
@@ -54,6 +57,9 @@ _systemd_cgls() {
                 ;;
             --unit|-u)
                 comps=$( __get_units_have_cgroup --system )
+                ;;
+            -c|--cgroup-id|-x|--xattr)
+                comps='yes no'
                 ;;
             --user-unit)
                 comps=$( __get_units_have_cgroup --user )

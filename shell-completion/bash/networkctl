@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # networkctl(1) completion                               -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -25,20 +26,35 @@ __contains_word () {
 }
 
 __get_links() {
-    networkctl list --no-legend --no-pager --all | { while read -r a b c; do echo " $b"; done; };
+    networkctl list --no-legend --no-pager --all --full 2>/dev/null | { while read -r a b c; do echo " $b"; done; }
+}
+
+__get_links_with_prefix() {
+    local i
+    for i in $(__get_links); do
+        echo "@$i"
+    done
+}
+
+__get_files() {
+    ls {/run,/usr/lib,/etc}/systemd/network/*.{network,netdev,link} 2>/dev/null
 }
 
 _networkctl() {
     local i verb comps
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} words cword
     local -A OPTS=(
-        [STANDALONE]='-a --all -h --help --version --no-pager --no-legend -s --stats'
-        [ARG]=''
+        [STANDALONE]='-a --all -h --help --version --no-pager --no-legend --no-ask-password
+                      -s --stats -l --full --no-reload --no-reconfigure --runtime'
+        [ARG]='-n --lines --json --drop-in'
     )
 
     local -A VERBS=(
-        [STANDALONE]='label'
-        [LINKS]='status list lldp delete'
+        [STANDALONE]='label reload'
+        [LINKS]='status dhcp-lease list lldp delete renew up down forcerenew reconfigure'
+        [FILES_OR_LINKS]='edit cat'
+        [FILES]='mask unmask'
+        [BOOL]='persistent-storage'
     )
 
     _init_completion || return
@@ -51,17 +67,36 @@ _networkctl() {
         fi
     done
 
+    if __contains_word "$prev" ${OPTS[ARG]}; then
+        case $prev in
+            --json)
+                comps=$(networkctl --json=help 2>/dev/null)
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+        COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
+        return 0
+    fi
+
     if [[ "$cur" = -* ]]; then
         COMPREPLY=( $(compgen -W '${OPTS[*]}' -- "$cur") )
         return 0
     fi
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
     elif __contains_word "$verb" ${VERBS[STANDALONE]}; then
         comps=''
     elif __contains_word "$verb" ${VERBS[LINKS]}; then
         comps=$( __get_links )
+    elif __contains_word "$verb" ${VERBS[FILES_OR_LINKS]}; then
+        comps=$( __get_files; __get_links_with_prefix )
+    elif __contains_word "$verb" ${VERBS[FILES]}; then
+        comps=$( __get_files )
+    elif __contains_word "$verb" ${VERBS[BOOL]}; then
+        comps=$( yes no )
     fi
 
     COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

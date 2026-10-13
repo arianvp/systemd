@@ -1,5 +1,6 @@
+# shellcheck shell=bash
 # timedatectl(1) completion                               -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -16,7 +17,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -27,9 +28,17 @@ __contains_word () {
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } |
+        { while read -r a b; do echo " $a"; done; } |
+        sort -u
 }
 
+__get_interfaces(){
+    local name
+    for name in $(cd /sys/class/net && command ls); do
+        [[ "$name" != "lo" ]] && echo "$name"
+    done
+}
 _timedatectl() {
     local i verb comps
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
@@ -60,6 +69,7 @@ _timedatectl() {
         [STANDALONE]='status show list-timezones timesync-status show-timesync'
         [TIMEZONES]='set-timezone'
         [TIME]='set-time'
+        [IFNAME]='ntp-servers revert'
     )
 
     for ((i=0; i < COMP_CWORD; i++)); do
@@ -69,7 +79,7 @@ _timedatectl() {
         fi
     done
 
-    if [[ -z $verb ]]; then
+    if [[ -z ${verb-} ]]; then
         comps=${VERBS[*]}
     elif __contains_word "$verb" ${VERBS[BOOLEAN]}; then
         comps='true false'
@@ -77,6 +87,8 @@ _timedatectl() {
         comps=$(command timedatectl list-timezones)
     elif __contains_word "$verb" ${VERBS[STANDALONE]} ${VERBS[TIME]}; then
         comps=''
+    elif __contains_word "$verb" ${VERBS[TIMEZONES]}; then
+        comps=$( __get_interfaces )
     fi
 
     COMPREPLY=( $(compgen -W '$comps' -- "$cur") )

@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # sys-script.py
 #
 # © 2017 Canonical Ltd.
 # Author: Dan Streetman <dan.streetman@canonical.com>
 
-import os, sys
+import os
 import shutil
+import sys
+
 
 def d(path, mode):
     os.mkdir(path, mode)
 
-def l(path, src):
+
+def l(path, src):  # noqa: E743
     os.symlink(src, path)
 
+
 def f(path, mode, contents):
-    with open(path, "wb") as f:
+    with open(path, 'wb') as f:
         f.write(contents)
     os.chmod(path, mode)
 
+
 if len(sys.argv) < 2:
-    exit("Usage: {} <target dir>".format(sys.argv[0]))
+    exit(f'Usage: {sys.argv[0]} <target dir>')
 
 if not os.path.isdir(sys.argv[1]):
-    exit("Target dir {} not found".format(sys.argv[1]))
+    exit(f'Target dir {sys.argv[1]} not found')
 
 os.chdir(sys.argv[1])
 
 if os.path.exists('sys'):
     shutil.rmtree('sys')
+# fmt: off
 d('sys', 0o755)
 d('sys/kernel', 0o775)
 f('sys/kernel/kexec_crash_loaded', 0o664, b'0\n')
@@ -10578,6 +10584,7 @@ f('sys/devices/pnp0/00:07/rtc/rtc0/name', 0o644, b'rtc_cmos\n')
 f('sys/devices/pnp0/00:07/rtc/rtc0/time', 0o644, b'02:30:51\n')
 f('sys/devices/pnp0/00:07/rtc/rtc0/uevent', 0o644, b'''MAJOR=253
 MINOR=0
+DEVNAME=rtc0
 ''')
 d('sys/devices/pnp0/00:07/rtc/rtc0/power', 0o755)
 f('sys/devices/pnp0/00:07/rtc/rtc0/power/wakeup', 0o644, b'\n')
@@ -11677,6 +11684,7 @@ f('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:
 f('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/uevent', 0o644, b'''MAJOR=8
 MINOR=16
 DEVTYPE=disk
+DEVNAME=sdb
 ''')
 d('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/queue', 0o755)
 l('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/queue/bsg', '../../../bsg/7:0:0:0')
@@ -11709,6 +11717,7 @@ f('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:
 f('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/sdb1/uevent', 0o644, b'''MAJOR=8
 MINOR=17
 DEVTYPE=partition
+DEVNAME=sdb1
 ''')
 d('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/sdb1/power', 0o755)
 f('sys/devices/pci0000:00/0000:00:1d.7/usb5/5-1/5-1:1.0/host7/target7:0:0/7:0:0:0/block/sdb/sdb1/power/wakeup', 0o644, b'\n')
@@ -13150,6 +13159,7 @@ f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda10
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda10/uevent', 0o644, b'''MAJOR=8
 MINOR=10
 DEVTYPE=partition
+DEVNAME=sda10
 ''')
 d('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda10/power', 0o755)
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda10/power/wakeup', 0o644, b'\n')
@@ -13163,6 +13173,7 @@ f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda9/
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda9/uevent', 0o644, b'''MAJOR=8
 MINOR=9
 DEVTYPE=partition
+DEVNAME=sda9
 ''')
 d('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda9/holders', 0o755)
 l('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda9/holders/md0', '../../../../../../../../../virtual/block/md0')
@@ -13178,6 +13189,7 @@ f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda7/
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda7/uevent', 0o644, b'''MAJOR=8
 MINOR=7
 DEVTYPE=partition
+DEVNAME=sda7
 ''')
 d('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda7/power', 0o755)
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda7/power/wakeup', 0o644, b'\n')
@@ -13205,6 +13217,7 @@ f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda8/
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda8/uevent', 0o644, b'''MAJOR=8
 MINOR=8
 DEVTYPE=partition
+DEVNAME=sda8
 ''')
 d('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda8/power', 0o755)
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda8/power/wakeup', 0o644, b'\n')
@@ -13232,6 +13245,7 @@ f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda6/
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda6/uevent', 0o644, b'''MAJOR=8
 MINOR=6
 DEVTYPE=partition
+DEVNAME=sda6
 ''')
 d('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda6/power', 0o755)
 f('sys/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda6/power/wakeup', 0o644, b'\n')
@@ -16848,3 +16862,4 @@ f('sys/devices/platform/i8042/serio1/input/input1/capabilities/rel', 0o644, b'3\
 f('sys/devices/platform/i8042/serio1/input/input1/capabilities/sw', 0o644, b'0\n')
 f('sys/devices/platform/i8042/serio1/input/input1/capabilities/ev', 0o644, b'7\n')
 f('sys/devices/platform/i8042/serio1/input/input1/capabilities/led', 0o644, b'0\n')
+# fmt: on

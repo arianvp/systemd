@@ -1,32 +1,71 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <ftw.h>
 #include <langinfo.h>
-#include <libintl.h>
-#include <locale.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-#include "def.h"
 #include "dirent-util.h"
 #include "env-util.h"
 #include "fd-util.h"
-#include "hashmap.h"
+#include "fileio.h"
 #include "locale-util.h"
+#include "log.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "set.h"
+#include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "utf8.h"
 
+static char* normalize_locale(const char *name) {
+        const char *e;
+
+        /* Locale names are weird: glibc has some magic rules when looking for the charset name on disk: it
+         * lowercases everything, and removes most special chars. This means the official .UTF-8 suffix
+         * becomes .utf8 when looking things up on disk. When enumerating locales, let's do the reverse
+         * operation, and go back to ".UTF-8" which appears to be the more commonly accepted name. We only do
+         * that for UTF-8 however, since it's kinda the only charset that matters. */
+
+        e = endswith(name, ".utf8");
+        if (e) {
+                _cleanup_free_ char *prefix = NULL;
+
+                prefix = strndup(name, e - name);
+                if (!prefix)
+                        return NULL;
+
+                return strjoin(prefix, ".UTF-8");
+        }
+
+        e = strstr(name, ".utf8@");
+        if (e) {
+                _cleanup_free_ char *prefix = NULL;
+
+                prefix = strndup(name, e - name);
+                if (!prefix)
+                        return NULL;
+
+                return strjoin(prefix, ".UTF-8@", e + 6);
+        }
+
+        return strdup(name);
+}
+
+static const char* get_locale_dir(void) {
+        return secure_getenv("SYSTEMD_LOCALE_DIRECTORY") ?:
+#ifdef __GLIBC__
+                "/usr/lib/locale/";
+#else
+                "/usr/share/i18n/locales/musl/";
+#endif
+}
+
+#ifdef __GLIBC__
 static int add_locales_from_archive(Set *locales) {
         /* Stolen from glibc... */
 
@@ -61,33 +100,38 @@ static int add_locales_from_archive(Set *locales) {
                 uint32_t locrec_offset;
         };
 
-        const struct locarhead *h;
-        const struct namehashent *e;
-        const void *p = MAP_FAILED;
-        _cleanup_close_ int fd = -1;
-        size_t sz = 0;
-        struct stat st;
-        size_t i;
         int r;
 
-        fd = open("/usr/lib/locale/locale-archive", O_RDONLY|O_NOCTTY|O_CLOEXEC);
+        assert(locales);
+
+        _cleanup_free_ char *locale_archive_file = path_join(get_locale_dir(), "locale-archive");
+        if (!locale_archive_file)
+                return -ENOMEM;
+
+        _cleanup_close_ int fd = open(locale_archive_file, O_RDONLY|O_NOCTTY|O_CLOEXEC);
         if (fd < 0)
                 return errno == ENOENT ? 0 : -errno;
 
+        struct stat st;
         if (fstat(fd, &st) < 0)
                 return -errno;
 
-        if (!S_ISREG(st.st_mode))
-                return -EBADMSG;
+        r = stat_verify_regular(&st);
+        if (r < 0)
+                return r;
 
         if (st.st_size < (off_t) sizeof(struct locarhead))
                 return -EBADMSG;
 
-        p = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (file_offset_beyond_memory_size(st.st_size))
+                return -EFBIG;
+
+        void *p = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED)
                 return -errno;
 
-        h = (const struct locarhead *) p;
+        const struct namehashent *e;
+        const struct locarhead *h = p;
         if (h->magic != 0xde020109 ||
             h->namehash_offset + h->namehash_size > st.st_size ||
             h->string_offset + h->string_size > st.st_size ||
@@ -98,7 +142,7 @@ static int add_locales_from_archive(Set *locales) {
         }
 
         e = (const struct namehashent*) ((const uint8_t*) p + h->namehash_offset);
-        for (i = 0; i < h->namehash_size; i++) {
+        for (size_t i = 0; i < h->namehash_size; i++) {
                 char *z;
 
                 if (e[i].locrec_offset == 0)
@@ -107,7 +151,7 @@ static int add_locales_from_archive(Set *locales) {
                 if (!utf8_is_valid((char*) p + e[i].name_offset))
                         continue;
 
-                z = strdup((char*) p + e[i].name_offset);
+                z = normalize_locale((char*) p + e[i].name_offset);
                 if (!z) {
                         r = -ENOMEM;
                         goto finish;
@@ -120,51 +164,80 @@ static int add_locales_from_archive(Set *locales) {
 
         r = 0;
 
- finish:
+finish:
         if (p != MAP_FAILED)
-                munmap((void*) p, sz);
+                munmap(p, st.st_size);
 
         return r;
 }
 
-static int add_locales_from_libdir (Set *locales) {
+static int add_locales_from_libdir(Set *locales) {
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *entry;
         int r;
 
-        dir = opendir("/usr/lib/locale");
+        assert(locales);
+
+        dir = opendir(get_locale_dir());
         if (!dir)
                 return errno == ENOENT ? 0 : -errno;
 
-        FOREACH_DIRENT(entry, dir, return -errno) {
+        FOREACH_DIRENT(de, dir, return -errno) {
                 char *z;
 
-                dirent_ensure_type(dir, entry);
-
-                if (entry->d_type != DT_DIR)
+                if (de->d_type != DT_DIR)
                         continue;
 
-                z = strdup(entry->d_name);
+                z = normalize_locale(de->d_name);
                 if (!z)
                         return -ENOMEM;
 
                 r = set_consume(locales, z);
-                if (r < 0 && r != -EEXIST)
+                if (r < 0)
                         return r;
         }
 
         return 0;
 }
 
-int get_locales(char ***ret) {
-        _cleanup_set_free_ Set *locales = NULL;
-        _cleanup_strv_free_ char **l = NULL;
+#else
+
+static int add_locales_for_musl(Set *locales) {
         int r;
 
-        locales = set_new(&string_hash_ops);
+        assert(locales);
+
+        _cleanup_closedir_ DIR *dir = opendir(get_locale_dir());
+        if (!dir)
+                return errno == ENOENT ? 0 : -errno;
+
+        FOREACH_DIRENT(de, dir, return -errno) {
+                if (de->d_type != DT_REG)
+                        continue;
+
+                char *z = normalize_locale(de->d_name);
+                if (!z)
+                        return -ENOMEM;
+
+                r = set_consume(locales, z);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+#endif
+
+int get_locales(char ***ret) {
+        _cleanup_set_free_ Set *locales = NULL;
+        int r;
+
+        assert(ret);
+
+        locales = set_new(&string_hash_ops_free);
         if (!locales)
                 return -ENOMEM;
 
+#ifdef __GLIBC__
         r = add_locales_from_archive(locales);
         if (r < 0 && r != -ENOENT)
                 return r;
@@ -172,10 +245,40 @@ int get_locales(char ***ret) {
         r = add_locales_from_libdir(locales);
         if (r < 0)
                 return r;
+#else
+        r = add_locales_for_musl(locales);
+        if (r < 0)
+                return r;
+#endif
 
-        l = set_get_strv(locales);
+        char *locale;
+        SET_FOREACH(locale, locales) {
+                r = locale_is_installed(locale);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        free(set_remove(locales, locale));
+        }
+
+        _cleanup_strv_free_ char **l = set_to_strv(&locales);
         if (!l)
                 return -ENOMEM;
+
+        r = getenv_bool("SYSTEMD_LIST_NON_UTF8_LOCALES");
+        if (r <= 0) {
+                if (!IN_SET(r, -ENXIO, 0))
+                        log_debug_errno(r, "Failed to parse $SYSTEMD_LIST_NON_UTF8_LOCALES as boolean, ignoring: %m");
+
+                /* Filter out non-UTF-8 locales, because it's 2019, by default */
+                char **b = l;
+                STRV_FOREACH(a, l)
+                        if (endswith(*a, "UTF-8") || strstr(*a, ".UTF-8@"))
+                                *(b++) = *a;
+                        else
+                                free(*a);
+
+                *b = NULL;
+        }
 
         strv_sort(l);
 
@@ -198,169 +301,116 @@ bool locale_is_valid(const char *name) {
         if (!filename_is_valid(name))
                 return false;
 
-        if (!string_is_safe(name))
+        /* Locales look like: ll_CC.ENC@variant, where ll and CC are alphabetic, ENC is alphanumeric with
+         * dashes, and variant seems to be alphabetic.
+         * See: https://www.gnu.org/software/gettext/manual/html_node/Locale-Names.html */
+        if (!in_charset(name, ALPHANUMERICAL "_.-@"))
                 return false;
 
         return true;
 }
 
-void init_gettext(void) {
-        setlocale(LC_ALL, "");
-        textdomain(GETTEXT_PACKAGE);
+int locale_is_installed(const char *name) {
+        if (!locale_is_valid(name))
+                return false;
+
+        if (STR_IN_SET(name, "C", "POSIX")) /* These ones are always OK */
+                return true;
+
+#ifdef __GLIBC__
+        _cleanup_(freelocalep) locale_t loc = newlocale(LC_ALL_MASK, name, (locale_t) 0);
+        if (loc == (locale_t) 0)
+                return errno == ENOMEM ? -ENOMEM : false;
+
+        return true;
+#else
+        /* musl also has C.UTF-8 as builtin */
+        if (streq(name, "C.UTF-8"))
+                return true;
+
+        /* musl's newlocale() always succeeds and provides a fake locale object even when the locale does
+         * not exist. Hence, we need to explicitly check if the locale file exists. */
+        _cleanup_free_ char *p = path_join(get_locale_dir(), name);
+        if (!p)
+                return -ENOMEM;
+
+        return access(p, F_OK) >= 0;
+#endif
 }
 
-bool is_locale_utf8(void) {
+static bool is_locale_utf8_impl(void) {
         const char *set;
-        static int cached_answer = -1;
+        int r;
 
-        /* Note that we default to 'true' here, since today UTF8 is
-         * pretty much supported everywhere. */
+        /* Note that we default to 'true' here, since today UTF8 is pretty much supported everywhere. */
 
-        if (cached_answer >= 0)
-                goto out;
+        r = secure_getenv_bool("SYSTEMD_UTF8");
+        if (r >= 0)
+                return r;
+        if (r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_UTF8, ignoring: %m");
 
-        if (!setlocale(LC_ALL, "")) {
-                cached_answer = true;
-                goto out;
-        }
+        /* This function may be called from libsystemd, and setlocale() is not thread safe. Assuming yes. */
+        if (!is_main_thread())
+                return true;
+
+        if (!setlocale(LC_ALL, ""))
+                return true;
 
         set = nl_langinfo(CODESET);
-        if (!set) {
-                cached_answer = true;
-                goto out;
-        }
+        if (!set || streq(set, "UTF-8"))
+                return true;
 
-        if (streq(set, "UTF-8")) {
-                cached_answer = true;
-                goto out;
-        }
-
-        /* For LC_CTYPE=="C" return true, because CTYPE is effectively
-         * unset and everything can do to UTF-8 nowadays. */
         set = setlocale(LC_CTYPE, NULL);
-        if (!set) {
-                cached_answer = true;
-                goto out;
-        }
+        if (!set)
+                return true;
 
-        /* Check result, but ignore the result if C was set
-         * explicitly. */
-        cached_answer =
-                STR_IN_SET(set, "C", "POSIX") &&
+        /* Unless LC_CTYPE is explicitly overridden, return true. Because here CTYPE is effectively unset
+         * and everything can do to UTF-8 nowadays. */
+        return STR_IN_SET(set, "C", "POSIX") &&
                 !getenv("LC_ALL") &&
                 !getenv("LC_CTYPE") &&
                 !getenv("LANG");
-
-out:
-        return (bool) cached_answer;
 }
 
-static bool emoji_enabled(void) {
-        static int cached_emoji_enabled = -1;
+bool is_locale_utf8(void) {
+        static int cached = -1;
 
-        if (cached_emoji_enabled < 0) {
-                int val;
+        if (cached < 0)
+                cached = is_locale_utf8_impl();
 
-                val = getenv_bool("SYSTEMD_EMOJI");
-                if (val < 0)
-                        cached_emoji_enabled =
-                                is_locale_utf8() &&
-                                !STRPTR_IN_SET(getenv("TERM"), "dumb", "linux");
-                else
-                        cached_emoji_enabled = val;
-        }
-
-        return cached_emoji_enabled;
-}
-
-const char *special_glyph(SpecialGlyph code) {
-
-        /* A list of a number of interesting unicode glyphs we can use to decorate our output. It's probably wise to be
-         * conservative here, and primarily stick to the glyphs defined in the eurlatgr font, so that display still
-         * works reasonably well on the Linux console. For details see:
-         *
-         * http://git.altlinux.org/people/legion/packages/kbd.git?p=kbd.git;a=blob;f=data/consolefonts/README.eurlatgr
-         */
-
-        static const char* const draw_table[2][_SPECIAL_GLYPH_MAX] = {
-                /* ASCII fallback */
-                [false] = {
-                        [SPECIAL_GLYPH_TREE_VERTICAL]           = "| ",
-                        [SPECIAL_GLYPH_TREE_BRANCH]             = "|-",
-                        [SPECIAL_GLYPH_TREE_RIGHT]              = "`-",
-                        [SPECIAL_GLYPH_TREE_SPACE]              = "  ",
-                        [SPECIAL_GLYPH_TRIANGULAR_BULLET]       = ">",
-                        [SPECIAL_GLYPH_BLACK_CIRCLE]            = "*",
-                        [SPECIAL_GLYPH_BULLET]                  = "*",
-                        [SPECIAL_GLYPH_ARROW]                   = "->",
-                        [SPECIAL_GLYPH_MDASH]                   = "-",
-                        [SPECIAL_GLYPH_ELLIPSIS]                = "...",
-                        [SPECIAL_GLYPH_MU]                      = "u",
-                        [SPECIAL_GLYPH_CHECK_MARK]              = "+",
-                        [SPECIAL_GLYPH_CROSS_MARK]              = "-",
-                        [SPECIAL_GLYPH_ECSTATIC_SMILEY]         = ":-]",
-                        [SPECIAL_GLYPH_HAPPY_SMILEY]            = ":-}",
-                        [SPECIAL_GLYPH_SLIGHTLY_HAPPY_SMILEY]   = ":-)",
-                        [SPECIAL_GLYPH_NEUTRAL_SMILEY]          = ":-|",
-                        [SPECIAL_GLYPH_SLIGHTLY_UNHAPPY_SMILEY] = ":-(",
-                        [SPECIAL_GLYPH_UNHAPPY_SMILEY]          = ":-{️",
-                        [SPECIAL_GLYPH_DEPRESSED_SMILEY]        = ":-[",
-                },
-
-                /* UTF-8 */
-                [true] = {
-                        [SPECIAL_GLYPH_TREE_VERTICAL]           = "\342\224\202 ",            /* │  */
-                        [SPECIAL_GLYPH_TREE_BRANCH]             = "\342\224\234\342\224\200", /* ├─ */
-                        [SPECIAL_GLYPH_TREE_RIGHT]              = "\342\224\224\342\224\200", /* └─ */
-                        [SPECIAL_GLYPH_TREE_SPACE]              = "  ",                       /*    */
-                        [SPECIAL_GLYPH_TRIANGULAR_BULLET]       = "\342\200\243",             /* ‣ */
-                        [SPECIAL_GLYPH_BLACK_CIRCLE]            = "\342\227\217",             /* ● */
-                        [SPECIAL_GLYPH_BULLET]                  = "\342\200\242",             /* • */
-                        [SPECIAL_GLYPH_ARROW]                   = "\342\206\222",             /* → */
-                        [SPECIAL_GLYPH_MDASH]                   = "\342\200\223",             /* – */
-                        [SPECIAL_GLYPH_ELLIPSIS]                = "\342\200\246",             /* … */
-                        [SPECIAL_GLYPH_MU]                      = "\316\274",                 /* μ */
-                        [SPECIAL_GLYPH_CHECK_MARK]              = "\342\234\223",             /* ✓ */
-                        [SPECIAL_GLYPH_CROSS_MARK]              = "\342\234\227",             /* ✗ */
-                        [SPECIAL_GLYPH_ECSTATIC_SMILEY]         = "\360\237\230\207",         /* 😇 */
-                        [SPECIAL_GLYPH_HAPPY_SMILEY]            = "\360\237\230\200",         /* 😀 */
-                        [SPECIAL_GLYPH_SLIGHTLY_HAPPY_SMILEY]   = "\360\237\231\202",         /* 🙂 */
-                        [SPECIAL_GLYPH_NEUTRAL_SMILEY]          = "\360\237\230\220",         /* 😐 */
-                        [SPECIAL_GLYPH_SLIGHTLY_UNHAPPY_SMILEY] = "\360\237\231\201",         /* 🙁 */
-                        [SPECIAL_GLYPH_UNHAPPY_SMILEY]          = "\360\237\230\250",         /* 😨️️ */
-                        [SPECIAL_GLYPH_DEPRESSED_SMILEY]        = "\360\237\244\242",         /* 🤢 */
-                },
-        };
-
-        assert(code < _SPECIAL_GLYPH_MAX);
-
-        return draw_table[code >= _SPECIAL_GLYPH_FIRST_SMILEY ? emoji_enabled() : is_locale_utf8()][code];
+        return cached;
 }
 
 void locale_variables_free(char *l[_VARIABLE_LC_MAX]) {
-        LocaleVariable i;
+        free_many_charp(l, _VARIABLE_LC_MAX);
+}
 
-        if (!l)
-                return;
+void locale_variables_simplify(char *l[_VARIABLE_LC_MAX]) {
+        assert(l);
 
-        for (i = 0; i < _VARIABLE_LC_MAX; i++)
-                l[i] = mfree(l[i]);
+        for (LocaleVariable p = 0; p < _VARIABLE_LC_MAX; p++) {
+                if (p == VARIABLE_LANG)
+                        continue;
+                if (isempty(l[p]) || streq_ptr(l[VARIABLE_LANG], l[p]))
+                        l[p] = mfree(l[p]);
+        }
 }
 
 static const char * const locale_variable_table[_VARIABLE_LC_MAX] = {
-        [VARIABLE_LANG] = "LANG",
-        [VARIABLE_LANGUAGE] = "LANGUAGE",
-        [VARIABLE_LC_CTYPE] = "LC_CTYPE",
-        [VARIABLE_LC_NUMERIC] = "LC_NUMERIC",
-        [VARIABLE_LC_TIME] = "LC_TIME",
-        [VARIABLE_LC_COLLATE] = "LC_COLLATE",
-        [VARIABLE_LC_MONETARY] = "LC_MONETARY",
-        [VARIABLE_LC_MESSAGES] = "LC_MESSAGES",
-        [VARIABLE_LC_PAPER] = "LC_PAPER",
-        [VARIABLE_LC_NAME] = "LC_NAME",
-        [VARIABLE_LC_ADDRESS] = "LC_ADDRESS",
-        [VARIABLE_LC_TELEPHONE] = "LC_TELEPHONE",
-        [VARIABLE_LC_MEASUREMENT] = "LC_MEASUREMENT",
+        [VARIABLE_LANG]              = "LANG",
+        [VARIABLE_LANGUAGE]          = "LANGUAGE",
+        [VARIABLE_LC_CTYPE]          = "LC_CTYPE",
+        [VARIABLE_LC_NUMERIC]        = "LC_NUMERIC",
+        [VARIABLE_LC_TIME]           = "LC_TIME",
+        [VARIABLE_LC_COLLATE]        = "LC_COLLATE",
+        [VARIABLE_LC_MONETARY]       = "LC_MONETARY",
+        [VARIABLE_LC_MESSAGES]       = "LC_MESSAGES",
+        [VARIABLE_LC_PAPER]          = "LC_PAPER",
+        [VARIABLE_LC_NAME]           = "LC_NAME",
+        [VARIABLE_LC_ADDRESS]        = "LC_ADDRESS",
+        [VARIABLE_LC_TELEPHONE]      = "LC_TELEPHONE",
+        [VARIABLE_LC_MEASUREMENT]    = "LC_MEASUREMENT",
         [VARIABLE_LC_IDENTIFICATION] = "LC_IDENTIFICATION"
 };
 

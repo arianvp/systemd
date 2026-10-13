@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_event_exit" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -35,7 +35,7 @@
       <funcprototype>
         <funcdef>int <function>sd_event_get_exit_code</function></funcdef>
         <paramdef>sd_event *<parameter>event</parameter></paramdef>
-        <paramdef>int *<parameter>code</parameter></paramdef>
+        <paramdef>int *<parameter>ret</parameter></paramdef>
       </funcprototype>
 
     </funcsynopsis>
@@ -65,15 +65,27 @@
     the exit code stored in the event loop object is updated, but
     otherwise no further operation is executed.</para>
 
-    <para><function>sd_event_get_exit_code()</function> may be used to
-    query the exit code passed into
-    <function>sd_event_exit()</function> earlier.</para>
+    <para><function>sd_event_get_exit_code()</function> may be used to query the exit code passed to an
+    earlier call of <function>sd_event_exit()</function>. The return parameter <parameter>ret</parameter>
+    may be set to <constant>NULL</constant>, in order to simply check if <function>sd_event_exit()</function>
+    has been called before (as <function>sd_event_get_exit_code()</function> fails with
+    <constant>-ENODATA</constant> if that's not the case, see below).</para>
 
     <para>While the full positive and negative integer ranges may be used
     for the exit code, care should be taken not pick exit codes that
     conflict with regular exit codes returned by
     <function>sd_event_loop()</function>, if these exit codes shall be
     distinguishable.</para>
+
+    <para>Note that for most event source types passing the callback pointer as <constant>NULL</constant> in
+    the respective constructor call (i.e. in
+    <citerefentry><refentrytitle>sd_event_add_time</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
+    <citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
+    …) has the effect of <function>sd_event_exit()</function> being invoked once the event source triggers,
+    with the specified userdata pointer cast to an integer as the exit code parameter. This is useful to
+    automatically terminate an event loop after some condition, such as a timeout or reception of
+    <constant>SIGTERM</constant> or similar. See the documentation for the respective constructor call for
+    details.</para>
   </refsect1>
 
   <refsect1>
@@ -99,7 +111,7 @@
         <varlistentry>
           <term><constant>-ECHILD</constant></term>
 
-          <listitem><para>The event loop was created in a different process.</para></listitem>
+          <listitem><para>The event loop was created in a different process, library or module instance.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -112,24 +124,36 @@
         <varlistentry>
           <term><constant>-ENODATA</constant></term>
 
-          <listitem><para>The event loop has not been requested to exit yet.</para></listitem>
+          <listitem><para>Returned by <function>sd_event_get_exit_code()</function> in case the event loop has not
+          been requested to exit yet.</para></listitem>
         </varlistentry>
 
       </variablelist>
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_event_exit()</function> and
+    <function>sd_event_get_exit_code()</function> were added in version 229.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_event_add_exit</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-event</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_exit</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_time</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_io</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_defer</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_event_add_inotify</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

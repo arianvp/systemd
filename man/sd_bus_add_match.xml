@@ -1,9 +1,9 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 
 <!--
-  SPDX-License-Identifier: LGPL-2.1+
+  SPDX-License-Identifier: LGPL-2.1-or-later
 
   Copyright © 2016 Julian Orth
 -->
@@ -33,7 +33,7 @@
     <funcsynopsis>
       <funcsynopsisinfo>#include &lt;systemd/sd-bus.h&gt;</funcsynopsisinfo>
 
-      <funcprototype>
+      <funcprototype id="sd_bus_message_handler_t">
         <funcdef>typedef int (*<function>sd_bus_message_handler_t</function>)</funcdef>
         <paramdef>sd_bus_message *<parameter>m</parameter></paramdef>
         <paramdef>void *<parameter>userdata</parameter></paramdef>
@@ -94,13 +94,13 @@
     connection object <parameter>bus</parameter>. The syntax of the match rule expression passed in
     <parameter>match</parameter> is described in the <ulink
     url="https://dbus.freedesktop.org/doc/dbus-specification.html">D-Bus Specification</ulink>. The specified handler
-    function <parameter>callback</parameter> is called for eaching incoming message matching the specified expression,
+    function <parameter>callback</parameter> is called for each incoming message matching the specified expression,
     the <parameter>userdata</parameter> parameter is passed as-is to the callback function. The match is installed
     synchronously when connected to a bus broker, i.e. the call sends a control message requested the match to be added
     to the broker and waits until the broker confirms the match has been installed successfully.</para>
 
-    <para><function>sd_bus_add_match_async()</function> operates very similar to
-    <function>sd_bus_match_signal()</function>, however it installs the match asynchronously, in a non-blocking
+    <para><function>sd_bus_add_match_async()</function> operates very similarly to
+    <function>sd_bus_add_match()</function>, however it installs the match asynchronously, in a non-blocking
     fashion: a request is sent to the broker, but the call does not wait for a response. The
     <parameter>install_callback</parameter> function is called when the response is later received, with the response
     message from the broker as parameter. If this function is specified as <constant>NULL</constant> a default
@@ -134,7 +134,7 @@
 
     <para>If an error occurs during the callback invocation, the callback should return a negative error number
     (optionally, a more precise error may be returned in <parameter>ret_error</parameter>, as well). If it wants other
-    callbacks that match the same rule to be called, it should return 0. Otherwise it should return a positive integer.
+    callbacks that match the same rule to be called, it should return 0. Otherwise, it should return a positive integer.
     </para>
 
     <para>If the <parameter>bus</parameter> refers to a direct connection (i.e. not a bus connection, as set with
@@ -151,23 +151,28 @@
     </para>
   </refsect1>
 
-  <refsect1>
-    <title>Notes</title>
+  <xi:include href="libsystemd-notes.xml"/>
 
-    <xi:include href="libsystemd-pkgconfig.xml" xpointer="pkgconfig-text"/>
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_add_match()</function> and
+    <function>sd_bus_message_handler_t()</function> were added in version 221.</para>
+    <para><function>sd_bus_add_match_async()</function>,
+    <function>sd_bus_match_signal()</function>, and
+    <function>sd_bus_match_signal_async()</function> were added in version 237.</para>
   </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_ref</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_set_bus_client</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_slot_set_floating</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_slot_unref</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_ref</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_set_bus_client</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_slot_set_floating</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -1,290 +1,235 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/fou.h>
+#include <linux/genetlink.h>
+#include <linux/if_macsec.h>
+#include <linux/l2tp.h>
+#include <linux/nl80211.h>
+#include <linux/unix_diag.h>
+#include <net/ethernet.h>
 #include <net/if.h>
-#include <netinet/ether.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "sd-event.h"
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
-#include "ether-addr-util.h"
-#include "macro.h"
-#include "missing.h"
+#include "fd-util.h"
+#include "missing-network.h"
+#include "netlink-genl.h"
+#include "netlink-internal.h"
+#include "netlink-sock-diag.h"
 #include "netlink-util.h"
 #include "socket-util.h"
-#include "string-util.h"
-#include "util.h"
+#include "stdio-util.h"
+#include "strv.h"
+#include "tests.h"
+#include "time-util.h"
 
-static void test_message_link_bridge(sd_netlink *rtnl) {
+TEST(message_newlink_bridge) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         uint32_t cost;
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &message, RTM_NEWLINK, 1) >= 0);
-        assert_se(sd_rtnl_message_link_set_family(message, PF_BRIDGE) >= 0);
-        assert_se(sd_netlink_message_open_container(message, IFLA_PROTINFO) >= 0);
-        assert_se(sd_netlink_message_append_u32(message, IFLA_BRPORT_COST, 10) >= 0);
-        assert_se(sd_netlink_message_close_container(message) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
 
-        assert_se(sd_netlink_message_rewind(message) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &message, RTM_NEWLINK, 1));
+        ASSERT_OK(sd_rtnl_message_link_set_family(message, AF_BRIDGE));
+        ASSERT_OK(sd_netlink_message_open_container(message, IFLA_PROTINFO));
+        ASSERT_OK(sd_netlink_message_append_u32(message, IFLA_BRPORT_COST, 10));
+        ASSERT_OK(sd_netlink_message_close_container(message));
 
-        assert_se(sd_netlink_message_enter_container(message, IFLA_PROTINFO) >= 0);
-        assert_se(sd_netlink_message_read_u32(message, IFLA_BRPORT_COST, &cost) >= 0);
-        assert_se(cost == 10);
-        assert_se(sd_netlink_message_exit_container(message) >= 0);
+        ASSERT_OK(sd_netlink_message_rewind(message, rtnl));
+
+        ASSERT_OK(sd_netlink_message_enter_container(message, IFLA_PROTINFO));
+        ASSERT_OK(sd_netlink_message_read_u32(message, IFLA_BRPORT_COST, &cost));
+        ASSERT_EQ(cost, 10U);
+        ASSERT_OK(sd_netlink_message_exit_container(message));
 }
 
-static void test_link_configure(sd_netlink *rtnl, int ifindex) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
-        const char *mac = "98:fe:94:3f:c6:18", *name = "test";
-        char buffer[ETHER_ADDR_TO_STRING_MAX];
-        uint32_t mtu = 1450, mtu_out;
-        const char *name_out;
-        struct ether_addr mac_out;
-
-        /* we'd really like to test NEWLINK, but let's not mess with the running kernel */
-        assert_se(sd_rtnl_message_new_link(rtnl, &message, RTM_GETLINK, ifindex) >= 0);
-        assert_se(sd_netlink_message_append_string(message, IFLA_IFNAME, name) >= 0);
-        assert_se(sd_netlink_message_append_ether_addr(message, IFLA_ADDRESS, ether_aton(mac)) >= 0);
-        assert_se(sd_netlink_message_append_u32(message, IFLA_MTU, mtu) >= 0);
-
-        assert_se(sd_netlink_call(rtnl, message, 0, NULL) == 1);
-        assert_se(sd_netlink_message_rewind(message) >= 0);
-
-        assert_se(sd_netlink_message_read_string(message, IFLA_IFNAME, &name_out) >= 0);
-        assert_se(streq(name, name_out));
-
-        assert_se(sd_netlink_message_read_ether_addr(message, IFLA_ADDRESS, &mac_out) >= 0);
-        assert_se(streq(mac, ether_addr_to_string(&mac_out, buffer)));
-
-        assert_se(sd_netlink_message_read_u32(message, IFLA_MTU, &mtu_out) >= 0);
-        assert_se(mtu == mtu_out);
-}
-
-static void test_link_get(sd_netlink *rtnl, int ifindex) {
-        sd_netlink_message *m;
-        sd_netlink_message *r;
-        uint32_t mtu = 1500;
-        const char *str_data;
+TEST(message_getlink) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+        int ifindex;
         uint8_t u8_data;
+        uint16_t u16_data;
         uint32_t u32_data;
+        const char *str_data;
         struct ether_addr eth_data;
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
-        assert_se(m);
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
 
-        /* u8 test cases  */
-        assert_se(sd_netlink_message_append_u8(m, IFLA_CARRIER, 0) >= 0);
-        assert_se(sd_netlink_message_append_u8(m, IFLA_OPERSTATE, 0) >= 0);
-        assert_se(sd_netlink_message_append_u8(m, IFLA_LINKMODE, 0) >= 0);
+        /* we'd really like to test NEWLINK, but let's not mess with the running kernel */
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &message, RTM_GETLINK, ifindex));
+        ASSERT_OK_EQ(sd_netlink_call(rtnl, message, 0, &reply), 1);
 
-        /* u32 test cases */
-        assert_se(sd_netlink_message_append_u32(m, IFLA_MTU, mtu) >= 0);
-        assert_se(sd_netlink_message_append_u32(m, IFLA_GROUP, 0) >= 0);
-        assert_se(sd_netlink_message_append_u32(m, IFLA_TXQLEN, 0) >= 0);
-        assert_se(sd_netlink_message_append_u32(m, IFLA_NUM_TX_QUEUES, 0) >= 0);
-        assert_se(sd_netlink_message_append_u32(m, IFLA_NUM_RX_QUEUES, 0) >= 0);
+        /* u8 */
+        ASSERT_OK(sd_netlink_message_read_u8(reply, IFLA_CARRIER, &u8_data));
+        ASSERT_OK(sd_netlink_message_read_u8(reply, IFLA_OPERSTATE, &u8_data));
+        ASSERT_OK(sd_netlink_message_read_u8(reply, IFLA_LINKMODE, &u8_data));
 
-        assert_se(sd_netlink_call(rtnl, m, -1, &r) == 1);
+        /* u16 */
+        ASSERT_OK(sd_netlink_message_get_type(reply, &u16_data));
+        ASSERT_EQ(u16_data, RTM_NEWLINK);
 
-        assert_se(sd_netlink_message_read_string(r, IFLA_IFNAME, &str_data) == 0);
+        /* u32 */
+        ASSERT_OK(sd_netlink_message_read_u32(reply, IFLA_MTU, &u32_data));
+        ASSERT_OK(sd_netlink_message_read_u32(reply, IFLA_GROUP, &u32_data));
+        ASSERT_OK(sd_netlink_message_read_u32(reply, IFLA_TXQLEN, &u32_data));
+        ASSERT_OK(sd_netlink_message_read_u32(reply, IFLA_NUM_TX_QUEUES, &u32_data));
 
-        assert_se(sd_netlink_message_read_u8(r, IFLA_CARRIER, &u8_data) == 0);
-        assert_se(sd_netlink_message_read_u8(r, IFLA_OPERSTATE, &u8_data) == 0);
-        assert_se(sd_netlink_message_read_u8(r, IFLA_LINKMODE, &u8_data) == 0);
+        /* string */
+        ASSERT_OK(sd_netlink_message_read_string(reply, IFLA_IFNAME, &str_data));
 
-        assert_se(sd_netlink_message_read_u32(r, IFLA_MTU, &u32_data) == 0);
-        assert_se(sd_netlink_message_read_u32(r, IFLA_GROUP, &u32_data) == 0);
-        assert_se(sd_netlink_message_read_u32(r, IFLA_TXQLEN, &u32_data) == 0);
-        assert_se(sd_netlink_message_read_u32(r, IFLA_NUM_TX_QUEUES, &u32_data) == 0);
-        assert_se(sd_netlink_message_read_u32(r, IFLA_NUM_RX_QUEUES, &u32_data) == 0);
-
-        assert_se(sd_netlink_message_read_ether_addr(r, IFLA_ADDRESS, &eth_data) == 0);
-
-        assert_se((m = sd_netlink_message_unref(m)) == NULL);
-        assert_se((r = sd_netlink_message_unref(r)) == NULL);
+        /* ether_addr */
+        ASSERT_OK(sd_netlink_message_read_ether_addr(reply, IFLA_ADDRESS, &eth_data));
 }
 
-static void test_address_get(sd_netlink *rtnl, int ifindex) {
-        sd_netlink_message *m;
-        sd_netlink_message *r;
+TEST(message_address) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+        int ifindex;
         struct in_addr in_data;
         struct ifa_cacheinfo cache;
         const char *label;
-
-        assert_se(sd_rtnl_message_new_addr(rtnl, &m, RTM_GETADDR, ifindex, AF_INET) >= 0);
-        assert_se(m);
-
-        assert_se(sd_netlink_call(rtnl, m, -1, &r) == 1);
-
-        assert_se(sd_netlink_message_read_in_addr(r, IFA_LOCAL, &in_data) == 0);
-        assert_se(sd_netlink_message_read_in_addr(r, IFA_ADDRESS, &in_data) == 0);
-        assert_se(sd_netlink_message_read_string(r, IFA_LABEL, &label) == 0);
-        assert_se(sd_netlink_message_read_cache_info(r, IFA_CACHEINFO, &cache) == 0);
-
-        assert_se((m = sd_netlink_message_unref(m)) == NULL);
-        assert_se((r = sd_netlink_message_unref(r)) == NULL);
-
-}
-
-static void test_route(sd_netlink *rtnl) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req;
-        struct in_addr addr, addr_data;
-        uint32_t index = 2, u32_data;
         int r;
 
-        r = sd_rtnl_message_new_route(rtnl, &req, RTM_NEWROUTE, AF_INET, RTPROT_STATIC);
-        if (r < 0) {
-                log_error_errno(r, "Could not create RTM_NEWROUTE message: %m");
-                return;
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
+
+        ASSERT_OK(sd_rtnl_message_new_addr(rtnl, &message, RTM_GETADDR, ifindex, AF_INET));
+        ASSERT_OK(sd_netlink_message_set_request_dump(message, true));
+
+        ASSERT_OK(r = sd_netlink_call(rtnl, message, 0, &reply));
+
+        /* If the loopback device is down we won't get any results. */
+        if (r > 0) {
+                ASSERT_OK(sd_netlink_message_read_in_addr(reply, IFA_LOCAL, &in_data));
+                ASSERT_OK(sd_netlink_message_read_in_addr(reply, IFA_ADDRESS, &in_data));
+                ASSERT_OK(sd_netlink_message_read_string(reply, IFA_LABEL, &label));
+                ASSERT_OK(sd_netlink_message_read_cache_info(reply, IFA_CACHEINFO, &cache));
         }
-
-        addr.s_addr = htonl(INADDR_LOOPBACK);
-
-        r = sd_netlink_message_append_in_addr(req, RTA_GATEWAY, &addr);
-        if (r < 0) {
-                log_error_errno(r, "Could not append RTA_GATEWAY attribute: %m");
-                return;
-        }
-
-        r = sd_netlink_message_append_u32(req, RTA_OIF, index);
-        if (r < 0) {
-                log_error_errno(r, "Could not append RTA_OIF attribute: %m");
-                return;
-        }
-
-        assert_se(sd_netlink_message_rewind(req) >= 0);
-
-        assert_se(sd_netlink_message_read_in_addr(req, RTA_GATEWAY, &addr_data) >= 0);
-        assert_se(addr_data.s_addr == addr.s_addr);
-
-        assert_se(sd_netlink_message_read_u32(req, RTA_OIF, &u32_data) >= 0);
-        assert_se(u32_data == index);
-
-        assert_se((req = sd_netlink_message_unref(req)) == NULL);
 }
 
-static void test_multiple(void) {
-        sd_netlink *rtnl1, *rtnl2;
+TEST(message_route) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
+        struct in_addr addr, addr_data;
+        uint32_t index = 2, u32_data;
 
-        assert_se(sd_netlink_open(&rtnl1) >= 0);
-        assert_se(sd_netlink_open(&rtnl2) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
 
-        rtnl1 = sd_netlink_unref(rtnl1);
-        rtnl2 = sd_netlink_unref(rtnl2);
+        ASSERT_OK(sd_rtnl_message_new_route(rtnl, &req, RTM_NEWROUTE, AF_INET, RTPROT_STATIC));
+
+        addr.s_addr = htobe32(INADDR_LOOPBACK);
+
+        ASSERT_OK(sd_netlink_message_append_in_addr(req, RTA_GATEWAY, &addr));
+        ASSERT_OK(sd_netlink_message_append_u32(req, RTA_OIF, index));
+
+        ASSERT_OK(sd_netlink_message_rewind(req, rtnl));
+
+        ASSERT_OK(sd_netlink_message_read_in_addr(req, RTA_GATEWAY, &addr_data));
+        ASSERT_EQ(addr_data.s_addr, addr.s_addr);
+
+        ASSERT_OK(sd_netlink_message_read_u32(req, RTA_OIF, &u32_data));
+        ASSERT_EQ(u32_data, index);
+
+        ASSERT_NULL(req = sd_netlink_message_unref(req));
 }
 
 static int link_handler(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        char *ifname = userdata;
         const char *data;
 
-        assert_se(rtnl);
-        assert_se(m);
-        assert_se(userdata);
+        ASSERT_NOT_NULL(rtnl);
+        ASSERT_NOT_NULL(m);
 
-        log_info("%s: got link info about %s", __func__, ifname);
-        free(ifname);
+        ASSERT_STREQ(userdata, "foo");
 
-        assert_se(sd_netlink_message_read_string(m, IFLA_IFNAME, &data) >= 0);
-        assert_se(streq(data, "lo"));
+        ASSERT_OK(sd_netlink_message_read_string(m, IFLA_IFNAME, &data));
+        ASSERT_STREQ(data, "lo");
 
+        log_info("%s: got link info about %s", __func__, data);
         return 1;
 }
 
-static void test_event_loop(int ifindex) {
+TEST(netlink_event_loop) {
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
-        char *ifname;
+        _cleanup_free_ char *userdata = NULL;
+        int ifindex;
 
-        ifname = strdup("lo2");
-        assert_se(ifname);
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
+        ASSERT_NOT_NULL((userdata = strdup("foo")));
 
-        assert_se(sd_netlink_call_async(rtnl, NULL, m, link_handler, NULL, ifname, 0, NULL) >= 0);
+        ASSERT_OK(sd_event_default(&event));
+        ASSERT_OK(sd_netlink_attach_event(rtnl, event, 0));
 
-        assert_se(sd_event_default(&event) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_netlink_call_async(rtnl, NULL, m, link_handler, NULL, userdata, 0, NULL));
 
-        assert_se(sd_netlink_attach_event(rtnl, event, 0) >= 0);
+        ASSERT_OK(sd_event_run(event, 0));
 
-        assert_se(sd_event_run(event, 0) >= 0);
-
-        assert_se(sd_netlink_detach_event(rtnl) >= 0);
-
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
+        ASSERT_OK(sd_netlink_detach_event(rtnl));
+        ASSERT_NULL(rtnl = sd_netlink_unref(rtnl));
 }
 
 static void test_async_destroy(void *userdata) {
 }
 
-static void test_async(int ifindex) {
+TEST(netlink_call_async) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL, *r = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL, *reply = NULL;
         _cleanup_(sd_netlink_slot_unrefp) sd_netlink_slot *slot = NULL;
+        _cleanup_free_ char *userdata = NULL;
         sd_netlink_destroy_t destroy_callback;
         const char *description;
-        char *ifname;
+        int ifindex;
 
-        ifname = strdup("lo");
-        assert_se(ifname);
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
+        ASSERT_NOT_NULL((userdata = strdup("foo")));
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_netlink_call_async(rtnl, &slot, m, link_handler, test_async_destroy, userdata, 0, "hogehoge"));
 
-        assert_se(sd_netlink_call_async(rtnl, &slot, m, link_handler, test_async_destroy, ifname, 0, "hogehoge") >= 0);
+        ASSERT_PTR_EQ(sd_netlink_slot_get_netlink(slot), rtnl);
 
-        assert_se(sd_netlink_slot_get_netlink(slot) == rtnl);
-        assert_se(sd_netlink_slot_get_userdata(slot) == ifname);
-        assert_se(sd_netlink_slot_get_destroy_callback(slot, &destroy_callback) == 1);
-        assert_se(destroy_callback == test_async_destroy);
-        assert_se(sd_netlink_slot_get_floating(slot) == 0);
-        assert_se(sd_netlink_slot_get_description(slot, &description) == 1);
-        assert_se(streq(description, "hogehoge"));
+        ASSERT_PTR_EQ(sd_netlink_slot_get_userdata(slot), userdata);
+        ASSERT_PTR_EQ(sd_netlink_slot_set_userdata(slot, NULL), userdata);
+        ASSERT_NULL(sd_netlink_slot_get_userdata(slot));
+        ASSERT_NULL(sd_netlink_slot_set_userdata(slot, userdata));
+        ASSERT_PTR_EQ(sd_netlink_slot_get_userdata(slot), userdata);
 
-        assert_se(sd_netlink_wait(rtnl, 0) >= 0);
-        assert_se(sd_netlink_process(rtnl, &r) >= 0);
+        ASSERT_OK_EQ(sd_netlink_slot_get_destroy_callback(slot, &destroy_callback), 1);
+        ASSERT_PTR_EQ(destroy_callback, test_async_destroy);
+        ASSERT_OK(sd_netlink_slot_set_destroy_callback(slot, NULL));
+        ASSERT_OK_ZERO(sd_netlink_slot_get_destroy_callback(slot, &destroy_callback));
+        ASSERT_NULL(destroy_callback);
+        ASSERT_OK(sd_netlink_slot_set_destroy_callback(slot, test_async_destroy));
+        ASSERT_OK_EQ(sd_netlink_slot_get_destroy_callback(slot, &destroy_callback), 1);
+        ASSERT_PTR_EQ(destroy_callback, test_async_destroy);
 
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
-}
+        ASSERT_OK_ZERO(sd_netlink_slot_get_floating(slot));
+        ASSERT_OK_EQ(sd_netlink_slot_set_floating(slot, 1), 1);
+        ASSERT_OK_EQ(sd_netlink_slot_get_floating(slot), 1);
 
-static void test_slot_set(int ifindex) {
-        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL, *r = NULL;
-        _cleanup_(sd_netlink_slot_unrefp) sd_netlink_slot *slot = NULL;
-        sd_netlink_destroy_t destroy_callback;
-        const char *description;
-        char *ifname;
+        ASSERT_OK_EQ(sd_netlink_slot_get_description(slot, &description), 1);
+        ASSERT_STREQ(description, "hogehoge");
+        ASSERT_OK(sd_netlink_slot_set_description(slot, NULL));
+        ASSERT_OK_ZERO(sd_netlink_slot_get_description(slot, &description));
+        ASSERT_NULL(description);
 
-        ifname = strdup("lo");
-        assert_se(ifname);
+        ASSERT_OK(sd_netlink_wait(rtnl, 0));
+        ASSERT_OK(sd_netlink_process(rtnl, &reply));
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
-
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
-
-        assert_se(sd_netlink_call_async(rtnl, &slot, m, link_handler, NULL, NULL, 0, NULL) >= 0);
-
-        assert_se(sd_netlink_slot_get_netlink(slot) == rtnl);
-        assert_se(!sd_netlink_slot_get_userdata(slot));
-        assert_se(!sd_netlink_slot_set_userdata(slot, ifname));
-        assert_se(sd_netlink_slot_get_userdata(slot) == ifname);
-        assert_se(sd_netlink_slot_get_destroy_callback(slot, NULL) == 0);
-        assert_se(sd_netlink_slot_set_destroy_callback(slot, test_async_destroy) >= 0);
-        assert_se(sd_netlink_slot_get_destroy_callback(slot, &destroy_callback) == 1);
-        assert_se(destroy_callback == test_async_destroy);
-        assert_se(sd_netlink_slot_get_floating(slot) == 0);
-        assert_se(sd_netlink_slot_set_floating(slot, 1) == 1);
-        assert_se(sd_netlink_slot_get_floating(slot) == 1);
-        assert_se(sd_netlink_slot_get_description(slot, NULL) == 0);
-        assert_se(sd_netlink_slot_set_description(slot, "hogehoge") >= 0);
-        assert_se(sd_netlink_slot_get_description(slot, &description) == 1);
-        assert_se(streq(description, "hogehoge"));
-
-        assert_se(sd_netlink_wait(rtnl, 0) >= 0);
-        assert_se(sd_netlink_process(rtnl, &r) >= 0);
-
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
+        ASSERT_NULL(rtnl = sd_netlink_unref(rtnl));
 }
 
 struct test_async_object {
@@ -293,7 +238,7 @@ struct test_async_object {
 };
 
 static struct test_async_object *test_async_object_free(struct test_async_object *t) {
-        assert(t);
+        ASSERT_NOT_NULL(t);
 
         free(t->ifname);
         return mfree(t);
@@ -306,14 +251,14 @@ static int link_handler2(sd_netlink *rtnl, sd_netlink_message *m, void *userdata
         struct test_async_object *t = userdata;
         const char *data;
 
-        assert_se(rtnl);
-        assert_se(m);
-        assert_se(userdata);
+        ASSERT_NOT_NULL(rtnl);
+        ASSERT_NOT_NULL(m);
+        ASSERT_NOT_NULL(userdata);
 
         log_info("%s: got link info about %s", __func__, t->ifname);
 
-        assert_se(sd_netlink_message_read_string(m, IFLA_IFNAME, &data) >= 0);
-        assert_se(streq(data, "lo"));
+        ASSERT_OK(sd_netlink_message_read_string(m, IFLA_IFNAME, &data));
+        ASSERT_STREQ(data, "lo");
 
         return 1;
 }
@@ -321,247 +266,469 @@ static int link_handler2(sd_netlink *rtnl, sd_netlink_message *m, void *userdata
 static void test_async_object_destroy(void *userdata) {
         struct test_async_object *t = userdata;
 
-        assert(userdata);
+        ASSERT_NOT_NULL(userdata);
 
         log_info("%s: n_ref=%u", __func__, t->n_ref);
         test_async_object_unref(t);
 }
 
-static void test_async_destroy_callback(int ifindex) {
+TEST(async_destroy_callback) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL, *r = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL, *reply = NULL;
         _cleanup_(test_async_object_unrefp) struct test_async_object *t = NULL;
         _cleanup_(sd_netlink_slot_unrefp) sd_netlink_slot *slot = NULL;
-        char *ifname;
+        int ifindex;
 
-        assert_se(t = new(struct test_async_object, 1));
-        assert_se(ifname = strdup("lo"));
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
+
+        ASSERT_NOT_NULL((t = new(struct test_async_object, 1)));
         *t = (struct test_async_object) {
                 .n_ref = 1,
-                .ifname = ifname,
         };
-
-        assert_se(sd_netlink_open(&rtnl) >= 0);
+        ASSERT_NOT_NULL((t->ifname = strdup("lo")));
 
         /* destroy callback is called after processing message */
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
-        assert_se(sd_netlink_call_async(rtnl, NULL, m, link_handler2, test_async_object_destroy, t, 0, NULL) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_netlink_call_async(rtnl, NULL, m, link_handler2, test_async_object_destroy, t, 0, NULL));
 
-        assert_se(t->n_ref == 1);
-        assert_se(test_async_object_ref(t));
-        assert_se(t->n_ref == 2);
+        ASSERT_EQ(t->n_ref, 1U);
+        ASSERT_PTR_EQ(test_async_object_ref(t), t);
+        ASSERT_EQ(t->n_ref, 2U);
 
-        assert_se(sd_netlink_wait(rtnl, 0) >= 0);
-        assert_se(sd_netlink_process(rtnl, &r) == 1);
-        assert_se(t->n_ref == 1);
+        ASSERT_OK(sd_netlink_wait(rtnl, 0));
+        ASSERT_OK_EQ(sd_netlink_process(rtnl, &reply), 1);
+        ASSERT_EQ(t->n_ref, 1U);
 
-        assert_se(!sd_netlink_message_unref(m));
+        ASSERT_NULL(sd_netlink_message_unref(m));
 
         /* destroy callback is called when asynchronous call is cancelled, that is, slot is freed. */
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
-        assert_se(sd_netlink_call_async(rtnl, &slot, m, link_handler2, test_async_object_destroy, t, 0, NULL) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_netlink_call_async(rtnl, &slot, m, link_handler2, test_async_object_destroy, t, 0, NULL));
 
-        assert_se(t->n_ref == 1);
-        assert_se(test_async_object_ref(t));
-        assert_se(t->n_ref == 2);
+        ASSERT_EQ(t->n_ref, 1U);
+        ASSERT_PTR_EQ(test_async_object_ref(t), t);
+        ASSERT_EQ(t->n_ref, 2U);
 
-        assert_se(!(slot = sd_netlink_slot_unref(slot)));
-        assert_se(t->n_ref == 1);
+        ASSERT_NULL(slot = sd_netlink_slot_unref(slot));
+        ASSERT_EQ(t->n_ref, 1U);
 
-        assert_se(!sd_netlink_message_unref(m));
+        ASSERT_NULL(sd_netlink_message_unref(m));
 
         /* destroy callback is also called by sd_netlink_unref() */
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex) >= 0);
-        assert_se(sd_netlink_call_async(rtnl, NULL, m, link_handler2, test_async_object_destroy, t, 0, NULL) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_netlink_call_async(rtnl, NULL, m, link_handler2, test_async_object_destroy, t, 0, NULL));
 
-        assert_se(t->n_ref == 1);
-        assert_se(test_async_object_ref(t));
-        assert_se(t->n_ref == 2);
+        ASSERT_EQ(t->n_ref, 1U);
+        ASSERT_PTR_EQ(test_async_object_ref(t), t);
+        ASSERT_EQ(t->n_ref, 2U);
 
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
-        assert_se(t->n_ref == 1);
+        ASSERT_NULL(rtnl = sd_netlink_unref(rtnl));
+        ASSERT_EQ(t->n_ref, 1U);
 }
 
 static int pipe_handler(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        int *counter = userdata;
-        int r;
+        int r, *counter = userdata;
 
         (*counter)--;
 
-        r = sd_netlink_message_get_errno(m);
-
+        ASSERT_OK(r = sd_netlink_message_get_errno(m));
         log_info_errno(r, "%d left in pipe. got reply: %m", *counter);
-
-        assert_se(r >= 0);
-
         return 1;
 }
 
-static void test_pipe(int ifindex) {
+TEST(pipe) {
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m1 = NULL, *m2 = NULL;
-        int counter = 0;
+        int ifindex, counter = 0;
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
+        ifindex = (int) if_nametoindex("lo");
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &m1, RTM_GETLINK, ifindex) >= 0);
-        assert_se(sd_rtnl_message_new_link(rtnl, &m2, RTM_GETLINK, ifindex) >= 0);
-
-        counter++;
-        assert_se(sd_netlink_call_async(rtnl, NULL, m1, pipe_handler, NULL, &counter, 0, NULL) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m1, RTM_GETLINK, ifindex));
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m2, RTM_GETLINK, ifindex));
 
         counter++;
-        assert_se(sd_netlink_call_async(rtnl, NULL, m2, pipe_handler, NULL, &counter, 0, NULL) >= 0);
+        ASSERT_OK(sd_netlink_call_async(rtnl, NULL, m1, pipe_handler, NULL, &counter, 0, NULL));
+
+        counter++;
+        ASSERT_OK(sd_netlink_call_async(rtnl, NULL, m2, pipe_handler, NULL, &counter, 0, NULL));
 
         while (counter > 0) {
-                assert_se(sd_netlink_wait(rtnl, 0) >= 0);
-                assert_se(sd_netlink_process(rtnl, NULL) >= 0);
+                ASSERT_OK(sd_netlink_wait(rtnl, 0));
+                ASSERT_OK(sd_netlink_process(rtnl, NULL));
         }
 
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
+        ASSERT_NULL(rtnl = sd_netlink_unref(rtnl));
 }
 
-static void test_container(sd_netlink *rtnl) {
+TEST(message_container) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         uint16_t u16_data;
         uint32_t u32_data;
         const char *string_data;
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINK, 0) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
 
-        assert_se(sd_netlink_message_open_container(m, IFLA_LINKINFO) >= 0);
-        assert_se(sd_netlink_message_open_container_union(m, IFLA_INFO_DATA, "vlan") >= 0);
-        assert_se(sd_netlink_message_append_u16(m, IFLA_VLAN_ID, 100) >= 0);
-        assert_se(sd_netlink_message_close_container(m) >= 0);
-        assert_se(sd_netlink_message_append_string(m, IFLA_INFO_KIND, "vlan") >= 0);
-        assert_se(sd_netlink_message_close_container(m) >= 0);
-        assert_se(sd_netlink_message_close_container(m) == -EINVAL);
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINK, 0));
 
-        assert_se(sd_netlink_message_rewind(m) >= 0);
+        ASSERT_OK(sd_netlink_message_open_container(m, IFLA_LINKINFO));
+        ASSERT_OK(sd_netlink_message_open_container_union(m, IFLA_INFO_DATA, "vlan"));
+        ASSERT_OK(sd_netlink_message_append_u16(m, IFLA_VLAN_ID, 100));
+        ASSERT_OK(sd_netlink_message_close_container(m));
+        ASSERT_OK(sd_netlink_message_close_container(m));
 
-        assert_se(sd_netlink_message_enter_container(m, IFLA_LINKINFO) >= 0);
-        assert_se(sd_netlink_message_read_string(m, IFLA_INFO_KIND, &string_data) >= 0);
-        assert_se(streq("vlan", string_data));
+        ASSERT_OK(sd_netlink_message_rewind(m, rtnl));
 
-        assert_se(sd_netlink_message_enter_container(m, IFLA_INFO_DATA) >= 0);
-        assert_se(sd_netlink_message_read_u16(m, IFLA_VLAN_ID, &u16_data) >= 0);
-        assert_se(sd_netlink_message_exit_container(m) >= 0);
+        ASSERT_OK(sd_netlink_message_enter_container(m, IFLA_LINKINFO));
+        ASSERT_OK(sd_netlink_message_read_string(m, IFLA_INFO_KIND, &string_data));
+        ASSERT_STREQ(string_data, "vlan");
 
-        assert_se(sd_netlink_message_read_string(m, IFLA_INFO_KIND, &string_data) >= 0);
-        assert_se(streq("vlan", string_data));
-        assert_se(sd_netlink_message_exit_container(m) >= 0);
+        ASSERT_OK(sd_netlink_message_enter_container(m, IFLA_INFO_DATA));
+        ASSERT_OK(sd_netlink_message_read_u16(m, IFLA_VLAN_ID, &u16_data));
+        ASSERT_OK(sd_netlink_message_exit_container(m));
 
-        assert_se(sd_netlink_message_read_u32(m, IFLA_LINKINFO, &u32_data) < 0);
+        ASSERT_OK(sd_netlink_message_read_string(m, IFLA_INFO_KIND, &string_data));
+        ASSERT_STREQ(string_data, "vlan");
+        ASSERT_OK(sd_netlink_message_exit_container(m));
 
-        assert_se(sd_netlink_message_exit_container(m) == -EINVAL);
+        ASSERT_FAIL(sd_netlink_message_read_u32(m, IFLA_LINKINFO, &u32_data));
 }
 
-static void test_match(void) {
+TEST(sd_netlink_add_match) {
         _cleanup_(sd_netlink_slot_unrefp) sd_netlink_slot *s1 = NULL, *s2 = NULL;
         _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
 
-        assert_se(sd_netlink_add_match(rtnl, &s1, RTM_NEWLINK, link_handler, NULL, NULL, NULL) >= 0);
-        assert_se(sd_netlink_add_match(rtnl, &s2, RTM_NEWLINK, link_handler, NULL, NULL, NULL) >= 0);
-        assert_se(sd_netlink_add_match(rtnl, NULL, RTM_NEWLINK, link_handler, NULL, NULL, NULL) >= 0);
+        ASSERT_OK(sd_netlink_add_match(rtnl, &s1, RTM_NEWLINK, link_handler, NULL, NULL, NULL));
+        ASSERT_OK(sd_netlink_add_match(rtnl, &s2, RTM_NEWLINK, link_handler, NULL, NULL, NULL));
+        ASSERT_OK(sd_netlink_add_match(rtnl, NULL, RTM_NEWLINK, link_handler, NULL, NULL, NULL));
 
-        assert_se(!(s1 = sd_netlink_slot_unref(s1)));
-        assert_se(!(s2 = sd_netlink_slot_unref(s2)));
+        ASSERT_NULL(s1 = sd_netlink_slot_unref(s1));
+        ASSERT_NULL(s2 = sd_netlink_slot_unref(s2));
 
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
+        ASSERT_NULL(rtnl = sd_netlink_unref(rtnl));
 }
 
-static void test_get_addresses(sd_netlink *rtnl) {
+TEST(dump_addresses) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL, *reply = NULL;
-        sd_netlink_message *m;
 
-        assert_se(sd_rtnl_message_new_addr(rtnl, &req, RTM_GETADDR, 0, AF_UNSPEC) >= 0);
+        ASSERT_OK(sd_netlink_open(&rtnl));
 
-        assert_se(sd_netlink_call(rtnl, req, 0, &reply) >= 0);
+        ASSERT_OK(sd_rtnl_message_new_addr(rtnl, &req, RTM_GETADDR, 0, AF_UNSPEC));
+        ASSERT_OK(sd_netlink_message_set_request_dump(req, true));
+        ASSERT_OK(sd_netlink_call(rtnl, req, 0, &reply));
 
-        for (m = reply; m; m = sd_netlink_message_next(m)) {
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
                 uint16_t type;
-                unsigned char scope, flags;
+                unsigned char scope;
                 int family, ifindex;
+                uint32_t flags;
 
-                assert_se(sd_netlink_message_get_type(m, &type) >= 0);
-                assert_se(type == RTM_NEWADDR);
+                ASSERT_OK(sd_netlink_message_get_type(m, &type));
+                ASSERT_EQ(type, RTM_NEWADDR);
 
-                assert_se(sd_rtnl_message_addr_get_ifindex(m, &ifindex) >= 0);
-                assert_se(sd_rtnl_message_addr_get_family(m, &family) >= 0);
-                assert_se(sd_rtnl_message_addr_get_scope(m, &scope) >= 0);
-                assert_se(sd_rtnl_message_addr_get_flags(m, &flags) >= 0);
+                ASSERT_OK(sd_rtnl_message_addr_get_ifindex(m, &ifindex));
+                ASSERT_OK(sd_rtnl_message_addr_get_family(m, &family));
+                ASSERT_OK(sd_rtnl_message_addr_get_scope(m, &scope));
+                ASSERT_OK(sd_netlink_message_read_u32(m, IFA_FLAGS, &flags));
 
-                assert_se(ifindex > 0);
-                assert_se(IN_SET(family, AF_INET, AF_INET6));
+                ASSERT_GT(ifindex, 0);
+                ASSERT_TRUE(IN_SET(family, AF_INET, AF_INET6));
 
-                log_info("got IPv%u address on ifindex %i", family == AF_INET ? 4: 6, ifindex);
+                log_info("got IPv%i address on ifindex %i", family == AF_INET ? 4 : 6, ifindex);
         }
 }
 
-static void test_message(sd_netlink *rtnl) {
+TEST(sd_netlink_message_get_errno) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
 
-        assert_se(rtnl_message_new_synthetic_error(rtnl, -ETIMEDOUT, 1, &m) >= 0);
-        assert_se(sd_netlink_message_get_errno(m) == -ETIMEDOUT);
+        ASSERT_OK(sd_netlink_open(&rtnl));
+
+        ASSERT_OK(message_new_synthetic_error(rtnl, -ETIMEDOUT, 1, &m));
+        ASSERT_ERROR(sd_netlink_message_get_errno(m), ETIMEDOUT);
 }
 
-int main(void) {
-        sd_netlink *rtnl;
-        sd_netlink_message *m;
-        sd_netlink_message *r;
-        const char *string_data;
-        int if_loopback;
-        uint16_t type;
+TEST(message_array) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *genl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
 
-        test_match();
-        test_multiple();
+        ASSERT_OK(sd_genl_socket_open(&genl));
+        ASSERT_OK(sd_genl_message_new(genl, CTRL_GENL_NAME, CTRL_CMD_GETFAMILY, &m));
 
-        assert_se(sd_netlink_open(&rtnl) >= 0);
-        assert_se(rtnl);
+        ASSERT_OK(sd_netlink_message_open_container(m, CTRL_ATTR_MCAST_GROUPS));
+        for (unsigned i = 0; i < 10; i++) {
+                char name[STRLEN("hoge") + DECIMAL_STR_MAX(uint32_t)];
+                uint32_t id = i + 1000;
 
-        test_route(rtnl);
-        test_message(rtnl);
-        test_container(rtnl);
+                xsprintf(name, "hoge%" PRIu32, id);
+                ASSERT_OK(sd_netlink_message_open_array(m, i + 1));
+                ASSERT_OK(sd_netlink_message_append_u32(m, CTRL_ATTR_MCAST_GRP_ID, id));
+                ASSERT_OK(sd_netlink_message_append_string(m, CTRL_ATTR_MCAST_GRP_NAME, name));
+                ASSERT_OK(sd_netlink_message_close_container(m));
+        }
+        ASSERT_OK(sd_netlink_message_close_container(m));
 
-        if_loopback = (int) if_nametoindex("lo");
-        assert_se(if_loopback > 0);
+        message_seal(m);
+        ASSERT_OK(sd_netlink_message_rewind(m, genl));
 
-        test_async(if_loopback);
-        test_slot_set(if_loopback);
-        test_async_destroy_callback(if_loopback);
-        test_pipe(if_loopback);
-        test_event_loop(if_loopback);
-        test_link_configure(rtnl, if_loopback);
+        ASSERT_OK(sd_netlink_message_enter_container(m, CTRL_ATTR_MCAST_GROUPS));
+        for (unsigned i = 0; i < 10; i++) {
+                char expected[STRLEN("hoge") + DECIMAL_STR_MAX(uint32_t)];
+                const char *name;
+                uint32_t id;
 
-        test_get_addresses(rtnl);
-        test_message_link_bridge(rtnl);
+                ASSERT_OK(sd_netlink_message_enter_array(m, i + 1));
+                ASSERT_OK(sd_netlink_message_read_u32(m, CTRL_ATTR_MCAST_GRP_ID, &id));
+                ASSERT_OK(sd_netlink_message_read_string(m, CTRL_ATTR_MCAST_GRP_NAME, &name));
+                ASSERT_OK(sd_netlink_message_exit_container(m));
 
-        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_GETLINK, if_loopback) >= 0);
-        assert_se(m);
-
-        assert_se(sd_netlink_message_get_type(m, &type) >= 0);
-        assert_se(type == RTM_GETLINK);
-
-        assert_se(sd_netlink_message_read_string(m, IFLA_IFNAME, &string_data) == -EPERM);
-
-        assert_se(sd_netlink_call(rtnl, m, 0, &r) == 1);
-        assert_se(sd_netlink_message_get_type(r, &type) >= 0);
-        assert_se(type == RTM_NEWLINK);
-
-        assert_se((r = sd_netlink_message_unref(r)) == NULL);
-
-        assert_se(sd_netlink_call(rtnl, m, -1, &r) == -EPERM);
-        assert_se((m = sd_netlink_message_unref(m)) == NULL);
-        assert_se((r = sd_netlink_message_unref(r)) == NULL);
-
-        test_link_get(rtnl, if_loopback);
-        test_address_get(rtnl, if_loopback);
-
-        assert_se((m = sd_netlink_message_unref(m)) == NULL);
-        assert_se((r = sd_netlink_message_unref(r)) == NULL);
-        assert_se((rtnl = sd_netlink_unref(rtnl)) == NULL);
-
-        return EXIT_SUCCESS;
+                ASSERT_EQ(id, i + 1000);
+                xsprintf(expected, "hoge%" PRIu32, id);
+                ASSERT_STREQ(name, expected);
+        }
+        ASSERT_OK(sd_netlink_message_exit_container(m));
 }
+
+TEST(message_strv) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+        _cleanup_strv_free_ char **names_in = NULL, **names_out;
+        const char *p;
+
+        ASSERT_OK(sd_netlink_open(&rtnl));
+
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINKPROP, 1));
+
+        for (unsigned i = 0; i < 10; i++) {
+                char name[STRLEN("hoge") + DECIMAL_STR_MAX(uint32_t)];
+
+                xsprintf(name, "hoge%" PRIu32, i + 1000);
+                ASSERT_OK(strv_extend(&names_in, name));
+        }
+
+        ASSERT_OK(sd_netlink_message_open_container(m, IFLA_PROP_LIST));
+        ASSERT_OK(sd_netlink_message_append_strv(m, IFLA_ALT_IFNAME, (const char**) names_in));
+        ASSERT_OK(sd_netlink_message_close_container(m));
+
+        message_seal(m);
+        ASSERT_OK(sd_netlink_message_rewind(m, rtnl));
+
+        ASSERT_OK(sd_netlink_message_read_strv(m, IFLA_PROP_LIST, IFLA_ALT_IFNAME, &names_out));
+        ASSERT_TRUE(strv_equal(names_in, names_out));
+
+        ASSERT_OK(sd_netlink_message_enter_container(m, IFLA_PROP_LIST));
+        ASSERT_OK(sd_netlink_message_read_string(m, IFLA_ALT_IFNAME, &p));
+        ASSERT_STREQ(p, "hoge1009");
+        ASSERT_OK(sd_netlink_message_exit_container(m));
+}
+
+static int genl_ctrl_match_callback(sd_netlink *genl, sd_netlink_message *m, void *userdata) {
+        const char *name;
+        uint16_t id;
+        uint8_t cmd;
+
+        ASSERT_NOT_NULL(genl);
+        ASSERT_NOT_NULL(m);
+
+        ASSERT_OK(sd_genl_message_get_family_name(genl, m, &name));
+        ASSERT_STREQ(name, CTRL_GENL_NAME);
+
+        ASSERT_OK(sd_genl_message_get_command(genl, m, &cmd));
+
+        switch (cmd) {
+        case CTRL_CMD_NEWFAMILY:
+        case CTRL_CMD_DELFAMILY:
+                ASSERT_OK(sd_netlink_message_read_string(m, CTRL_ATTR_FAMILY_NAME, &name));
+                ASSERT_OK(sd_netlink_message_read_u16(m, CTRL_ATTR_FAMILY_ID, &id));
+                log_debug("%s: %s (id=%"PRIu16") family is %s.",
+                          __func__, name, id, cmd == CTRL_CMD_NEWFAMILY ? "added" : "removed");
+                break;
+        case CTRL_CMD_NEWMCAST_GRP:
+        case CTRL_CMD_DELMCAST_GRP:
+                ASSERT_OK(sd_netlink_message_read_string(m, CTRL_ATTR_FAMILY_NAME, &name));
+                ASSERT_OK(sd_netlink_message_read_u16(m, CTRL_ATTR_FAMILY_ID, &id));
+                log_debug("%s: multicast group for %s (id=%"PRIu16") family is %s.",
+                          __func__, name, id, cmd == CTRL_CMD_NEWMCAST_GRP ? "added" : "removed");
+                break;
+        default:
+                log_debug("%s: received nlctrl message with unknown command '%"PRIu8"'.", __func__, cmd);
+        }
+
+        return 0;
+}
+
+TEST(genl) {
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *genl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+        const char *name;
+        uint8_t cmd;
+        int r;
+
+        ASSERT_OK(sd_genl_socket_open(&genl));
+        ASSERT_OK(sd_event_default(&event));
+        ASSERT_OK(sd_netlink_attach_event(genl, event, 0));
+
+        ASSERT_OK(sd_genl_message_new(genl, CTRL_GENL_NAME, CTRL_CMD_GETFAMILY, &m));
+        ASSERT_OK(sd_genl_message_get_family_name(genl, m, &name));
+        ASSERT_STREQ(name, CTRL_GENL_NAME);
+        ASSERT_OK(sd_genl_message_get_command(genl, m, &cmd));
+        ASSERT_EQ(cmd, CTRL_CMD_GETFAMILY);
+
+        ASSERT_OK(sd_genl_add_match(genl, NULL, CTRL_GENL_NAME, "notify", 0, genl_ctrl_match_callback, NULL, NULL, "genl-ctrl-notify"));
+
+        ASSERT_NULL(m = sd_netlink_message_unref(m));
+        ASSERT_FAIL(sd_genl_message_new(genl, "should-not-exist", CTRL_CMD_GETFAMILY, &m));
+        ASSERT_ERROR(sd_genl_message_new(genl, "should-not-exist", CTRL_CMD_GETFAMILY, &m), EOPNOTSUPP);
+
+        /* These families may not be supported by kernel. Hence, ignore results. */
+        (void) sd_genl_message_new(genl, FOU_GENL_NAME, 0, &m);
+        ASSERT_NULL(m = sd_netlink_message_unref(m));
+        (void) sd_genl_message_new(genl, L2TP_GENL_NAME, 0, &m);
+        ASSERT_NULL(m = sd_netlink_message_unref(m));
+        (void) sd_genl_message_new(genl, MACSEC_GENL_NAME, 0, &m);
+        ASSERT_NULL(m = sd_netlink_message_unref(m));
+        (void) sd_genl_message_new(genl, NL80211_GENL_NAME, 0, &m);
+        ASSERT_NULL(m = sd_netlink_message_unref(m));
+        (void) sd_genl_message_new(genl, NETLBL_NLTYPE_UNLABELED_NAME, 0, &m);
+
+        for (;;) {
+                ASSERT_OK(r = sd_event_run(event, 500 * USEC_PER_MSEC));
+                if (r == 0)
+                        return;
+        }
+}
+
+static void remove_dummy_interfacep(int *ifindex) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
+
+        POINTER_MAY_BE_NULL(ifindex);
+
+        if (!ifindex || *ifindex <= 0)
+                return;
+
+        ASSERT_OK(sd_netlink_open(&rtnl));
+
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &message, RTM_DELLINK, *ifindex));
+        ASSERT_OK_EQ(sd_netlink_call(rtnl, message, 0, NULL), 1);
+}
+
+TEST(rtnl_set_link_name) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL, *reply = NULL;
+        _cleanup_(remove_dummy_interfacep) int ifindex = 0;
+        _cleanup_strv_free_ char **alternative_names = NULL;
+        int r;
+
+        if (geteuid() != 0)
+                return (void) log_tests_skipped("not root");
+
+        ASSERT_OK(sd_netlink_open(&rtnl));
+
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &message, RTM_NEWLINK, 0));
+        ASSERT_OK(sd_netlink_message_append_string(message, IFLA_IFNAME, "test-netlink"));
+        ASSERT_OK(sd_netlink_message_open_container(message, IFLA_LINKINFO));
+        ASSERT_OK(sd_netlink_message_append_string(message, IFLA_INFO_KIND, "dummy"));
+        r = sd_netlink_call(rtnl, message, 0, &reply);
+        if (r == -EPERM)
+                return (void) log_tests_skipped("missing required capabilities");
+        if (r == -EOPNOTSUPP)
+                return (void) log_tests_skipped("dummy network interface is not supported");
+        ASSERT_OK(r);
+
+        ASSERT_NULL(message = sd_netlink_message_unref(message));
+        ASSERT_NULL(reply = sd_netlink_message_unref(reply));
+
+        ASSERT_OK(sd_rtnl_message_new_link(rtnl, &message, RTM_GETLINK, 0));
+        ASSERT_OK(sd_netlink_message_append_string(message, IFLA_IFNAME, "test-netlink"));
+        ASSERT_OK_EQ(sd_netlink_call(rtnl, message, 0, &reply), 1);
+
+        ASSERT_OK(sd_rtnl_message_link_get_ifindex(reply, &ifindex));
+        ASSERT_GT(ifindex, 0);
+
+        /* Test that the new name (which is currently an alternative name) is
+         * restored as an alternative name on error. Create an error by using
+         * an invalid device name, namely one that exceeds IFNAMSIZ
+         * (alternative names can exceed IFNAMSIZ, but not regular names). */
+        r = rtnl_set_link_alternative_names(&rtnl, ifindex, STRV_MAKE("testlongalternativename", "test-shortname"));
+        if (r == -EPERM)
+                return (void) log_tests_skipped("missing required capabilities");
+        if (r == -EOPNOTSUPP)
+                return (void) log_tests_skipped("alternative name is not supported");
+        ASSERT_OK(r);
+
+        ASSERT_OK(rtnl_get_link_alternative_names(&rtnl, ifindex, &alternative_names));
+        ASSERT_TRUE(strv_contains(alternative_names, "testlongalternativename"));
+        ASSERT_TRUE(strv_contains(alternative_names, "test-shortname"));
+
+        ASSERT_ERROR(rtnl_set_link_name(&rtnl, ifindex, "testlongalternativename", NULL), EINVAL);
+        ASSERT_OK(rtnl_set_link_name(&rtnl, ifindex, "test-shortname", STRV_MAKE("testlongalternativename", "test-shortname", "test-additional-name")));
+
+        ASSERT_NULL(alternative_names = strv_free(alternative_names));
+        ASSERT_OK(rtnl_get_link_alternative_names(&rtnl, ifindex, &alternative_names));
+        ASSERT_TRUE(strv_contains(alternative_names, "testlongalternativename"));
+        ASSERT_TRUE(strv_contains(alternative_names, "test-additional-name"));
+        ASSERT_FALSE(strv_contains(alternative_names, "test-shortname"));
+
+        ASSERT_OK(rtnl_delete_link_alternative_names(&rtnl, ifindex, STRV_MAKE("testlongalternativename")));
+
+        ASSERT_NULL(alternative_names = strv_free(alternative_names));
+        ASSERT_OK_EQ(rtnl_get_link_alternative_names(&rtnl, ifindex, &alternative_names), ifindex);
+        ASSERT_FALSE(strv_contains(alternative_names, "testlongalternativename"));
+        ASSERT_TRUE(strv_contains(alternative_names, "test-additional-name"));
+        ASSERT_FALSE(strv_contains(alternative_names, "test-shortname"));
+
+        _cleanup_free_ char *resolved = NULL;
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-additional-name", NULL), ifindex);
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-additional-name", &resolved), ifindex);
+        ASSERT_STREQ(resolved, "test-shortname");
+        ASSERT_NULL(resolved = mfree(resolved));
+
+        ASSERT_OK(rtnl_rename_link(&rtnl, "test-shortname", "test-shortname"));
+        ASSERT_OK(rtnl_rename_link(&rtnl, "test-shortname", "test-shortname2"));
+        ASSERT_OK(rtnl_rename_link(NULL, "test-shortname2", "test-shortname3"));
+
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-additional-name", NULL), ifindex);
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-additional-name", &resolved), ifindex);
+        ASSERT_STREQ(resolved, "test-shortname3");
+        ASSERT_NULL(resolved = mfree(resolved));
+
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-shortname3", NULL), ifindex);
+        ASSERT_OK_EQ(rtnl_resolve_link_alternative_name(&rtnl, "test-shortname3", &resolved), ifindex);
+        ASSERT_STREQ(resolved, "test-shortname3");
+        ASSERT_NULL(resolved = mfree(resolved));
+}
+
+TEST(sock_diag_unix) {
+        _cleanup_(sd_netlink_unrefp) sd_netlink *nl = NULL;
+        int r;
+
+        ASSERT_OK(sd_sock_diag_socket_open(&nl));
+
+        _cleanup_close_ int unix_fd = ASSERT_FD(socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0));
+        ASSERT_OK(socket_autobind(unix_fd, /* ret_name= */ NULL));
+        ASSERT_OK_ERRNO(listen(unix_fd, 123));
+
+        struct stat st;
+        ASSERT_OK_ERRNO(fstat(unix_fd, &st));
+
+        uint64_t cookie;
+        ASSERT_OK(socket_get_cookie(unix_fd, &cookie));
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
+        ASSERT_OK(sd_sock_diag_message_new_unix(nl, &message, st.st_ino, cookie, UDIAG_SHOW_RQLEN));
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *reply = NULL;
+        r = sd_netlink_call(nl, message, /* timeout= */ 0, &reply);
+        if (r == -ENOENT)
+                return (void) log_tests_skipped("CONFIG_UNIX_DIAG disabled");
+        ASSERT_OK(r);
+}
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

@@ -1,131 +1,160 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-event.h"
+#include "sd-messages.h"
 
-#include "capability-util.h"
+#include "bus-log-control-api.h"
+#include "bus-object.h"
 #include "clock-util.h"
 #include "daemon-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
+#include "log.h"
 #include "main-func.h"
-#include "mkdir.h"
 #include "network-util.h"
 #include "process-util.h"
-#include "signal-util.h"
+#include "service-util.h"
 #include "timesyncd-bus.h"
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
-#include "user-util.h"
+#include "verbs.h"
 
-#define STATE_DIR   "/var/lib/systemd/timesync"
-#define CLOCK_FILE  STATE_DIR "/clock"
+static int advance_tstamp(int fd, usec_t epoch) {
+        assert(fd >= 0);
 
-static int load_clock_timestamp(uid_t uid, gid_t gid) {
-        _cleanup_close_ int fd = -1;
-        usec_t min = TIME_EPOCH * USEC_PER_SEC;
-        usec_t ct;
-        int r;
+        /* So here's the problem: whenever we read the timestamp we'd like to ensure the next time we won't
+         * restore the exact same time again, but one at least one step further (so that comparing mtimes of
+         * the timestamp file is a reliable check that timesync did its thing). But file systems have
+         * different timestamp accuracy: traditional fat has 2s granularity, and even ext2 and friends expose
+         * different granularity depending on selected inode size during formatting! Hence, to ensure the
+         * timestamp definitely is increased, here's what we'll do: we'll first try to increase the timestamp
+         * by 1μs, write that and read it back. If it was updated, great. But if it was not, we'll instead
+         * increase the timestamp by 10μs, and do the same, then 100μs, then 1ms, and so on, until it works,
+         * or we reach 10s. If it still didn't work then, the fs is just broken and we give up. */
 
-        /* Let's try to make sure that the clock is always
-         * monotonically increasing, by saving the clock whenever we
-         * have a new NTP time, or when we shut down, and restoring it
-         * when we start again. This is particularly helpful on
-         * systems lacking a battery backed RTC. We also will adjust
-         * the time to at least the build time of systemd. */
+        usec_t target = MAX(epoch, now(CLOCK_REALTIME));
 
-        fd = open(CLOCK_FILE, O_RDWR|O_CLOEXEC, 0644);
-        if (fd >= 0) {
-                struct stat st;
-                usec_t stamp;
+        for (usec_t a = 1; a <= 10 * USEC_PER_SEC; a *= 10) { /* 1μs, 10μs, 100μs, 1ms, … 10s */
+                struct timespec ts[2];
+                struct stat new_st;
 
-                /* check if the recorded time is later than the compiled-in one */
-                r = fstat(fd, &st);
-                if (r >= 0) {
-                        stamp = timespec_load(&st.st_mtim);
-                        if (stamp > min)
-                                min = stamp;
+                /* Bump to the maximum of the old timestamp advanced by the specified unit. */
+                usec_t c = usec_add(target, a);
+
+                timespec_store(&ts[0], c);
+                ts[1] = ts[0];
+
+                if (futimens(fd, ts) < 0) {
+                        /* If this doesn't work at all, log and don't fail, but give up. */
+                        log_warning_errno(errno, "Unable to update mtime of timestamp file, ignoring: %m");
+                        return 0;
                 }
 
-                if (geteuid() == 0) {
-                        /* Try to fix the access mode, so that we can still
-                           touch the file after dropping privileges */
-                        r = fchmod_and_chown(fd, 0644, uid, gid);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to chmod or chown %s, ignoring: %m", CLOCK_FILE);
+                if (fstat(fd, &new_st) < 0)
+                        return log_error_errno(errno, "Failed to stat timestamp file: %m");
+
+                if (timespec_load(&new_st.st_mtim) > target) {
+                        log_debug("Successfully touched timestamp file.");
+                        return 1;
                 }
 
-        } else {
-                r = mkdir_safe_label(STATE_DIR, 0755, uid, gid,
-                                     MKDIR_FOLLOW_SYMLINK | MKDIR_WARN_MODE);
-                if (r < 0) {
-                        log_debug_errno(r, "Failed to create state directory, ignoring: %m");
-                        goto settime;
-                }
-
-                /* create stamp file with the compiled-in date */
-                r = touch_file(CLOCK_FILE, false, min, uid, gid, 0644);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to create %s, ignoring: %m", CLOCK_FILE);
+                log_debug("Tried to advance timestamp mtime by "USEC_FMT", but this didn't work, file system timestamp granularity too coarse?", a);
         }
 
-settime:
-        ct = now(CLOCK_REALTIME);
-        if (ct < min) {
-                struct timespec ts;
-                char date[FORMAT_TIMESTAMP_MAX];
-
-                log_info("System clock time unset or jumped backwards, restoring from recorded timestamp: %s",
-                         format_timestamp(date, sizeof(date), min));
-
-                if (clock_settime(CLOCK_REALTIME, timespec_store(&ts, min)) < 0)
-                        log_error_errno(errno, "Failed to restore system clock, ignoring: %m");
-        }
-
+        log_debug("Gave up trying to advance timestamp file.");
         return 0;
 }
 
+static int load_clock_timestamp(void) {
+        usec_t epoch = TIME_EPOCH * USEC_PER_SEC, ct;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        /* Let's try to make sure that the clock is always monotonically increasing, by saving the clock
+         * whenever we have a new NTP time, or when we shut down, and restoring it when we start again. This
+         * is particularly helpful on systems lacking a battery backed RTC. We also will adjust the time to
+         * at least the build time of systemd. */
+
+        fd = RET_NERRNO(open(TIMESYNCD_CLOCK_FILE, O_RDWR|O_CLOEXEC, 0644));
+        if (fd < 0) {
+                if (fd != -ENOENT)
+                        log_warning_errno(fd, "Unable to open timestamp file "TIMESYNCD_CLOCK_FILE", ignoring: %m");
+
+                /* Create stamp file with the compiled-in date */
+                r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents= */ false, epoch, UID_INVALID, GID_INVALID, MODE_INVALID);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to create %s, ignoring: %m", TIMESYNCD_CLOCK_FILE);
+        } else {
+                struct stat st;
+
+                /* Check if the recorded time is later than the compiled-in one */
+                if (fstat(fd, &st) < 0)
+                        return log_error_errno(errno, "Unable to stat timestamp file "TIMESYNCD_CLOCK_FILE": %m");
+
+                epoch = MAX(epoch, timespec_load(&st.st_mtim));
+
+                (void) advance_tstamp(fd, epoch);
+        }
+
+        ct = now(CLOCK_REALTIME);
+        if (ct > epoch)
+                return 0;
+
+        /* Not that it matters much, but we actually restore the clock to n+1 here rather than n, simply
+         * because we read n as time previously already and we want to progress here, i.e. not report the
+         * same time again. */
+        if (clock_settime(CLOCK_REALTIME, TIMESPEC_STORE(epoch + 1)) < 0) {
+                log_warning_errno(errno, "Failed to advance system clock, ignoring: %m");
+                return 0;
+        }
+
+        log_struct(LOG_INFO,
+                   LOG_MESSAGE_ID(SD_MESSAGE_TIME_BUMP_STR),
+                   LOG_ITEM("REALTIME_USEC=" USEC_FMT, epoch + 1),
+                   LOG_ITEM("DIRECTION=forwards"),
+                   LOG_MESSAGE("System clock time advanced to %s: %s",
+                               epoch > TIME_EPOCH * USEC_PER_SEC ? "recorded timestamp" : "built-in epoch",
+                               FORMAT_TIMESTAMP(epoch + 1)));
+        return 0;
+}
+
+COMMAND(
+        "systemd-timesyncd\0",
+        "Synchronize the system clock across the network.",
+        .man_pages = "systemd-timesyncd.service(8)\0",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
-        const char *user = "systemd-timesync";
-        uid_t uid, uid_current;
-        gid_t gid;
+        _unused_ _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
         log_set_facility(LOG_CRON);
-        log_setup_service();
+        log_setup();
+
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object, &log_control_object),
+                               /* runtime_scope= */ NULL,
+                               argc, argv);
+        if (r <= 0)
+                return r;
 
         umask(0022);
 
         if (argc != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program does not take arguments.");
 
-        uid = uid_current = geteuid();
-        gid = getegid();
-
-        if (uid_current == 0) {
-                r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot resolve user name %s: %m", user);
-        }
-
-        r = load_clock_timestamp(uid, gid);
+        r = load_clock_timestamp();
         if (r < 0)
                 return r;
-
-        /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
-         * privileges are already dropped. */
-        if (uid_current == 0) {
-                r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to drop privileges: %m");
-        }
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -153,7 +182,11 @@ static int run(int argc, char *argv[]) {
 
         notify_message = notify_start("READY=1\n"
                                       "STATUS=Daemon is running",
-                                      NOTIFY_STOPPING);
+                                      NOTIFY_STOPPING_MESSAGE);
+
+        r = manager_setup_save_time_event(m);
+        if (r < 0)
+                return r;
 
         if (network_is_online()) {
                 r = manager_connect(m);
@@ -165,12 +198,10 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 
-        /* if we got an authoritative time, store it in the file system */
-        if (m->sync) {
-                r = touch(CLOCK_FILE);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to touch %s, ignoring: %m", CLOCK_FILE);
-        }
+        /* Save the current time in the file system on exit. */
+        r = touch(TIMESYNCD_CLOCK_FILE);
+        if (r < 0)
+                log_debug_errno(r, "Failed to touch "TIMESYNCD_CLOCK_FILE", ignoring: %m");
 
         return 0;
 }

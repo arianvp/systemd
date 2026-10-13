@@ -1,12 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Geneve Geneve;
+#include <linux/if_link.h>
 
 #include "in-addr-util.h"
 #include "netdev.h"
-#include "networkd-link.h"
-#include "networkd-network.h"
 
 #define GENEVE_VID_MAX (1u << 24) - 1
 
@@ -15,10 +13,10 @@ typedef enum GeneveDF {
         NETDEV_GENEVE_DF_YES = GENEVE_DF_SET,
         NETDEV_GENEVE_DF_INHERIT = GENEVE_DF_INHERIT,
         _NETDEV_GENEVE_DF_MAX,
-        _NETDEV_GENEVE_DF_INVALID = -1
+        _NETDEV_GENEVE_DF_INVALID = -EINVAL,
 } GeneveDF;
 
-struct Geneve {
+typedef struct Geneve {
         NetDev meta;
 
         uint32_t id;
@@ -38,13 +36,14 @@ struct Geneve {
 
         GeneveDF geneve_df;
         union in_addr_union remote;
-};
+
+        bool inherit_inner_protocol;
+} Geneve;
 
 DEFINE_NETDEV_CAST(GENEVE, Geneve);
 extern const NetDevVTable geneve_vtable;
 
-const char *geneve_df_to_string(GeneveDF d) _const_;
-GeneveDF geneve_df_from_string(const char *d) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(geneve_df, GeneveDF);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_geneve_vni);
 CONFIG_PARSER_PROTOTYPE(config_parse_geneve_address);

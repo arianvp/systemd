@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd-login" conditional='HAVE_PAM'
   xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -35,19 +35,20 @@
   <refsect1>
     <title>Description</title>
 
-    <para><filename>sd-login.h</filename> provides APIs to introspect
-    and monitor seat, login session and user status information on the
-    local system. </para>
+    <para><filename>sd-login.h</filename> is part of
+    <citerefentry><refentrytitle>libsystemd</refentrytitle><manvolnum>3</manvolnum></citerefentry> and
+    provides APIs to introspect and monitor seat, login session, and user status information on the local
+    system.</para>
 
     <para>Note that these APIs only allow purely passive access and
-    monitoring of seats, sessions and users. To actively make changes
+    monitoring of seats, sessions, and users. To actively make changes
     to the seat configuration, terminate login sessions, or switch
     session on a seat you need to utilize the D-Bus API of
-    systemd-logind, instead.</para>
+    systemd-logind instead.</para>
 
     <para>These functions synchronously access data in
-    <filename>/proc</filename>, <filename>/sys/fs/cgroup</filename>
-    and <filename>/run</filename>. All of these are virtual file
+    <filename>/proc/</filename>, <filename>/sys/fs/cgroup/</filename>
+    and <filename>/run/</filename>. All of these are virtual file
     systems, hence the runtime cost of the accesses is relatively
     cheap.</para>
 
@@ -61,7 +62,7 @@
     other.</para>
 
     <para>If the functions return string arrays, these are generally
-    <constant>NULL</constant> terminated and need to be freed by the
+    <constant>NULL</constant>-terminated and need to be freed by the
     caller with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use, including the strings referenced therein.
@@ -98,7 +99,9 @@
         character from the range [a-zA-Z0-9], <literal>_</literal> and
         <literal>-</literal>. They are suitable for use as file names. Seat names may or
         may not be stable and may be reused if a seat becomes available again.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -123,6 +126,8 @@
         a user name (a string). A multi-session system allows multiple user sessions on
         the same seat at the same time. A multi-seat system allows multiple independent
         seats that can be individually and simultaneously used by different users.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -159,7 +164,9 @@
         as well, in which case all (current and future) devices plugged into it will also
         be assigned to the same seat (unless they are explicitly assigned to another
         seat).
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -170,7 +177,29 @@
         seat hence consists of an arbitrary number of devices marked with the
         <literal>seat</literal> tag, but (at least) one of these devices needs to be
         tagged with <literal>master-of-seat</literal> before the seat is actually
-        considered to be around.</para></listitem>
+        considered to be around.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>Tag <literal>uaccess</literal></term>
+
+        <listitem><para>When set, access to this device is tied to an active seat.
+        As the session on the seat becomes active or inactive, access to the device
+        is updated accordingly.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>Tag <literal>xaccess-*</literal></term>
+
+        <listitem><para>When <literal>xaccess-<replaceable>ID</replaceable></literal>
+        is set, access to this device is granted to sessions created with
+        <literal><replaceable>ID</replaceable></literal> listed in <literal>ExtraDeviceAccess</literal>.
+        As the sessions with some <literal>ExtraDeviceAccess</literal> open and close,
+        access to the device is updated accordingly.</para>
+
+        <xi:include href="version-info.xml" xpointer="v260"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -186,7 +215,9 @@
         need to enumerate all devices and check the <varname>ID_SEAT</varname> property
         manually. Again, if a device is assigned to seat0 this is visible on the device in
         two ways: with a property <varname>ID_SEAT=seat0</varname> and with no property
-        <varname>ID_SEAT</varname> set for it at all.</para></listitem>
+        <varname>ID_SEAT</varname> set for it at all.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -194,8 +225,10 @@
 
         <listitem><para>When set to <literal>1</literal>, this device automatically
         generates a new and independent seat, which is named after the path of the
-        device. This is set for specialized USB hubs like the Plugable devices, which when
+        device. This is set for specialized USB hubs like the Pluggable devices, which when
         plugged in should create a hotplug seat without further configuration.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/>
         </listitem>
       </varlistentry>
 
@@ -206,7 +239,9 @@
         device this is a good choice to name the seat after. It is created from the path
         of the device. This is useful in UIs for configuring seats: as soon as you create
         a new seat from a graphics device, read this property and prefix it with
-        <literal>seat-</literal> and use it as name for the seat.</para></listitem>
+        <literal>seat-</literal> and use it as name for the seat.</para>
+
+        <xi:include href="version-info.xml" xpointer="v235"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -227,22 +262,21 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_uid_get_state</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_session_is_active</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_seat_get_active</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_get_seats</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_login_monitor_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-daemon</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='die-net'><refentrytitle>pkg-config</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_uid_get_state</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_session_is_active</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_seat_get_active</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_get_seats</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_login_monitor_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-daemon</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='die-net'><refentrytitle>pkg-config</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
 
     <para>
       <ulink url="https://www.freedesktop.org/wiki/Software/systemd/multiseat">Multi-Seat on Linux</ulink>
-      for an introduction to multi-seat support on Linux and the background for this set of APIs.
+      may also be of historical interest.
     </para>
   </refsect1>
-
 </refentry>

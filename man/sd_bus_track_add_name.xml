@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_track_add_name" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -126,7 +126,7 @@
     <para><function>sd_bus_track_count()</function> returns the number of names currently being tracked by the
     specified bus peer tracking object. Note that this function always returns the actual number of names tracked, and
     hence if <function>sd_bus_track_add_name()</function> has been invoked multiple times for the same name it is only
-    counted as one, regardless if recursive mode is used or not.</para>
+    counted as one, regardless of whether recursive mode is used or not.</para>
 
     <para><function>sd_bus_track_count_name()</function> returns the current per-name counter for the specified
     name. If non-recursive mode is used this returns either 1 or 0, depending on whether the specified name has been
@@ -159,7 +159,7 @@
 
     <para>On success, <function>sd_bus_track_add_name()</function> and <function>sd_bus_track_add_sender()</function>
     return 0 if the specified name has already been added to the bus peer tracking object before and positive if it
-    hasn't. On failure, they return a negative errno-style error code.</para>
+    has not. On failure, they return a negative errno-style error code.</para>
 
     <para><function>sd_bus_track_remove_name()</function> and <function>sd_bus_track_remove_sender()</function> return
     positive if the specified name was previously tracked by the bus peer tracking object and has now been removed. In
@@ -213,16 +213,30 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_track_add_name()</function>,
+    <function>sd_bus_track_add_sender()</function>,
+    <function>sd_bus_track_remove_name()</function>,
+    <function>sd_bus_track_remove_sender()</function>,
+    <function>sd_bus_track_count()</function>,
+    <function>sd_bus_track_count_name()</function>,
+    <function>sd_bus_track_count_sender()</function>,
+    <function>sd_bus_track_contains()</function>,
+    <function>sd_bus_track_first()</function>, and
+    <function>sd_bus_track_next()</function> were added in version 232.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_track_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_track_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

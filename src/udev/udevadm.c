@@ -1,127 +1,112 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <errno.h>
-#include <getopt.h>
-#include <stddef.h>
-#include <stdio.h>
+#include "sd-json.h"
 
-#include "alloc-util.h"
+#include "argv-util.h"
+#include "build.h"
+#include "dlopen-note.h"
+#include "label-util.h"
 #include "main-func.h"
-#include "pretty-print.h"
-#include "selinux-util.h"
-#include "string-util.h"
-#include "udevadm.h"
+#include "options.h"
+#include "pager.h"
 #include "udev-util.h"
+#include "udevadm.h"
+#include "udevd.h"
 #include "verbs.h"
-#include "util.h"
 
-static int help(void) {
-        static const char *const short_descriptions[][2] = {
-                { "info",         "Query sysfs or the udev database" },
-                { "trigger",      "Request events from the kernel"   },
-                { "settle",       "Wait for pending udev events"     },
-                { "control",      "Control the udev daemon"          },
-                { "monitor",      "Listen to kernel and udev events" },
-                { "test",         "Test an event run"                },
-                { "test-builtin", "Test a built-in command"          },
-        };
+PagerFlags arg_pager_flags = 0;
 
-        _cleanup_free_ char *link = NULL;
-        size_t i;
-        int r;
+COMMAND(
+        "udevadm\0",
+        "Send control commands or test the device manager.",
+        .argspec = "COMMAND [COMMAND OPTION…]\0",
+        .man_pages = "udevadm(8)\0",
+        .option_namespace = "udevadm",
+        .pager_flags = &arg_pager_flags,
+);
 
-        r = terminal_urlify_man("udevadm", "8", &link);
-        if (r < 0)
-                return log_oom();
+/* All verbs are defined here, right after the COMMAND, so that they are attributed to it. Each
+ * subcommand parses its own options from the "udevadm-<verb>" namespace, see udevadm-*.c. */
+VERB_COMMON_HELP_AUTO_PROGRAM("udevadm");
 
-        printf("%s [--help] [--version] [--debug] COMMAND [COMMAND OPTIONS]\n\n"
-               "Send control commands or test the device manager.\n\n"
-               "Commands:\n"
-               , program_invocation_short_name);
+#define UDEVADM_VERB(fn, name, args, flags, help, footer)               \
+        VERB_SCOPE_NS_FULL(, fn, name, "udevadm-" name, args, VERB_ANY, VERB_ANY, flags, /* dat= */ 0, help, footer)
 
-        for (i = 0; i < ELEMENTSOF(short_descriptions); i++)
-                printf("  %-12s  %s\n", short_descriptions[i][0], short_descriptions[i][1]);
+UDEVADM_VERB(verb_info_main,    "info",         "[DEVPATH|FILE]\0",   0,                    "Query sysfs or the udev database",      NULL);
+UDEVADM_VERB(verb_trigger_main, "trigger",      "DEVPATH\0",          0,                    "Request events from the kernel",        NULL);
+UDEVADM_VERB(verb_settle_main,  "settle",       NULL,                 0,                    "Wait for pending udev events",          NULL);
+UDEVADM_VERB(verb_control_main, "control",      NULL,                 VERB_OPTION_REQUIRED, "Control the udev daemon",               NULL);
+UDEVADM_VERB(verb_monitor_main, "monitor",      NULL,                 0,                    "Listen to kernel and udev events",      NULL);
+UDEVADM_VERB(verb_test_main,    "test",         "DEVPATH\0",          0,                    "Test an event run",                     NULL);
+UDEVADM_VERB(verb_builtin_main, "test-builtin", "COMMAND DEVPATH\0",  0,                    "Test a built-in command",               NULL);
+UDEVADM_VERB(verb_verify_main,  "verify",       "[FILE…]\0",          0,                    "Verify udev rules files",               NULL);
+UDEVADM_VERB(verb_cat_main,     "cat",          "[FILE…]\0",          0,                    "Show udev rules files",                 NULL);
+UDEVADM_VERB(verb_wait_main,    "wait",         "DEVICE [DEVICE…]\0", 0,                    "Wait for device or device symlink",     NULL);
+UDEVADM_VERB(verb_lock_main,    "lock",         "COMMAND\0--print\0", 0,                    "Lock a block device and run a command", NULL);
+UDEVADM_VERB(verb_hwdb_main,    "hwdb",         NULL,                 VERB_DEPRECATED,      "Update or query the hardware database",
+                                                                                            "Verb 'hwdb' is deprecated. Use systemd-hwdb instead.");
 
-        printf("\nSee the %s for details.\n", link);
-        return 0;
+VERB_NOARG(verb_version_main, "version", /* help= */ NULL);
+static int verb_version_main(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return version_only();
 }
 
-static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "debug",   no_argument, NULL, 'd' },
-                { "help",    no_argument, NULL, 'h' },
-                { "version", no_argument, NULL, 'V' },
-                {}
-        };
-        int c;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        while ((c = getopt_long(argc, argv, "+dhV", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION, "udevadm" };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'd':
+                OPTION_NAMESPACE("udevadm"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_help_name("udevadm");
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('d', "debug", NULL, "Enable debug logging"):
                         log_set_max_level(LOG_DEBUG);
                         break;
 
-                case 'h':
-                        return help();
-
-                case 'V':
-                        return print_version();
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached("Unhandled option");
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        *remaining_args = option_parser_get_args(&opts);
         return 1; /* work to do */
 }
 
-static int version_main(int argc, char *argv[], void *userdata) {
-        return print_version();
-}
-
-static int help_main(int argc, char *argv[], void *userdata) {
-        return help();
-}
-
-static int udevadm_main(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "info",         VERB_ANY, VERB_ANY, 0, info_main    },
-                { "trigger",      VERB_ANY, VERB_ANY, 0, trigger_main },
-                { "settle",       VERB_ANY, VERB_ANY, 0, settle_main  },
-                { "control",      VERB_ANY, VERB_ANY, 0, control_main },
-                { "monitor",      VERB_ANY, VERB_ANY, 0, monitor_main },
-                { "hwdb",         VERB_ANY, VERB_ANY, 0, hwdb_main    },
-                { "test",         VERB_ANY, VERB_ANY, 0, test_main    },
-                { "test-builtin", VERB_ANY, VERB_ANY, 0, builtin_main },
-                { "version",      VERB_ANY, VERB_ANY, 0, version_main },
-                { "help",         VERB_ANY, VERB_ANY, 0, help_main    },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
-}
-
 static int run(int argc, char *argv[]) {
+        char **args = NULL;
         int r;
 
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBKMOD_NOTE(recommended);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(recommended);
 
-        r = parse_argv(argc, argv);
+        if (invoked_as(argv, "udevd"))
+                return run_udevd(argc, argv);
+
+        (void) udev_parse_config();
+        log_setup();
+
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        log_set_max_level_realm(LOG_REALM_SYSTEMD, log_get_max_level());
+        r = mac_init();
+        if (r < 0)
+                return r;
 
-        mac_selinux_init();
-        return udevadm_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

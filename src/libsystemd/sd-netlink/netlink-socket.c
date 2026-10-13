@@ -1,87 +1,38 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <netinet/in.h>
-#include <stdbool.h>
-#include <unistd.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
-#include "fd-util.h"
-#include "format-util.h"
-#include "io-util.h"
-#include "missing.h"
+#include "errno-util.h"
+#include "hashmap.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "netlink-internal.h"
 #include "netlink-types.h"
-#include "netlink-util.h"
+#include "ordered-set.h"
 #include "socket-util.h"
-#include "util.h"
-
-int socket_open(int family) {
-        int fd;
-
-        fd = socket(PF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, family);
-        if (fd < 0)
-                return -errno;
-
-        return fd_move_above_stdio(fd);
-}
 
 static int broadcast_groups_get(sd_netlink *nl) {
         _cleanup_free_ uint32_t *groups = NULL;
-        socklen_t len = 0, old_len;
-        unsigned i, j;
+        size_t len;
         int r;
 
         assert(nl);
         assert(nl->fd >= 0);
 
-        r = getsockopt(nl->fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, NULL, &len);
-        if (r < 0) {
-                if (errno == ENOPROTOOPT) {
-                        nl->broadcast_group_dont_leave = true;
-                        return 0;
-                } else
-                        return -errno;
-        }
-
-        if (len == 0)
-                return 0;
-
-        groups = new0(uint32_t, len);
-        if (!groups)
-                return -ENOMEM;
-
-        old_len = len;
-
-        r = getsockopt(nl->fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, groups, &len);
-        if (r < 0)
-                return -errno;
-
-        if (old_len != len)
-                return -EIO;
-
-        r = hashmap_ensure_allocated(&nl->broadcast_group_refs, NULL);
+        r = netlink_socket_get_multicast_groups(nl->fd, &len, &groups);
         if (r < 0)
                 return r;
 
-        for (i = 0; i < len; i++) {
-                for (j = 0; j < sizeof(uint32_t) * 8; j++) {
-                        uint32_t offset;
-                        unsigned group;
+        for (size_t i = 0; i < len; i++)
+                for (unsigned j = 0; j < sizeof(uint32_t) * 8; j++)
+                        if (groups[i] & (1U << j)) {
+                                unsigned group = i * sizeof(uint32_t) * 8 + j + 1;
 
-                        offset = 1U << j;
-
-                        if (!(groups[i] & offset))
-                                continue;
-
-                        group = i * sizeof(uint32_t) * 8 + j + 1;
-
-                        r = hashmap_put(nl->broadcast_group_refs, UINT_TO_PTR(group), UINT_TO_PTR(1));
-                        if (r < 0)
-                                return r;
-                }
-        }
+                                r = hashmap_ensure_put(&nl->broadcast_group_refs, NULL, UINT_TO_PTR(group), UINT_TO_PTR(1));
+                                if (r < 0)
+                                        return r;
+                        }
 
         return 0;
 }
@@ -96,20 +47,14 @@ int socket_bind(sd_netlink *nl) {
 
         addrlen = sizeof(nl->sockaddr);
 
-        r = bind(nl->fd, &nl->sockaddr.sa, addrlen);
-        /* ignore EINVAL to allow opening an already bound socket */
-        if (r < 0 && errno != EINVAL)
+        /* ignore EINVAL to allow binding an already bound socket */
+        if (bind(nl->fd, &nl->sockaddr.sa, addrlen) < 0 && errno != EINVAL)
                 return -errno;
 
-        r = getsockname(nl->fd, &nl->sockaddr.sa, &addrlen);
-        if (r < 0)
+        if (getsockname(nl->fd, &nl->sockaddr.sa, &addrlen) < 0)
                 return -errno;
 
-        r = broadcast_groups_get(nl);
-        if (r < 0)
-                return r;
-
-        return 0;
+        return broadcast_groups_get(nl);
 }
 
 static unsigned broadcast_group_get_ref(sd_netlink *nl, unsigned group) {
@@ -119,29 +64,18 @@ static unsigned broadcast_group_get_ref(sd_netlink *nl, unsigned group) {
 }
 
 static int broadcast_group_set_ref(sd_netlink *nl, unsigned group, unsigned n_ref) {
-        int r;
-
         assert(nl);
 
-        r = hashmap_replace(nl->broadcast_group_refs, UINT_TO_PTR(group), UINT_TO_PTR(n_ref));
-        if (r < 0)
-                return r;
-
-        return 0;
+        return hashmap_ensure_replace(&nl->broadcast_group_refs, NULL, UINT_TO_PTR(group), UINT_TO_PTR(n_ref));
 }
 
 static int broadcast_group_join(sd_netlink *nl, unsigned group) {
-        int r;
-
         assert(nl);
         assert(nl->fd >= 0);
         assert(group > 0);
 
-        r = setsockopt(nl->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group));
-        if (r < 0)
-                return -errno;
-
-        return 0;
+        /* group is "unsigned", but netlink(7) says the argument for NETLINK_ADD_MEMBERSHIP is "int" */
+        return setsockopt_int(nl->fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, group);
 }
 
 int socket_broadcast_group_ref(sd_netlink *nl, unsigned group) {
@@ -154,40 +88,15 @@ int socket_broadcast_group_ref(sd_netlink *nl, unsigned group) {
 
         n_ref++;
 
-        r = hashmap_ensure_allocated(&nl->broadcast_group_refs, NULL);
-        if (r < 0)
-                return r;
-
         r = broadcast_group_set_ref(nl, group, n_ref);
         if (r < 0)
                 return r;
 
         if (n_ref > 1)
-                /* not yet in the group */
+                /* already in the group */
                 return 0;
 
-        r = broadcast_group_join(nl, group);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-static int broadcast_group_leave(sd_netlink *nl, unsigned group) {
-        int r;
-
-        assert(nl);
-        assert(nl->fd >= 0);
-        assert(group > 0);
-
-        if (nl->broadcast_group_dont_leave)
-                return 0;
-
-        r = setsockopt(nl->fd, SOL_NETLINK, NETLINK_DROP_MEMBERSHIP, &group, sizeof(group));
-        if (r < 0)
-                return -errno;
-
-        return 0;
+        return broadcast_group_join(nl, group);
 }
 
 int socket_broadcast_group_unref(sd_netlink *nl, unsigned group) {
@@ -197,8 +106,8 @@ int socket_broadcast_group_unref(sd_netlink *nl, unsigned group) {
         assert(nl);
 
         n_ref = broadcast_group_get_ref(nl, group);
-
-        assert(n_ref > 0);
+        if (n_ref == 0)
+                return 0;
 
         n_ref--;
 
@@ -210,19 +119,13 @@ int socket_broadcast_group_unref(sd_netlink *nl, unsigned group) {
                 /* still refs left */
                 return 0;
 
-        r = broadcast_group_leave(nl, group);
-        if (r < 0)
-                return r;
-
-        return 0;
+        /* group is "unsigned", but netlink(7) says the argument for NETLINK_DROP_MEMBERSHIP is "int" */
+        return setsockopt_int(nl->fd, SOL_NETLINK, NETLINK_DROP_MEMBERSHIP, group);
 }
 
 /* returns the number of bytes sent, or a negative error code */
 int socket_write_message(sd_netlink *nl, sd_netlink_message *m) {
-        union {
-                struct sockaddr sa;
-                struct sockaddr_nl nl;
-        } addr = {
+        union sockaddr_union addr = {
                 .nl.nl_family = AF_NETLINK,
         };
         ssize_t k;
@@ -231,72 +134,218 @@ int socket_write_message(sd_netlink *nl, sd_netlink_message *m) {
         assert(m);
         assert(m->hdr);
 
-        k = sendto(nl->fd, m->hdr, m->hdr->nlmsg_len,
-                        0, &addr.sa, sizeof(addr));
+        k = sendto(nl->fd, m->hdr, m->hdr->nlmsg_len, 0, &addr.sa, sizeof(addr));
         if (k < 0)
                 return -errno;
 
         return k;
 }
 
-static int socket_recv_message(int fd, struct iovec *iov, uint32_t *_group, bool peek) {
+static int socket_recv_message(int fd, void *buf, size_t buf_size, uint32_t *ret_mcast_group, bool peek) {
+        struct iovec iov = IOVEC_MAKE(buf, buf_size);
         union sockaddr_union sender;
-        uint8_t cmsg_buffer[CMSG_SPACE(sizeof(struct nl_pktinfo))];
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct nl_pktinfo))) control;
         struct msghdr msg = {
-                .msg_iov = iov,
+                .msg_iov = &iov,
                 .msg_iovlen = 1,
                 .msg_name = &sender,
                 .msg_namelen = sizeof(sender),
-                .msg_control = cmsg_buffer,
-                .msg_controllen = sizeof(cmsg_buffer),
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
         };
-        struct cmsghdr *cmsg;
-        uint32_t group = 0;
         ssize_t n;
 
         assert(fd >= 0);
-        assert(iov);
+        assert(peek || (buf && buf_size > 0));
 
-        n = recvmsg(fd, &msg, MSG_TRUNC | (peek ? MSG_PEEK : 0));
-        if (n < 0) {
-                /* no data */
-                if (errno == ENOBUFS)
-                        log_debug("rtnl: kernel receive buffer overrun");
-                else if (errno == EAGAIN)
-                        log_debug("rtnl: no data in socket");
+        /* Note: this might return successfully, but with a zero size under some transient conditions, such
+         * as the reception of a non-kernel message. In such a case the passed buffer might or might not be
+         * modified. Caller must treat a zero return as "no message, but also not an error". */
 
-                return IN_SET(errno, EAGAIN, EINTR) ? 0 : -errno;
-        }
+        n = recvmsg_safe(fd, &msg, peek ? (MSG_PEEK|MSG_TRUNC) : 0);
+        if (ERRNO_IS_NEG_TRANSIENT(n))
+                goto transient;
+        if (n == -ENOBUFS)
+                return log_debug_errno(n, "sd-netlink: kernel receive buffer overrun");
+        if (n == -ECHRNG)
+                return log_debug_errno(n, "sd-netlink: got truncated control message");
+        if (n == -EXFULL)
+                return log_debug_errno(n, "sd-netlink: got truncated payload message");
+        if (n < 0)
+                return (int) n;
 
         if (sender.nl.nl_pid != 0) {
                 /* not from the kernel, ignore */
-                log_debug("rtnl: ignoring message from portid %"PRIu32, sender.nl.nl_pid);
+                log_debug("sd-netlink: ignoring message from PID %"PRIu32, sender.nl.nl_pid);
 
                 if (peek) {
-                        /* drop the message */
-                        n = recvmsg(fd, &msg, 0);
-                        if (n < 0)
-                                return IN_SET(errno, EAGAIN, EINTR) ? 0 : -errno;
+                        /* Drop the message. Note that we ignore ECHRNG/EXFULL errors here, which
+                         * recvmsg_safe() returns in case the payload or cdata is truncated. Given we just
+                         * want to drop the message we also don't care if its payload or cdata was
+                         * truncated. */
+                        n = recvmsg_safe(fd, &msg, 0);
+                        if (n < 0 && !IN_SET(n, -ECHRNG, -EXFULL))
+                                return (int) n;
                 }
 
-                return 0;
+                goto transient;
         }
 
-        CMSG_FOREACH(cmsg, &msg) {
-                if (cmsg->cmsg_level == SOL_NETLINK &&
-                    cmsg->cmsg_type == NETLINK_PKTINFO &&
-                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct nl_pktinfo))) {
-                        struct nl_pktinfo *pktinfo = (void *)CMSG_DATA(cmsg);
+        if (ret_mcast_group) {
+                struct nl_pktinfo *pi;
 
-                        /* multi-cast group */
-                        group = pktinfo->group;
-                }
+                pi = CMSG_FIND_DATA(&msg, SOL_NETLINK, NETLINK_PKTINFO, struct nl_pktinfo);
+                if (pi)
+                        *ret_mcast_group = pi->group;
+                else
+                        *ret_mcast_group = 0;
         }
-
-        if (_group)
-                *_group = group;
 
         return (int) n;
+
+transient:
+        if (ret_mcast_group)
+                *ret_mcast_group = 0;
+
+        return 0;
+}
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        netlink_message_hash_ops,
+        void, trivial_hash_func, trivial_compare_func,
+        sd_netlink_message, sd_netlink_message_unref);
+
+static int netlink_queue_received_message(sd_netlink *nl, sd_netlink_message *m) {
+        uint32_t serial;
+        int r;
+
+        assert(nl);
+        assert(m);
+
+        serial = message_get_serial(m);
+        if (serial != 0) {
+                NetlinkIgnoredSerial *s = hashmap_remove(nl->ignored_serials, UINT32_TO_PTR(serial));
+                if (s) {
+                        /* We are not interested in the message anymore. */
+                        free(s);
+                        return 0;
+                }
+        }
+
+        if (ordered_set_size(nl->rqueue) >= NETLINK_RQUEUE_MAX)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS),
+                                       "sd-netlink: exhausted the read queue size (%d)", NETLINK_RQUEUE_MAX);
+
+        r = ordered_set_ensure_put(&nl->rqueue, &netlink_message_hash_ops, m);
+        if (r < 0)
+                return r;
+
+        sd_netlink_message_ref(m);
+
+        if (sd_netlink_message_is_broadcast(m))
+                return 0;
+
+        if (serial == 0)
+                return 0;
+
+        if (sd_netlink_message_get_errno(m) < 0) {
+                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *old = NULL;
+
+                old = hashmap_remove(nl->rqueue_by_serial, UINT32_TO_PTR(serial));
+                if (old)
+                        log_debug("sd-netlink: received error message with serial %"PRIu32", but another message with "
+                                  "the same serial is already stored in the read queue, replacing.", serial);
+        }
+
+        r = hashmap_ensure_put(&nl->rqueue_by_serial, &netlink_message_hash_ops, UINT32_TO_PTR(serial), m);
+        if (r == -EEXIST) {
+                if (!sd_netlink_message_is_error(m))
+                        log_debug("sd-netlink: received message with serial %"PRIu32", but another message with "
+                                  "the same serial is already stored in the read queue, ignoring.", serial);
+                return 0;
+        }
+        if (r < 0) {
+                sd_netlink_message_unref(ordered_set_remove(nl->rqueue, m));
+                return r;
+        }
+
+        sd_netlink_message_ref(m);
+        return 0;
+}
+
+static int netlink_queue_partially_received_message(sd_netlink *nl, sd_netlink_message *m) {
+        uint32_t serial;
+        int r;
+
+        assert(nl);
+        assert(m);
+        assert(m->hdr->nlmsg_flags & NLM_F_MULTI);
+
+        if (hashmap_size(nl->rqueue_partial_by_serial) >= NETLINK_RQUEUE_MAX)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOBUFS),
+                                       "sd-netlink: exhausted the partial read queue size (%d)", NETLINK_RQUEUE_MAX);
+
+        serial = message_get_serial(m);
+        r = hashmap_ensure_put(&nl->rqueue_partial_by_serial, &netlink_message_hash_ops, UINT32_TO_PTR(serial), m);
+        if (r < 0)
+                return r;
+
+        sd_netlink_message_ref(m);
+        return 0;
+}
+
+static int parse_message_one(sd_netlink *nl, uint32_t group, const struct nlmsghdr *hdr, sd_netlink_message **ret) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+        size_t size;
+        int r;
+
+        assert(nl);
+        assert(hdr);
+        assert(ret);
+
+        /* not broadcast and not for us */
+        if (group == 0 && hdr->nlmsg_pid != nl->sockaddr.nl.nl_pid)
+                goto finalize;
+
+        /* silently drop noop messages */
+        if (hdr->nlmsg_type == NLMSG_NOOP)
+                goto finalize;
+
+        /* check that we support this message type */
+        r = netlink_get_policy_set_and_header_size(nl, hdr->nlmsg_type, hdr->nlmsg_flags, NULL, &size);
+        if (r == -EOPNOTSUPP) {
+                log_debug("sd-netlink: ignored message with unknown type: %i", hdr->nlmsg_type);
+                goto finalize;
+        }
+        if (r < 0)
+                return r;
+
+        /* check that the size matches the message type */
+        if (hdr->nlmsg_len < NLMSG_LENGTH(size)) {
+                log_debug("sd-netlink: message is shorter than expected, dropping.");
+                goto finalize;
+        }
+
+        r = message_new_empty(nl, &m);
+        if (r < 0)
+                return r;
+
+        m->multicast_group = group;
+        m->hdr = memdup(hdr, hdr->nlmsg_len);
+        if (!m->hdr)
+                return -ENOMEM;
+
+        /* seal and parse the top-level message */
+        r = sd_netlink_message_rewind(m, nl);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(m);
+        return 1;
+
+finalize:
+        *ret = NULL;
+        return 0;
 }
 
 /* On success, the number of bytes received is returned and *ret points to the received message
@@ -304,154 +353,89 @@ static int socket_recv_message(int fd, struct iovec *iov, uint32_t *_group, bool
  * If nothing useful was received 0 is returned.
  * On failure, a negative error code is returned.
  */
-int socket_read_message(sd_netlink *rtnl) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *first = NULL;
-        struct iovec iov = {};
-        uint32_t group = 0;
-        bool multi_part = false, done = false;
-        struct nlmsghdr *new_msg;
+int socket_read_message(sd_netlink *nl) {
+        bool done = false;
+        uint32_t group;
         size_t len;
         int r;
-        unsigned i = 0;
-        const NLTypeSystem *type_system_root;
 
-        assert(rtnl);
-        assert(rtnl->rbuffer);
-        assert(rtnl->rbuffer_allocated >= sizeof(struct nlmsghdr));
-
-        type_system_root = type_system_get_root(rtnl->protocol);
+        assert(nl);
 
         /* read nothing, just get the pending message size */
-        r = socket_recv_message(rtnl->fd, &iov, NULL, true);
+        r = socket_recv_message(nl->fd, NULL, 0, NULL, true);
         if (r <= 0)
                 return r;
-        else
-                len = (size_t) r;
+        len = (size_t) r;
 
         /* make room for the pending message */
-        if (!greedy_realloc((void **)&rtnl->rbuffer,
-                            &rtnl->rbuffer_allocated,
-                            len, sizeof(uint8_t)))
+        if (!greedy_realloc((void**) &nl->rbuffer, len, sizeof(uint8_t)))
                 return -ENOMEM;
 
-        iov = IOVEC_MAKE(rtnl->rbuffer, rtnl->rbuffer_allocated);
-
         /* read the pending message */
-        r = socket_recv_message(rtnl->fd, &iov, &group, false);
+        r = socket_recv_message(nl->fd, nl->rbuffer, MALLOC_SIZEOF_SAFE(nl->rbuffer), &group, false);
         if (r <= 0)
                 return r;
-        else
-                len = (size_t) r;
+        len = (size_t) r;
 
-        if (len > rtnl->rbuffer_allocated)
-                /* message did not fit in read buffer */
-                return -EIO;
-
-        if (NLMSG_OK(rtnl->rbuffer, len) && rtnl->rbuffer->nlmsg_flags & NLM_F_MULTI) {
-                multi_part = true;
-
-                for (i = 0; i < rtnl->rqueue_partial_size; i++) {
-                        if (rtnl_message_get_serial(rtnl->rqueue_partial[i]) ==
-                            rtnl->rbuffer->nlmsg_seq) {
-                                first = rtnl->rqueue_partial[i];
-                                break;
-                        }
-                }
-        }
-
-        for (new_msg = rtnl->rbuffer; NLMSG_OK(new_msg, len) && !done; new_msg = NLMSG_NEXT(new_msg, len)) {
-                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
-                const NLType *nl_type;
-
-                if (!group && new_msg->nlmsg_pid != rtnl->sockaddr.nl.nl_pid)
-                        /* not broadcast and not for us */
-                        continue;
-
-                if (new_msg->nlmsg_type == NLMSG_NOOP)
-                        /* silently drop noop messages */
-                        continue;
-
-                if (new_msg->nlmsg_type == NLMSG_DONE) {
-                        /* finished reading multi-part message */
-                        done = true;
-
-                        /* if first is not defined, put NLMSG_DONE into the receive queue. */
-                        if (first)
-                                continue;
-                }
-
-                /* check that we support this message type */
-                r = type_system_get_type(type_system_root, &nl_type, new_msg->nlmsg_type);
-                if (r < 0) {
-                        if (r == -EOPNOTSUPP)
-                                log_debug("sd-netlink: ignored message with unknown type: %i",
-                                          new_msg->nlmsg_type);
-
-                        continue;
-                }
-
-                /* check that the size matches the message type */
-                if (new_msg->nlmsg_len < NLMSG_LENGTH(type_get_size(nl_type))) {
-                        log_debug("sd-netlink: message larger than expected, dropping");
-                        continue;
-                }
-
-                r = message_new_empty(rtnl, &m);
-                if (r < 0)
-                        return r;
-
-                m->broadcast = !!group;
-
-                m->hdr = memdup(new_msg, new_msg->nlmsg_len);
-                if (!m->hdr)
-                        return -ENOMEM;
-
-                /* seal and parse the top-level message */
-                r = sd_netlink_message_rewind(m);
-                if (r < 0)
-                        return r;
-
-                /* push the message onto the multi-part message stack */
-                if (first)
-                        m->next = first;
-                first = TAKE_PTR(m);
-        }
-
-        if (len > 0)
-                log_debug("sd-netlink: discarding %zu bytes of incoming message", len);
-
-        if (!first)
+        if (!NLMSG_OK(nl->rbuffer, len)) {
+                log_debug("sd-netlink: received invalid message, discarding %zu bytes of incoming message", len);
                 return 0;
+        }
 
-        if (!multi_part || done) {
-                /* we got a complete message, push it on the read queue */
-                r = rtnl_rqueue_make_room(rtnl);
+        for (struct nlmsghdr *hdr = nl->rbuffer; NLMSG_OK(hdr, len); hdr = NLMSG_NEXT(hdr, len)) {
+                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+
+                r = parse_message_one(nl, group, hdr, &m);
                 if (r < 0)
                         return r;
+                if (r == 0)
+                        continue;
 
-                rtnl->rqueue[rtnl->rqueue_size++] = TAKE_PTR(first);
+                if (hdr->nlmsg_flags & NLM_F_MULTI) {
+                        if (hdr->nlmsg_type == NLMSG_DONE) {
+                                _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *existing = NULL;
 
-                if (multi_part && (i < rtnl->rqueue_partial_size)) {
-                        /* remove the message form the partial read queue */
-                        memmove(rtnl->rqueue_partial + i,rtnl->rqueue_partial + i + 1,
-                                sizeof(sd_netlink_message*) * (rtnl->rqueue_partial_size - i - 1));
-                        rtnl->rqueue_partial_size--;
-                }
+                                /* finished reading multi-part message */
+                                existing = hashmap_remove(nl->rqueue_partial_by_serial, UINT32_TO_PTR(hdr->nlmsg_seq));
 
-                return 1;
-        } else {
-                /* we only got a partial multi-part message, push it on the
-                   partial read queue */
-                if (i < rtnl->rqueue_partial_size)
-                        rtnl->rqueue_partial[i] = TAKE_PTR(first);
-                else {
-                        r = rtnl_rqueue_partial_make_room(rtnl);
+                                /* if we receive only NLMSG_DONE, put it into the receive queue. */
+                                r = netlink_queue_received_message(nl, existing ?: m);
+                                if (r < 0)
+                                        return r;
+
+                                done = true;
+                        } else {
+                                sd_netlink_message *existing;
+
+                                existing = hashmap_get(nl->rqueue_partial_by_serial, UINT32_TO_PTR(hdr->nlmsg_seq));
+                                if (existing) {
+                                        /* This is the continuation of the previously read messages.
+                                         * Let's append this message at the end. */
+                                        if (existing->tail)
+                                                existing->tail->next = m;
+                                        else
+                                                existing->next = m;
+                                        existing->tail = TAKE_PTR(m);
+                                } else {
+                                        /* This is the first message. Put it into the queue for partially
+                                         * received messages. */
+                                        r = netlink_queue_partially_received_message(nl, m);
+                                        if (r < 0)
+                                                return r;
+                                }
+                        }
+
+                } else {
+                        r = netlink_queue_received_message(nl, m);
                         if (r < 0)
                                 return r;
 
-                        rtnl->rqueue_partial[rtnl->rqueue_partial_size++] = TAKE_PTR(first);
+                        done = true;
                 }
-
-                return 0;
         }
+
+        if (len > 0)
+                log_debug("sd-netlink: discarding trailing %zu bytes of incoming message", len);
+
+        return done;
 }

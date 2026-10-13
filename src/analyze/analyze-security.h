@@ -1,7 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-bus.h"
+#include "forward.h"
 
 typedef enum AnalyzeSecurityFlags {
         ANALYZE_SECURITY_SHORT             = 1 << 0,
@@ -9,4 +9,4 @@ typedef enum AnalyzeSecurityFlags {
         ANALYZE_SECURITY_ONLY_LONG_RUNNING = 1 << 2,
 } AnalyzeSecurityFlags;
 
-int analyze_security(sd_bus *bus, char **units, AnalyzeSecurityFlags flags);
+int verb_security(int argc, char *argv[], uintptr_t _data, void *userdata);

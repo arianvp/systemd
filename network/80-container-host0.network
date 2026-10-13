@@ -1,19 +1,19 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: MIT-0
 #
-#  This file is part of systemd.
+# This config file is installed as part of systemd.
+# It may be freely copied and edited (following the MIT No Attribution license).
 #
-#  systemd is free software; you can redistribute it and/or modify it
-#  under the terms of the GNU Lesser General Public License as published by
-#  the Free Software Foundation; either version 2.1 of the License, or
-#  (at your option) any later version.
+# To make local modifications, use "networkctl edit". See networkctl(1) for details.
+# This file should not be edited in place, because it'll be overwritten on upgrades.
 
 # This network file matches the container-side of the virtual Ethernet link
 # created by systemd-nspawn's --network-veth switch. See systemd-nspawn(1) for
 # details.
 
 [Match]
-Virtualization=container
+Kind=veth
 Name=host0
+Virtualization=container
 
 [Network]
 DHCP=yes

@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -9,8 +9,8 @@
 
 [Unit]
 Description=Arbitrary Executable File Formats File System
-Documentation=https://www.kernel.org/doc/html/latest/admin-guide/binfmt-misc.html
-Documentation=https://www.freedesktop.org/wiki/Software/systemd/APIFileSystems
+Documentation=https://docs.kernel.org/admin-guide/binfmt-misc.html
+Documentation=https://systemd.io/API_FILE_SYSTEMS
 DefaultDependencies=no
 
 [Mount]
@@ -18,3 +18,6 @@ What=binfmt_misc
 Where=/proc/sys/fs/binfmt_misc
 Type=binfmt_misc
 Options=nosuid,nodev,noexec
+
+[Install]
+WantedBy=sysinit.target

@@ -1,13 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <errno.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "hashmap.h"
 #include "libudev-list-internal.h"
-#include "memory-util.h"
+#include "list.h"
+#include "string-util.h"
 
 /**
  * SECTION:libudev-list
@@ -23,209 +20,148 @@
  * contains a name, and optionally a value.
  */
 struct udev_list_entry {
-        struct udev_list_node node;
         struct udev_list *list;
         char *name;
         char *value;
-        int num;
+
+        LIST_FIELDS(struct udev_list_entry, entries);
 };
 
-/* the list's head points to itself if empty */
-static void udev_list_node_init(struct udev_list_node *list) {
-        list->next = list;
-        list->prev = list;
-}
+struct udev_list {
+        Hashmap *unique_entries;
+        LIST_HEAD(struct udev_list_entry, entries);
+        bool unique:1;
+        bool uptodate:1;
+};
 
-static int udev_list_node_is_empty(struct udev_list_node *list) {
-        return list->next == list;
-}
+static struct udev_list_entry* udev_list_entry_free(struct udev_list_entry *entry) {
+        if (!entry)
+                return NULL;
 
-static void udev_list_node_insert_between(struct udev_list_node *new,
-                                          struct udev_list_node *prev,
-                                          struct udev_list_node *next) {
-        next->prev = new;
-        new->next = next;
-        new->prev = prev;
-        prev->next = new;
-}
+        if (entry->list) {
+                if (entry->list->unique && entry->name)
+                        hashmap_remove_value(entry->list->unique_entries, entry->name, entry);
 
-static void udev_list_node_remove(struct udev_list_node *entry) {
-        struct udev_list_node *prev = entry->prev;
-        struct udev_list_node *next = entry->next;
-
-        next->prev = prev;
-        prev->next = next;
-
-        entry->prev = NULL;
-        entry->next = NULL;
-}
-
-/* return list entry which embeds this node */
-static struct udev_list_entry *list_node_to_entry(struct udev_list_node *node) {
-        return container_of(node, struct udev_list_entry, node);
-}
-
-void udev_list_init(struct udev_list *list, bool unique) {
-        memzero(list, sizeof(struct udev_list));
-        list->unique = unique;
-        udev_list_node_init(&list->node);
-}
-
-/* insert entry into a list as the last element  */
-static void udev_list_entry_append(struct udev_list_entry *new, struct udev_list *list) {
-        /* inserting before the list head make the node the last node in the list */
-        udev_list_node_insert_between(&new->node, list->node.prev, &list->node);
-        new->list = list;
-}
-
-/* insert entry into a list, before a given existing entry */
-static void udev_list_entry_insert_before(struct udev_list_entry *new, struct udev_list_entry *entry) {
-        udev_list_node_insert_between(&new->node, entry->node.prev, &entry->node);
-        new->list = entry->list;
-}
-
-/* binary search in sorted array */
-static int list_search(struct udev_list *list, const char *name) {
-        unsigned first, last;
-
-        first = 0;
-        last = list->entries_cur;
-        while (first < last) {
-                unsigned i;
-                int cmp;
-
-                i = (first + last)/2;
-                cmp = strcmp(name, list->entries[i]->name);
-                if (cmp < 0)
-                        last = i;
-                else if (cmp > 0)
-                        first = i+1;
-                else
-                        return i;
+                if (!entry->list->unique || entry->list->uptodate)
+                        LIST_REMOVE(entries, entry->list->entries, entry);
         }
 
-        /* not found, return negative insertion-index+1 */
-        return -(first+1);
+        free(entry->name);
+        free(entry->value);
+
+        return mfree(entry);
 }
 
-struct udev_list_entry *udev_list_entry_add(struct udev_list *list, const char *name, const char *value) {
-        struct udev_list_entry *entry;
-        int i = 0;
+DEFINE_TRIVIAL_CLEANUP_FUNC(struct udev_list_entry*, udev_list_entry_free);
 
-        if (list->unique) {
-                /* lookup existing name or insertion-index */
-                i = list_search(list, name);
-                if (i >= 0) {
-                        entry = list->entries[i];
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                udev_list_entry_hash_ops,
+                char, string_hash_func, string_compare_func,
+                struct udev_list_entry, udev_list_entry_free);
 
-                        free(entry->value);
-                        if (!value) {
-                                entry->value = NULL;
-                                return entry;
-                        }
-                        entry->value = strdup(value);
-                        if (!entry->value)
-                                return NULL;
-                        return entry;
-                }
-        }
+struct udev_list* udev_list_new(bool unique) {
+        struct udev_list *list;
 
-        /* add new name */
+        list = new(struct udev_list, 1);
+        if (!list)
+                return NULL;
+
+        *list = (struct udev_list) {
+                .unique = unique,
+        };
+
+        return list;
+}
+
+struct udev_list_entry* udev_list_entry_add(struct udev_list *list, const char *name, const char *value) {
+        _cleanup_(udev_list_entry_freep) struct udev_list_entry *entry = NULL;
+
+        assert(list);
+        assert(name);
+
         entry = new0(struct udev_list_entry, 1);
         if (!entry)
                 return NULL;
 
-        entry->name = strdup(name);
-        if (!entry->name)
-                return mfree(entry);
+        if (strdup_to(&entry->name, name) < 0)
+                return NULL;
 
-        if (value) {
-                entry->value = strdup(value);
-                if (!entry->value) {
-                        free(entry->name);
-                        return mfree(entry);
-                }
-        }
+        if (strdup_to(&entry->value, value) < 0)
+                return NULL;
 
         if (list->unique) {
-                /* allocate or enlarge sorted array if needed */
-                if (list->entries_cur >= list->entries_max) {
-                        struct udev_list_entry **entries;
-                        unsigned add;
+                struct udev_list_entry *old;
 
-                        add = list->entries_max;
-                        if (add < 1)
-                                add = 64;
-                        entries = reallocarray(list->entries, list->entries_max + add, sizeof(struct udev_list_entry *));
-                        if (!entries) {
-                                free(entry->name);
-                                free(entry->value);
-                                return mfree(entry);
-                        }
-                        list->entries = entries;
-                        list->entries_max += add;
-                }
+                /* Replace the entry for an already known name in a single step. hashmap_replace() reuses the
+                 * existing bucket and hence never allocates, so an existing entry is never dropped, not even
+                 * under memory pressure. Allocating may only fail when adding a genuinely new name, in which
+                 * case there is nothing to lose. */
+                old = hashmap_get(list->unique_entries, entry->name);
 
-                /* the negative i returned the insertion index */
-                i = (-i)-1;
+                if (hashmap_ensure_replace(&list->unique_entries, &udev_list_entry_hash_ops, entry->name, entry) < 0)
+                        return NULL;
 
-                /* insert into sorted list */
-                if ((unsigned)i < list->entries_cur)
-                        udev_list_entry_insert_before(entry, list->entries[i]);
-                else
-                        udev_list_entry_append(entry, list);
+                udev_list_entry_free(old);
 
-                /* insert into sorted array */
-                memmove(&list->entries[i+1], &list->entries[i],
-                        (list->entries_cur - i) * sizeof(struct udev_list_entry *));
-                list->entries[i] = entry;
-                list->entries_cur++;
+                list->uptodate = false;
         } else
-                udev_list_entry_append(entry, list);
+                LIST_APPEND(entries, list->entries, entry);
 
-        return entry;
+        entry->list = list;
+
+        return TAKE_PTR(entry);
 }
-
-static void udev_list_entry_delete(struct udev_list_entry *entry) {
-        if (entry->list->entries) {
-                int i;
-                struct udev_list *list = entry->list;
-
-                /* remove entry from sorted array */
-                i = list_search(list, entry->name);
-                if (i >= 0) {
-                        memmove(&list->entries[i], &list->entries[i+1],
-                                ((list->entries_cur-1) - i) * sizeof(struct udev_list_entry *));
-                        list->entries_cur--;
-                }
-        }
-
-        udev_list_node_remove(&entry->node);
-        free(entry->name);
-        free(entry->value);
-        free(entry);
-}
-
-#define udev_list_entry_foreach_safe(entry, tmp, first) \
-        for (entry = first, tmp = udev_list_entry_get_next(entry); \
-             entry; \
-             entry = tmp, tmp = udev_list_entry_get_next(tmp))
 
 void udev_list_cleanup(struct udev_list *list) {
-        struct udev_list_entry *entry_loop;
-        struct udev_list_entry *entry_tmp;
+        if (!list)
+                return;
 
-        list->entries = mfree(list->entries);
-        list->entries_cur = 0;
-        list->entries_max = 0;
-        udev_list_entry_foreach_safe(entry_loop, entry_tmp, udev_list_get_entry(list))
-                udev_list_entry_delete(entry_loop);
+        if (list->unique) {
+                list->uptodate = false;
+                hashmap_clear(list->unique_entries);
+        } else
+                LIST_FOREACH(entries, i, list->entries)
+                        udev_list_entry_free(i);
 }
 
-struct udev_list_entry *udev_list_get_entry(struct udev_list *list) {
-        if (udev_list_node_is_empty(&list->node))
+struct udev_list* udev_list_free(struct udev_list *list) {
+        if (!list)
                 return NULL;
-        return list_node_to_entry(list->node.next);
+
+        udev_list_cleanup(list);
+        hashmap_free(list->unique_entries);
+
+        return mfree(list);
+}
+
+struct udev_list_entry* udev_list_get_entry(struct udev_list *list) {
+        if (!list)
+                return NULL;
+
+        if (list->unique && !list->uptodate) {
+                size_t n;
+
+                LIST_HEAD_INIT(list->entries);
+
+                n = hashmap_size(list->unique_entries);
+                if (n == 0)
+                        ;
+                else if (n == 1)
+                        LIST_PREPEND(entries, list->entries, hashmap_first(list->unique_entries));
+                else {
+                        _cleanup_free_ struct udev_list_entry **buf = NULL;
+
+                        if (hashmap_dump_sorted(list->unique_entries, (void***) &buf, /* ret_n= */ NULL) < 0)
+                                return NULL;
+
+                        for (size_t j = n; j > 0; j--)
+                                LIST_PREPEND(entries, list->entries, buf[j-1]);
+                }
+
+                list->uptodate = true;
+        }
+
+        return list->entries;
 }
 
 /**
@@ -236,16 +172,12 @@ struct udev_list_entry *udev_list_get_entry(struct udev_list *list) {
  *
  * Returns: udev_list_entry, #NULL if no more entries are available.
  */
-_public_ struct udev_list_entry *udev_list_entry_get_next(struct udev_list_entry *list_entry) {
-        struct udev_list_node *next;
-
+_public_ struct udev_list_entry* udev_list_entry_get_next(struct udev_list_entry *list_entry) {
         if (!list_entry)
                 return NULL;
-        next = list_entry->node.next;
-        /* empty list or no more entries */
-        if (next == &list_entry->list->node)
+        if (list_entry->list->unique && !list_entry->list->uptodate)
                 return NULL;
-        return list_node_to_entry(next);
+        return list_entry->entries_next;
 }
 
 /**
@@ -257,19 +189,12 @@ _public_ struct udev_list_entry *udev_list_entry_get_next(struct udev_list_entry
  *
  * Returns: udev_list_entry, #NULL if no matching entry is found.
  */
-_public_ struct udev_list_entry *udev_list_entry_get_by_name(struct udev_list_entry *list_entry, const char *name) {
-        int i;
-
+_public_ struct udev_list_entry* udev_list_entry_get_by_name(struct udev_list_entry *list_entry, const char *name) {
         if (!list_entry)
                 return NULL;
-
-        if (!list_entry->list->unique)
+        if (!list_entry->list->unique || !list_entry->list->uptodate)
                 return NULL;
-
-        i = list_search(list_entry->list, name);
-        if (i < 0)
-                return NULL;
-        return list_entry->list->entries[i];
+        return hashmap_get(list_entry->list->unique_entries, name);
 }
 
 /**
@@ -280,7 +205,7 @@ _public_ struct udev_list_entry *udev_list_entry_get_by_name(struct udev_list_en
  *
  * Returns: the name string of this entry.
  */
-_public_ const char *udev_list_entry_get_name(struct udev_list_entry *list_entry) {
+_public_ const char* udev_list_entry_get_name(struct udev_list_entry *list_entry) {
         if (!list_entry)
                 return NULL;
         return list_entry->name;
@@ -294,7 +219,7 @@ _public_ const char *udev_list_entry_get_name(struct udev_list_entry *list_entry
  *
  * Returns: the value string of this entry.
  */
-_public_ const char *udev_list_entry_get_value(struct udev_list_entry *list_entry) {
+_public_ const char* udev_list_entry_get_value(struct udev_list_entry *list_entry) {
         if (!list_entry)
                 return NULL;
         return list_entry->value;

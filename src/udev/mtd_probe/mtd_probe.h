@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 
 /*
@@ -22,7 +22,7 @@
 
 #include <mtd/mtd-user.h>
 
-#include "macro.h"
+#include "forward.h"
 
 /* Full oob structure as written on the flash */
 struct sm_oob {

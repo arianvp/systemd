@@ -1,582 +1,1379 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
-#include <errno.h>
-#include <stdio.h>
+#include <net/if_arp.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <net/if.h>
 
 #include "sd-dhcp-client.h"
+#include "sd-dhcp-lease.h"
 #include "sd-event.h"
 
-#include "alloc-util.h"
-#include "dhcp-identifier.h"
-#include "dhcp-internal.h"
-#include "dhcp-protocol.h"
+#include "dhcp-client-internal.h"
+#include "dhcp-message.h"
+#include "ether-addr-util.h"
 #include "fd-util.h"
-#include "random-util.h"
+#include "hashmap.h"
+#include "in-addr-util.h"
+#include "iovec-util.h"
+#include "iovec-wrapper.h"
+#include "ip-util.h"
+#include "log.h"
+#include "set.h"
+#include "socket-util.h"
+#include "strv.h"
 #include "tests.h"
-#include "util.h"
 
-static uint8_t mac_addr[] = {'A', 'B', 'C', '1', '2', '3'};
+static const struct hw_addr_data hw_addr = {
+        .length = ETH_ALEN,
+        .ether = {{ 'A', 'B', 'C', '1', '2', '3' }},
+}, bcast_addr = {
+        .length = ETH_ALEN,
+        .ether = {{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }},
+};
 
-typedef int (*test_callback_recv_t)(size_t size, DHCPMessage *dhcp);
+static const uint16_t server_port = 1067;
+static const uint16_t client_port = 1068;
+static const int ip_service_type = IPTOS_CLASS_CS3;
 
-static bool verbose = true;
-static int test_fd[2];
-static test_callback_recv_t callback_recv;
-static be32_t xid;
-static sd_event_source *test_hangcheck;
+static const union in_addr_union prefix = {
+        .bytes = { 198, 51, 100, 0 },
+}, server_address = {
+        .bytes = { 198, 51, 100, 1 },
+}, client_address = {
+        .bytes = { 198, 51, 100, 100 },
+}, broadcast = {
+        .bytes = { 198, 51, 100, 255 },
+}, netmask = {
+        .bytes = { 255, 255, 255, 0 },
+};
 
-static int test_dhcp_hangcheck(sd_event_source *s, uint64_t usec, void *userdata) {
-        assert_not_reached("Test case should have completed in 2 seconds");
+static const usec_t lifetime = USEC_PER_DAY;
 
-        return 0;
+static const sd_dhcp_client_id client_id_generic = {
+        .size = 10,
+        .id.type = 0,
+        .id.data = { 1, 2, 3, 4, 5, 6, 7, 8, 9, },
+};
+
+/* options sent by client */
+static const char * const *user_class_strv = STRV_MAKE_CONST("user-class-hoge", "user-class-foo");
+static const char * const *vendor_specific_strv = STRV_MAKE_CONST("vendor-specific-hoge", "vendor-specific-foo");
+static const char *vendor_class = "vendor-class";
+static const char *mud_url = "https://mud-url.example.com";
+static const char *hostname = "hogehoge.example.com";
+static const uint32_t mtu = 3000;
+static const char *extra_option_163 = "private_option_163";
+static const char *extra_option_164 = "private_option_164";
+
+static void setup(sd_event_io_handler_t io_handler, sd_dhcp_client_callback_t client_handler, sd_dhcp_client **ret) {
+        assert_se(ret);
+
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+        ASSERT_NOT_NULL(e);
+
+        _cleanup_close_pair_ int socket_fd[2] = EBADF_PAIR;
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, socket_fd));
+
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        ASSERT_OK(sd_dhcp_client_new(&client));
+
+        client->socket_fd = TAKE_FD(socket_fd[0]);
+
+        ASSERT_OK(sd_dhcp_client_attach_event(client, e, SD_EVENT_PRIORITY_NORMAL));
+        ASSERT_OK(sd_dhcp_client_set_ifindex(client, 42));
+        ASSERT_OK(sd_dhcp_client_set_mac(client, hw_addr.bytes, bcast_addr.bytes, hw_addr.length, ARPHRD_ETHER));
+        ASSERT_OK(sd_dhcp_client_set_callback(client, client_handler, e));
+        ASSERT_OK(sd_dhcp_client_set_port(client, server_port));
+        ASSERT_OK(sd_dhcp_client_set_client_port(client, client_port));
+        ASSERT_OK(sd_dhcp_client_set_ip_service_type(client, ip_service_type));
+
+        /* options */
+        for (uint8_t i = 178; i <= 207; i++) /* These are currently unassigned. See sd-dhcp-protocol.h. */
+                ASSERT_OK(sd_dhcp_client_set_request_option(client, i));
+
+        ASSERT_OK(sd_dhcp_client_set_client_id(client, client_id_generic.id.type, client_id_generic.id.data, client_id_generic.size - 1));
+        ASSERT_OK(sd_dhcp_client_set_mtu(client, mtu));
+        ASSERT_OK(sd_dhcp_client_set_mud_url(client, mud_url));
+        ASSERT_OK(sd_dhcp_client_set_hostname(client, hostname));
+        ASSERT_OK(sd_dhcp_client_set_vendor_class_identifier(client, vendor_class));
+
+        _cleanup_(tlv_unrefp) TLV *vendor_specific =
+                ASSERT_NOT_NULL(tlv_new(TLV_DHCP4_SUBOPTION));
+        uint8_t c = 0;
+        STRV_FOREACH(s, vendor_specific_strv)
+                ASSERT_OK(tlv_append(vendor_specific, ++c, strlen(*s), *s));
+        ASSERT_OK(dhcp_client_set_vendor_options(client, vendor_specific));
+
+        _cleanup_(iovw_done) struct iovec_wrapper iovw = {};
+        STRV_FOREACH(s, user_class_strv)
+                ASSERT_OK(iovw_put(&iovw, (void*) *s, strlen(*s)));
+        ASSERT_OK(dhcp_client_set_user_class(client, &iovw));
+
+        _cleanup_(tlv_unrefp) TLV *extra_options = ASSERT_NOT_NULL(tlv_new(TLV_DHCP4));
+        ASSERT_OK(tlv_append(extra_options, 163, strlen(extra_option_163), extra_option_163));
+        ASSERT_OK(tlv_append(extra_options, 164, strlen(extra_option_164), extra_option_164));
+        ASSERT_OK(dhcp_client_set_extra_options(client, extra_options));
+
+        /* IO event source for the fake server side */
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        ASSERT_OK(sd_event_add_io(e, &s, socket_fd[1], EPOLLIN, io_handler, client));
+        ASSERT_OK(sd_event_source_set_priority(s, SD_EVENT_PRIORITY_IMPORTANT));
+        ASSERT_OK(sd_event_source_set_description(s, "fake-server-io-event-source"));
+        ASSERT_OK(sd_event_source_set_io_fd_own(s, true));
+        TAKE_FD(socket_fd[1]);
+        ASSERT_OK(sd_event_source_set_floating(s, true));
+
+        *ret = TAKE_PTR(client);
 }
 
-static void test_request_basic(sd_event *e) {
-        int r;
+static void receive_message(int fd, bool raw, bool check_xid, sd_dhcp_client *client, sd_dhcp_message **ret) {
+        ssize_t buflen = ASSERT_OK_POSITIVE(next_datagram_size_fd(fd));
+        _cleanup_free_ void *buf = ASSERT_NOT_NULL(malloc0(buflen));
 
-        sd_dhcp_client *client;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
-
-        /* Initialize client without Anonymize settings. */
-        r = sd_dhcp_client_new(&client, false);
-
-        assert_se(r >= 0);
-        assert_se(client);
-
-        r = sd_dhcp_client_attach_event(client, e, 0);
-        assert_se(r >= 0);
-
-        assert_se(sd_dhcp_client_set_request_option(NULL, 0) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_address(NULL, NULL) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(NULL, 0) == -EINVAL);
-
-        assert_se(sd_dhcp_client_set_ifindex(client, 15) == 0);
-        assert_se(sd_dhcp_client_set_ifindex(client, -42) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(client, -1) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(client, 0) == -EINVAL);
-        assert_se(sd_dhcp_client_set_ifindex(client, 1) == 0);
-
-        assert_se(sd_dhcp_client_set_hostname(client, "host") == 1);
-        assert_se(sd_dhcp_client_set_hostname(client, "host.domain") == 1);
-        assert_se(sd_dhcp_client_set_hostname(client, NULL) == 1);
-        assert_se(sd_dhcp_client_set_hostname(client, "~host") == -EINVAL);
-        assert_se(sd_dhcp_client_set_hostname(client, "~host.domain") == -EINVAL);
-
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_SUBNET_MASK) == -EEXIST);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_ROUTER) == -EEXIST);
-        /* This PRL option is not set when using Anonymize, but in this test
-         * Anonymize settings are not being used. */
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_HOST_NAME) == -EEXIST);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_DOMAIN_NAME) == -EEXIST);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_DOMAIN_NAME_SERVER) == -EEXIST);
-
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_PAD) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_END) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_MESSAGE_TYPE) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_OVERLOAD) == -EINVAL);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_PARAMETER_REQUEST_LIST)
-                        == -EINVAL);
-
-        /* RFC7844: option 33 (SD_DHCP_OPTION_STATIC_ROUTE) is set in the
-         * default PRL when using Anonymize, so it is changed to other option
-         * that is not set by default, to check that it was set successfully.
-         * Options not set by default (using or not anonymize) are option 17
-         * (SD_DHCP_OPTION_ROOT_PATH) and 42 (SD_DHCP_OPTION_NTP_SERVER) */
-        assert_se(sd_dhcp_client_set_request_option(client, 17) == 0);
-        assert_se(sd_dhcp_client_set_request_option(client, 17) == -EEXIST);
-        assert_se(sd_dhcp_client_set_request_option(client, 42) == 0);
-        assert_se(sd_dhcp_client_set_request_option(client, 17) == -EEXIST);
-
-        sd_dhcp_client_unref(client);
-}
-
-static void test_request_anonymize(sd_event *e) {
-        int r;
-
-        sd_dhcp_client *client;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
-
-        /* Initialize client with Anonymize settings. */
-        r = sd_dhcp_client_new(&client, true);
-
-        assert_se(r >= 0);
-        assert_se(client);
-
-        r = sd_dhcp_client_attach_event(client, e, 0);
-        assert_se(r >= 0);
-
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_NETBIOS_NAMESERVER) == -EEXIST);
-        /* This PRL option is not set when using Anonymize */
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_HOST_NAME) == 0);
-        assert_se(sd_dhcp_client_set_request_option(client,
-                                        SD_DHCP_OPTION_PARAMETER_REQUEST_LIST)
-                        == -EINVAL);
-
-        /* RFC7844: option 101 (SD_DHCP_OPTION_NEW_TZDB_TIMEZONE) is not set in the
-         * default PRL when using Anonymize, */
-        assert_se(sd_dhcp_client_set_request_option(client, 101) == 0);
-        assert_se(sd_dhcp_client_set_request_option(client, 101) == -EEXIST);
-
-        sd_dhcp_client_unref(client);
-}
-
-static void test_checksum(void) {
-        uint8_t buf[20] = {
-                0x45, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,
-                0x40, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0xff, 0xff, 0xff, 0xff
+        struct msghdr msg = {
+                .msg_iov = &IOVEC_MAKE(buf, buflen),
+                .msg_iovlen = 1,
         };
+        ssize_t len = ASSERT_OK_ERRNO(recvmsg_safe(fd, &msg, MSG_DONTWAIT));
 
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
+        struct iovec payload = IOVEC_MAKE(buf, len);
+        if (raw)
+                ASSERT_OK(udp_packet_verify(
+                                          &payload,
+                                          client->server_port,
+                                          /* checksum= */ true,
+                                          &payload));
 
-        assert_se(dhcp_packet_checksum((uint8_t*)&buf, 20) == be16toh(0x78ae));
+        ASSERT_OK(dhcp_message_parse(
+                                  &payload,
+                                  BOOTREQUEST,
+                                  check_xid ? &client->xid : NULL,
+                                  ARPHRD_ETHER,
+                                  &hw_addr,
+                                  ret));
 }
 
-static void test_dhcp_identifier_set_iaid(void) {
-        uint32_t iaid_legacy;
-        be32_t iaid;
-        int ifindex;
+static void iovw_send(int fd, struct iovec_wrapper *iovw) {
+        struct msghdr mh = {
+                .msg_iov = iovw->iovec,
+                .msg_iovlen = iovw->count,
+        };
+        ASSERT_OK_ERRNO(sendmsg(fd, &mh, MSG_NOSIGNAL));
+}
 
-        for (;;) {
-                char ifname[IFNAMSIZ];
+static void send_message(int fd, bool raw, sd_dhcp_client *client, sd_dhcp_message *m) {
+        _cleanup_(iovw_done_free) struct iovec_wrapper payload = {};
+        ASSERT_OK(dhcp_message_build(m, &payload));
 
-                /* try to find an ifindex which does not exist. I causes dhcp_identifier_set_iaid()
-                 * to hash the MAC address. */
-                pseudo_random_bytes(&ifindex, sizeof(ifindex));
-                if (ifindex > 0 && !if_indextoname(ifindex, ifname))
-                        break;
+        if (!raw) {
+                iovw_send(fd, &payload);
+                return;
         }
 
-        assert_se(dhcp_identifier_set_iaid(ifindex, mac_addr, sizeof(mac_addr), true, &iaid_legacy) >= 0);
-        assert_se(dhcp_identifier_set_iaid(ifindex, mac_addr, sizeof(mac_addr), false, &iaid) >= 0);
+        struct iphdr ip;
+        struct udphdr udp;
+        ASSERT_OK(udp_packet_build(
+                                  server_address.in.s_addr,
+                                  client->server_port,
+                                  m->header.yiaddr,
+                                  client->port,
+                                  client->ip_service_type,
+                                  &payload,
+                                  &ip,
+                                  &udp));
 
-        /* we expect, that the MAC address was hashed. The legacy value is in native
-         * endianness. */
-        assert_se(iaid_legacy == 0x8dde4ba8u);
-        assert_se(iaid  == htole32(0x8dde4ba8u));
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-        assert_se(iaid == iaid_legacy);
-#else
-        assert_se(iaid == __bswap_32(iaid_legacy));
-#endif
+        _cleanup_(iovw_done) struct iovec_wrapper iovw = {};
+        ASSERT_OK(iovw_put(&iovw, &ip, sizeof(struct iphdr)));
+        ASSERT_OK(iovw_put(&iovw, &udp, sizeof(struct udphdr)));
+        ASSERT_OK(iovw_put_iovw(&iovw, &payload));
+        iovw_send(fd, &iovw);
 }
 
-static int check_options(uint8_t code, uint8_t len, const void *option, void *userdata) {
-        switch(code) {
-        case SD_DHCP_OPTION_CLIENT_IDENTIFIER:
-        {
-                uint32_t iaid;
-                struct duid duid;
-                size_t duid_len;
+static void create_reply(sd_dhcp_client *client, sd_dhcp_message *request, uint8_t type, sd_dhcp_message **ret) {
+        assert(ret);
 
-                assert_se(dhcp_identifier_set_duid_en(&duid, &duid_len) >= 0);
-                assert_se(dhcp_identifier_set_iaid(42, mac_addr, ETH_ALEN, true, &iaid) >= 0);
+        struct hw_addr_data hw;
+        ASSERT_OK(dhcp_message_get_hw_addr(request, &hw));
 
-                assert_se(len == sizeof(uint8_t) + sizeof(uint32_t) + duid_len);
-                assert_se(len == 19);
-                assert_se(((uint8_t*) option)[0] == 0xff);
+        _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *m = NULL;
+        ASSERT_OK(dhcp_message_new(&m));
+        ASSERT_OK(dhcp_message_init_header(
+                                  m,
+                                  BOOTREPLY,
+                                  be32toh(request->header.xid),
+                                  request->header.htype,
+                                  &hw));
 
-                assert_se(memcmp((uint8_t*) option + 1, &iaid, sizeof(iaid)) == 0);
-                assert_se(memcmp((uint8_t*) option + 5, &duid, duid_len) == 0);
+        if (client->bootp) {
+                m->header.yiaddr = client_address.in.s_addr;
+                m->header.siaddr = server_address.in.s_addr;
+                ASSERT_OK(dhcp_message_append_option_address(m, SD_DHCP_OPTION_SUBNET_MASK, &netmask.in));
+                ASSERT_OK(dhcp_message_append_option_address(m, SD_DHCP_OPTION_BROADCAST, &broadcast.in));
+
+                *ret = TAKE_PTR(m);
+                return;
+        }
+
+        ASSERT_OK(dhcp_message_append_option_u8(m, SD_DHCP_OPTION_MESSAGE_TYPE, type));
+        ASSERT_OK(dhcp_message_append_option_address(m, SD_DHCP_OPTION_SERVER_IDENTIFIER, &server_address.in));
+
+        switch (type) {
+        case DHCP_OFFER:
+        case DHCP_ACK:
+                m->header.yiaddr = client_address.in.s_addr;
+                ASSERT_OK(dhcp_message_append_option_address(m, SD_DHCP_OPTION_SUBNET_MASK, &netmask.in));
+                ASSERT_OK(dhcp_message_append_option_address(m, SD_DHCP_OPTION_BROADCAST, &broadcast.in));
+                ASSERT_OK(dhcp_message_append_option_be32(m, SD_DHCP_OPTION_IP_ADDRESS_LEASE_TIME, usec_to_be32_sec(lifetime)));
+                /* The following two options are intentionally set with spurious values, to test the adjusting logic. */
+                ASSERT_OK(dhcp_message_append_option_be32(m, SD_DHCP_OPTION_REBINDING_TIME, usec_to_be32_sec(lifetime + USEC_PER_SEC)));
+                ASSERT_OK(dhcp_message_append_option_be32(m, SD_DHCP_OPTION_RENEWAL_TIME, usec_to_be32_sec(lifetime - USEC_PER_SEC)));
                 break;
-        }
+
+        case DHCP_NAK:
+                ASSERT_OK(dhcp_message_append_option_string(m, SD_DHCP_OPTION_ERROR_MESSAGE, "test error message"));
+                break;
 
         default:
+                ;
+        }
+
+        *ret = TAKE_PTR(m);
+}
+
+static void verify_header(sd_dhcp_message *m) {
+        ASSERT_EQ(m->header.op, BOOTREQUEST);
+        ASSERT_EQ(m->header.htype, ARPHRD_ETHER);
+        ASSERT_EQ(memcmp_nn(m->header.chaddr, m->header.hlen, hw_addr.bytes, hw_addr.length), 0);
+}
+
+static void verify_basic_options(sd_dhcp_message *m, uint8_t type) {
+        uint8_t t;
+        ASSERT_OK(dhcp_message_get_option_u8(m, SD_DHCP_OPTION_MESSAGE_TYPE, &t));
+        ASSERT_EQ(t, type);
+
+        sd_dhcp_client_id id;
+        ASSERT_OK(dhcp_message_get_option_client_id(m, &id));
+        ASSERT_EQ(client_id_compare_func(&id, &client_id_generic), 0);
+}
+
+static void verify_request(sd_dhcp_message *m, uint8_t type) {
+        verify_header(m);
+        verify_basic_options(m, type);
+
+        _cleanup_set_free_ Set *prl = NULL;
+        ASSERT_OK(dhcp_message_get_option_parameter_request_list(m, &prl));
+
+        for (uint8_t i = 178; i <= 207; i++)
+                ASSERT_TRUE(set_contains(prl, UINT_TO_PTR(i)));
+
+        uint16_t sz;
+        ASSERT_OK(dhcp_message_get_option_u16(m, SD_DHCP_OPTION_MAXIMUM_MESSAGE_SIZE, &sz));
+        ASSERT_EQ(sz, mtu);
+
+        _cleanup_free_ char *str = NULL;
+        ASSERT_OK(dhcp_message_get_option_string(m, SD_DHCP_OPTION_MUD_URL, &str));
+        ASSERT_STREQ(str, mud_url);
+
+        str = mfree(str);
+        ASSERT_OK(dhcp_message_get_option_hostname(m, &str));
+        ASSERT_STREQ(str, hostname);
+
+        str = mfree(str);
+        ASSERT_OK(dhcp_message_get_option_string(m, SD_DHCP_OPTION_VENDOR_CLASS_IDENTIFIER, &str));
+        ASSERT_STREQ(str, vendor_class);
+
+        _cleanup_(tlv_unrefp) TLV *vendor_specific = NULL;
+        ASSERT_OK(dhcp_message_get_option_sub_tlv(
+                                  m,
+                                  SD_DHCP_OPTION_VENDOR_SPECIFIC_INFORMATION,
+                                  TLV_DHCP4_SUBOPTION,
+                                  &vendor_specific));
+        ASSERT_EQ(hashmap_size(vendor_specific->entries), strv_length((char**) vendor_specific_strv));
+        uint8_t c = 0;
+        STRV_FOREACH(s, vendor_specific_strv) {
+                struct iovec v;
+                ASSERT_OK(tlv_get(vendor_specific, ++c, &v));
+                ASSERT_EQ(memcmp_nn(v.iov_base, v.iov_len, *s, strlen(*s)), 0);
+        }
+
+        _cleanup_(iovw_done) struct iovec_wrapper iovw = {};
+        STRV_FOREACH(s, user_class_strv)
+                ASSERT_OK(iovw_put(&iovw, (void*) *s, strlen(*s)));
+        _cleanup_(iovw_done_free) struct iovec_wrapper user_class = {};
+        ASSERT_OK(dhcp_message_get_option_length_prefixed_data(m, SD_DHCP_OPTION_USER_CLASS, /* length_size= */ 1, &user_class));
+        ASSERT_TRUE(iovw_equal(&user_class, &iovw));
+
+        str = mfree(str);
+        ASSERT_OK(dhcp_message_get_option_string(m, 163, &str));
+        ASSERT_STREQ(str, extra_option_163);
+
+        str = mfree(str);
+        ASSERT_OK(dhcp_message_get_option_string(m, 164, &str));
+        ASSERT_STREQ(str, extra_option_164);
+}
+
+static void verify_anonymized_request(sd_dhcp_message *m, uint8_t type) {
+        verify_header(m);
+        verify_basic_options(m, type);
+
+        _cleanup_set_free_ Set *prl = NULL;
+        ASSERT_OK(dhcp_message_get_option_parameter_request_list(m, &prl));
+
+        for (uint8_t i = 178; i <= 207; i++)
+                ASSERT_FALSE(set_contains(prl, UINT_TO_PTR(i)));
+
+        uint8_t code;
+        FOREACH_ARGUMENT(code,
+                         SD_DHCP_OPTION_MAXIMUM_MESSAGE_SIZE,
+                         SD_DHCP_OPTION_MUD_URL,
+                         SD_DHCP_OPTION_HOST_NAME,
+                         SD_DHCP_OPTION_FQDN,
+                         SD_DHCP_OPTION_VENDOR_CLASS_IDENTIFIER,
+                         SD_DHCP_OPTION_VENDOR_SPECIFIC_INFORMATION,
+                         SD_DHCP_OPTION_USER_CLASS,
+                         163,
+                         164)
+                ASSERT_FALSE(dhcp_message_has_option(m, code));
+}
+
+static void verify_request_server_address(sd_dhcp_message *m) {
+        struct in_addr a;
+        ASSERT_OK(dhcp_message_get_option_address(m, SD_DHCP_OPTION_SERVER_IDENTIFIER, &a));
+        ASSERT_TRUE(in4_addr_equal(&a, &server_address.in));
+}
+
+static void verify_request_client_address(sd_dhcp_message *m, bool header) {
+        if (header)
+                ASSERT_EQ(m->header.ciaddr, client_address.in.s_addr);
+        else {
+                struct in_addr a;
+                ASSERT_OK(dhcp_message_get_option_address(m, SD_DHCP_OPTION_REQUESTED_IP_ADDRESS, &a));
+                ASSERT_TRUE(in4_addr_equal(&a, &client_address.in));
+        }
+}
+
+static void verify_reply(sd_dhcp_client *client, DHCPState state) {
+        ASSERT_EQ(client->state, state);
+
+        sd_dhcp_lease *lease;
+        ASSERT_OK(sd_dhcp_client_get_lease(client, &lease));
+
+        struct in_addr a;
+        ASSERT_OK(sd_dhcp_lease_get_address(lease, &a));
+        ASSERT_TRUE(in4_addr_equal(&a, &client_address.in));
+
+        ASSERT_OK(sd_dhcp_lease_get_server_identifier(lease, &a));
+        ASSERT_TRUE(in4_addr_equal(&a, &server_address.in));
+
+        ASSERT_OK(sd_dhcp_lease_get_broadcast(lease, &a));
+        ASSERT_TRUE(in4_addr_equal(&a, &broadcast.in));
+
+        ASSERT_OK(sd_dhcp_lease_get_netmask(lease, &a));
+        ASSERT_TRUE(in4_addr_equal(&a, &netmask.in));
+
+        uint8_t prefixlen;
+        ASSERT_OK(sd_dhcp_lease_get_prefix(lease, &a, &prefixlen));
+        ASSERT_TRUE(in4_addr_equal(&a, &prefix.in));
+        ASSERT_EQ(prefixlen, 24u);
+
+        if (client->bootp) {
+                usec_t t;
+                ASSERT_OK(sd_dhcp_lease_get_lifetime(lease, &t));
+                ASSERT_EQ(t, USEC_INFINITY);
+        } else {
+                usec_t t;
+                ASSERT_OK(sd_dhcp_lease_get_lifetime(lease, &t));
+                ASSERT_EQ(t, lifetime);
+                ASSERT_OK(sd_dhcp_lease_get_t1(lease, &t));
+                ASSERT_EQ(t, lifetime / 2);
+                ASSERT_OK(sd_dhcp_lease_get_t2(lease, &t));
+                ASSERT_EQ(t, lifetime * 7 / 8);
+        }
+}
+
+static int basic_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u", __func__, count);
+
+        switch (count) {
+        case 1: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_OFFER, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
                 break;
+        }
+        case 2: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (selecting) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 3: {
+                /* In this stage, client is already restarted and a new xid is picked. */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ false, client, &request);
+
+                verify_header(request);
+                verify_basic_options(request, DHCP_DECLINE);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ false);
+                break;
+        }
+        case 4: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_OFFER, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 5: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (selecting) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 6: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ false, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (renewing) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_client_address(request, /* header= */ true);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ false, client, reply);
+                break;
+        }
+        case 7: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ false, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (renewing) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_client_address(request, /* header= */ true);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ false, client, reply);
+                break;
+        }
+        case 8: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (rebinding) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_client_address(request, /* header= */ true);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 9: {
+                /* In this stage, client is already stopped and the xid has been cleared. */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ false, /* check_xid= */ false, client, &request);
+
+                verify_header(request);
+                verify_basic_options(request, DHCP_RELEASE);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ true);
+
+                ASSERT_OK(sd_event_exit(sd_dhcp_client_get_event(client), 0));
+                break;
+        }
+        default:
+                assert_not_reached();
         }
 
         return 0;
 }
 
-int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link, const void *packet, size_t len) {
-        size_t size;
-        _cleanup_free_ DHCPPacket *discover;
-        uint16_t ip_check, udp_check;
+static int restart_now_defer_handler(sd_event_source *s, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
 
-        assert_se(s >= 0);
-        assert_se(packet);
-
-        size = sizeof(DHCPPacket);
-        assert_se(len > size);
-
-        discover = memdup(packet, len);
-
-        assert_se(discover->ip.ttl == IPDEFTTL);
-        assert_se(discover->ip.protocol == IPPROTO_UDP);
-        assert_se(discover->ip.saddr == INADDR_ANY);
-        assert_se(discover->ip.daddr == INADDR_BROADCAST);
-        assert_se(discover->udp.source == be16toh(DHCP_PORT_CLIENT));
-        assert_se(discover->udp.dest == be16toh(DHCP_PORT_SERVER));
-
-        ip_check = discover->ip.check;
-
-        discover->ip.ttl = 0;
-        discover->ip.check = discover->udp.len;
-
-        udp_check = ~dhcp_packet_checksum((uint8_t*)&discover->ip.ttl, len - 8);
-        assert_se(udp_check == 0xffff);
-
-        discover->ip.ttl = IPDEFTTL;
-        discover->ip.check = ip_check;
-
-        ip_check = ~dhcp_packet_checksum((uint8_t*)&discover->ip, sizeof(discover->ip));
-        assert_se(ip_check == 0xffff);
-
-        assert_se(discover->dhcp.xid);
-        assert_se(memcmp(discover->dhcp.chaddr, &mac_addr, ETH_ALEN) == 0);
-
-        size = len - sizeof(struct iphdr) - sizeof(struct udphdr);
-
-        assert_se(callback_recv);
-        callback_recv(size, &discover->dhcp);
-
-        return 575;
-}
-
-int dhcp_network_bind_raw_socket(
-                int index,
-                union sockaddr_union *link,
-                uint32_t id,
-                const uint8_t *addr, size_t addr_len,
-                uint16_t arp_type, uint16_t port) {
-
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, test_fd) < 0)
-                return -errno;
-
-        return test_fd[0];
-}
-
-int dhcp_network_bind_udp_socket(int ifindex, be32_t address, uint16_t port) {
-        int fd;
-
-        fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-        if (fd < 0)
-                return -errno;
-
-        return fd;
-}
-
-int dhcp_network_send_udp_socket(int s, be32_t address, uint16_t port, const void *packet, size_t len) {
+        ASSERT_OK(sd_event_source_set_time_relative(client->timeout_resend, /* usec= */ 0));
         return 0;
 }
 
-static int test_discover_message_verify(size_t size, struct DHCPMessage *dhcp) {
-        int res;
+static int basic_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
 
-        res = dhcp_option_parse(dhcp, size, check_options, NULL, NULL);
-        assert_se(res == DHCP_DISCOVER);
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
 
-        if (verbose)
-                printf("  recv DHCP Discover 0x%08x\n", be32toh(dhcp->xid));
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* decline the bound lease, and restart the cycle. */
+                ASSERT_OK(sd_dhcp_client_send_decline(client));
+                break;
+        case 3:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_EXPIRED);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* on decline, the client will be restarted with a delay. Let's boost the restart timer. */
+                ASSERT_OK(sd_event_add_defer(e, /* ret= */ NULL, restart_now_defer_handler, client));
+                break;
+        case 4:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                break;
+        case 5:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* renew the lease manually */
+                ASSERT_OK(sd_dhcp_client_send_renew(client));
+                break;
+        case 6:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_RENEW);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* renew the lease by timer, triggering the corresponding timer event source now. */
+                ASSERT_OK(sd_event_source_set_time_relative(client->timeout_t1, /* usec= */ 0));
+                break;
+        case 7:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_RENEW);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* rebind the lease, triggering the corresponding timer event source now. */
+                ASSERT_OK(sd_event_source_set_time_relative(client->timeout_t2, /* usec= */ 0));
+                break;
+        case 8:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_RENEW);
+                verify_reply(client, DHCP_STATE_BOUND);
+                /* release and stop. */
+                ASSERT_OK(sd_dhcp_client_stop(client));
+                break;
+        case 9:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_BOUND);
+                break;
+        default:
+                assert_not_reached();
+        }
 
         return 0;
 }
 
-static void test_discover_message(sd_event *e) {
-        sd_dhcp_client *client;
-        int res, r;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
-
-        r = sd_dhcp_client_new(&client, false);
-        assert_se(r >= 0);
-        assert_se(client);
-
-        r = sd_dhcp_client_attach_event(client, e, 0);
-        assert_se(r >= 0);
-
-        assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
-        assert_se(sd_dhcp_client_set_mac(client, mac_addr, ETH_ALEN, ARPHRD_ETHER) >= 0);
-
-        assert_se(sd_dhcp_client_set_request_option(client, 248) >= 0);
-
-        callback_recv = test_discover_message_verify;
-
-        res = sd_dhcp_client_start(client);
-
-        assert_se(IN_SET(res, 0, -EINPROGRESS));
-
-        sd_event_run(e, (uint64_t) -1);
-
-        sd_dhcp_client_stop(client);
-        sd_dhcp_client_unref(client);
-
-        test_fd[1] = safe_close(test_fd[1]);
-
-        callback_recv = NULL;
+TEST(basic) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        setup(basic_io_handler, basic_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_send_release(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
 }
 
-static uint8_t test_addr_acq_offer[] = {
-        0x45, 0x10, 0x01, 0x48, 0x00, 0x00, 0x00, 0x00,
-        0x80, 0x11, 0xb3, 0x84, 0xc0, 0xa8, 0x02, 0x01,
-        0xc0, 0xa8, 0x02, 0xbf, 0x00, 0x43, 0x00, 0x44,
-        0x01, 0x34, 0x00, 0x00, 0x02, 0x01, 0x06, 0x00,
-        0x6f, 0x95, 0x2f, 0x30, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0xa8, 0x02, 0xbf,
-        0xc0, 0xa8, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x63, 0x82, 0x53, 0x63, 0x35, 0x01, 0x02, 0x36,
-        0x04, 0xc0, 0xa8, 0x02, 0x01, 0x33, 0x04, 0x00,
-        0x00, 0x02, 0x58, 0x01, 0x04, 0xff, 0xff, 0xff,
-        0x00, 0x2a, 0x04, 0xc0, 0xa8, 0x02, 0x01, 0x0f,
-        0x09, 0x6c, 0x61, 0x62, 0x2e, 0x69, 0x6e, 0x74,
-        0x72, 0x61, 0x03, 0x04, 0xc0, 0xa8, 0x02, 0x01,
-        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
+static int anonymize_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
 
-static uint8_t test_addr_acq_ack[] = {
-        0x45, 0x10, 0x01, 0x48, 0x00, 0x00, 0x00, 0x00,
-        0x80, 0x11, 0xb3, 0x84, 0xc0, 0xa8, 0x02, 0x01,
-        0xc0, 0xa8, 0x02, 0xbf, 0x00, 0x43, 0x00, 0x44,
-        0x01, 0x34, 0x00, 0x00, 0x02, 0x01, 0x06, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0xa8, 0x02, 0xbf,
-        0xc0, 0xa8, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x63, 0x82, 0x53, 0x63, 0x35, 0x01, 0x05, 0x36,
-        0x04, 0xc0, 0xa8, 0x02, 0x01, 0x33, 0x04, 0x00,
-        0x00, 0x02, 0x58, 0x01, 0x04, 0xff, 0xff, 0xff,
-        0x00, 0x2a, 0x04, 0xc0, 0xa8, 0x02, 0x01, 0x0f,
-        0x09, 0x6c, 0x61, 0x62, 0x2e, 0x69, 0x6e, 0x74,
-        0x72, 0x61, 0x03, 0x04, 0xc0, 0xa8, 0x02, 0x01,
-        0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
+        count++;
+        log_debug("%s: count=%u", __func__, count);
 
-static int test_addr_acq_acquired(sd_dhcp_client *client, int event,
-                                   void *userdata) {
-        sd_event *e = userdata;
-        sd_dhcp_lease *lease;
-        struct in_addr addr;
-        const struct in_addr *addrs;
+        switch (count) {
+        case 1: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
 
-        assert_se(client);
-        assert_se(IN_SET(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE, SD_DHCP_CLIENT_EVENT_SELECTING));
+                verify_anonymized_request(request, DHCP_DISCOVER);
 
-        assert_se(sd_dhcp_client_get_lease(client, &lease) >= 0);
-        assert_se(lease);
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_OFFER, &reply);
 
-        assert_se(sd_dhcp_lease_get_address(lease, &addr) >= 0);
-        assert_se(memcmp(&addr.s_addr, &test_addr_acq_ack[44],
-                      sizeof(addr.s_addr)) == 0);
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 2: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
 
-        assert_se(sd_dhcp_lease_get_netmask(lease, &addr) >= 0);
-        assert_se(memcmp(&addr.s_addr, &test_addr_acq_ack[285],
-                      sizeof(addr.s_addr)) == 0);
+                /* REQUEST (selecting) */
+                verify_anonymized_request(request, DHCP_REQUEST);
+                verify_request_server_address(request);
 
-        assert_se(sd_dhcp_lease_get_router(lease, &addrs) == 1);
-        assert_se(memcmp(&addrs[0].s_addr, &test_addr_acq_ack[308],
-                         sizeof(addrs[0].s_addr)) == 0);
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
 
-        if (verbose)
-                printf("  DHCP address acquired\n");
-
-        sd_event_exit(e, 0);
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
 
         return 0;
 }
 
-static int test_addr_acq_recv_request(size_t size, DHCPMessage *request) {
-        uint16_t udp_check = 0;
-        uint8_t *msg_bytes = (uint8_t *)request;
-        int res;
+static int anonymize_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
 
-        res = dhcp_option_parse(request, size, check_options, NULL, NULL);
-        assert_se(res == DHCP_REQUEST);
-        assert_se(xid == request->xid);
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
 
-        assert_se(msg_bytes[size - 1] == SD_DHCP_OPTION_END);
-
-        if (verbose)
-                printf("  recv DHCP Request  0x%08x\n", be32toh(xid));
-
-        memcpy(&test_addr_acq_ack[26], &udp_check, sizeof(udp_check));
-        memcpy(&test_addr_acq_ack[32], &xid, sizeof(xid));
-        memcpy(&test_addr_acq_ack[56], &mac_addr, ETHER_ADDR_LEN);
-
-        callback_recv = NULL;
-
-        res = write(test_fd[1], test_addr_acq_ack,
-                    sizeof(test_addr_acq_ack));
-        assert_se(res == sizeof(test_addr_acq_ack));
-
-        if (verbose)
-                printf("  send DHCP Ack\n");
-
-        return 0;
-};
-
-static int test_addr_acq_recv_discover(size_t size, DHCPMessage *discover) {
-        uint16_t udp_check = 0;
-        uint8_t *msg_bytes = (uint8_t *)discover;
-        int res;
-
-        res = dhcp_option_parse(discover, size, check_options, NULL, NULL);
-        assert_se(res == DHCP_DISCOVER);
-
-        assert_se(msg_bytes[size - 1] == SD_DHCP_OPTION_END);
-
-        xid = discover->xid;
-
-        if (verbose)
-                printf("  recv DHCP Discover 0x%08x\n", be32toh(xid));
-
-        memcpy(&test_addr_acq_offer[26], &udp_check, sizeof(udp_check));
-        memcpy(&test_addr_acq_offer[32], &xid, sizeof(xid));
-        memcpy(&test_addr_acq_offer[56], &mac_addr, ETHER_ADDR_LEN);
-
-        callback_recv = test_addr_acq_recv_request;
-
-        res = write(test_fd[1], test_addr_acq_offer,
-                    sizeof(test_addr_acq_offer));
-        assert_se(res == sizeof(test_addr_acq_offer));
-
-        if (verbose)
-                printf("  sent DHCP Offer\n");
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
 
         return 0;
 }
 
-static void test_addr_acq(sd_event *e) {
-        usec_t time_now = now(clock_boottime_or_monotonic());
-        sd_dhcp_client *client;
-        int res, r;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
-
-        r = sd_dhcp_client_new(&client, false);
-        assert_se(r >= 0);
-        assert_se(client);
-
-        r = sd_dhcp_client_attach_event(client, e, 0);
-        assert_se(r >= 0);
-
-        assert_se(sd_dhcp_client_set_ifindex(client, 42) >= 0);
-        assert_se(sd_dhcp_client_set_mac(client, mac_addr, ETH_ALEN, ARPHRD_ETHER) >= 0);
-
-        assert_se(sd_dhcp_client_set_callback(client, test_addr_acq_acquired, e) >= 0);
-
-        callback_recv = test_addr_acq_recv_discover;
-
-        assert_se(sd_event_add_time(e, &test_hangcheck,
-                                    clock_boottime_or_monotonic(),
-                                    time_now + 2 * USEC_PER_SEC, 0,
-                                    test_dhcp_hangcheck, NULL) >= 0);
-
-        res = sd_dhcp_client_start(client);
-        assert_se(IN_SET(res, 0, -EINPROGRESS));
-
-        assert_se(sd_event_loop(e) >= 0);
-
-        test_hangcheck = sd_event_source_unref(test_hangcheck);
-
-        assert_se(sd_dhcp_client_set_callback(client, NULL, NULL) >= 0);
-        assert_se(sd_dhcp_client_stop(client) >= 0);
-        sd_dhcp_client_unref(client);
-
-        test_fd[1] = safe_close(test_fd[1]);
-
-        callback_recv = NULL;
-        xid = 0;
+TEST(anonymize) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        setup(anonymize_io_handler, anonymize_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_anonymize(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
 }
 
-int main(int argc, char *argv[]) {
-        _cleanup_(sd_event_unrefp) sd_event *e;
+static int rapid_commit_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
 
-        test_setup_logging(LOG_DEBUG);
+        count++;
+        log_debug("%s: count=%u", __func__, count);
 
-        assert_se(sd_event_new(&e) >= 0);
+        switch (count) {
+        case 1: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
 
-        test_request_basic(e);
-        test_request_anonymize(e);
-        test_checksum();
-        test_dhcp_identifier_set_iaid();
+                verify_request(request, DHCP_DISCOVER);
+                ASSERT_TRUE(dhcp_message_has_option(request, SD_DHCP_OPTION_RAPID_COMMIT));
 
-        test_discover_message(e);
-        test_addr_acq(e);
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+                ASSERT_OK(dhcp_message_append_option_flag(reply, SD_DHCP_OPTION_RAPID_COMMIT));
 
-#if VALGRIND
-        /* Make sure the async_close thread has finished.
-         * valgrind would report some of the phread_* structures
-         * as not cleaned up properly. */
-        sleep(1);
-#endif
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
 
         return 0;
 }
+
+static int rapid_commit_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+TEST(rapid_commit) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        setup(rapid_commit_io_handler, rapid_commit_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_rapid_commit(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+}
+
+static int init_reboot_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u", __func__, count);
+
+        switch (count) {
+        case 1: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_REQUEST);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int init_reboot_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+TEST(init_reboot) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        setup(init_reboot_io_handler, init_reboot_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_address(client, &client_address.in));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+}
+
+static int bootp_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u", __func__, count);
+
+        switch (count) {
+        case 1: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_header(request);
+                ASSERT_TRUE(tlv_isempty(&request->options));
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int bootp_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+TEST(bootp) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+        setup(bootp_io_handler, bootp_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_bootp(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+}
+
+static int ipv6_only_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u", __func__, count);
+
+        /* This is used multiple times. */
+        switch (count) {
+        case 1:   /* test case: before discover */
+        case 2:   /* test case: after offer */
+        case 3:   /* test case: before request */
+        case 4:   /* test case: before ack */
+        case 6: { /* test case: after ack */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_OFFER, &reply);
+
+                ASSERT_OK(dhcp_message_append_option_be32(reply, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED, usec_to_be32_sec(10 * USEC_PER_SEC)));
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 5:   /* test case: before ack */
+        case 7: { /* test case: after ack */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (selecting) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                ASSERT_OK(dhcp_message_append_option_be32(reply, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED, usec_to_be32_sec(10 * USEC_PER_SEC)));
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 8: { /* test case: init-reboot */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (init-reboot) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                ASSERT_OK(dhcp_message_append_option_be32(reply, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED, usec_to_be32_sec(10 * USEC_PER_SEC)));
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 9: { /* test case: rapid commit */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+                ASSERT_OK(dhcp_message_append_option_flag(reply, SD_DHCP_OPTION_RAPID_COMMIT));
+
+                ASSERT_OK(dhcp_message_append_option_be32(reply, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED, usec_to_be32_sec(10 * USEC_PER_SEC)));
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_before_discover_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_REQUESTING);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_after_offer_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_REQUESTING);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_before_request_defer_handler(sd_event_source *s, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+
+        ASSERT_EQ(client->state, DHCP_STATE_REQUESTING);
+        ASSERT_EQ(client->request_attempt, 0u);
+
+        ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+        ASSERT_EQ(client->state, DHCP_STATE_STOPPED);
+
+        ASSERT_OK(sd_event_source_set_enabled(s, SD_EVENT_OFF));
+        return 0;
+}
+
+static int ipv6_only_before_request_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_OK(sd_event_add_defer(e, /* ret= */ NULL, ipv6_only_before_request_defer_handler, client));
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_REQUESTING);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_before_ack_post_handler(sd_event_source *s, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+
+        if (sd_dhcp_client_is_waiting_for_ipv6_connectivity(client))
+                /* Boost the time for sending DHCPREQUEST */
+                ASSERT_OK(sd_event_source_set_time_relative(client->timeout_resend, /* usec= */ 0));
+
+        else if (client->state == DHCP_STATE_REQUESTING) {
+                ASSERT_EQ(client->request_attempt, 1u);
+
+                /* Set IPv6 connectivity after a DHCPREQUEST sent. */
+                ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+                /* Still running */
+                ASSERT_EQ(client->state, DHCP_STATE_REQUESTING);
+
+        } else if (client->state == DHCP_STATE_BOUND)
+                ASSERT_OK(sd_dhcp_client_stop(client));
+
+        return 0;
+}
+
+static int ipv6_only_before_ack_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_OK(sd_event_add_post(e, /* ret= */ NULL, ipv6_only_before_ack_post_handler, client));
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                break;
+        case 3:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_after_ack_defer_handler(sd_event_source *s, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+
+        ASSERT_EQ(client->state, DHCP_STATE_REQUESTING);
+        /* Boost the time for sending DHCPREQUEST */
+        ASSERT_OK(sd_event_source_set_time_relative(client->timeout_resend, /* usec= */ 0));
+        return 0;
+}
+
+static int ipv6_only_after_ack_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_OK(sd_event_add_defer(e, /* ret= */ NULL, ipv6_only_after_ack_defer_handler, client));
+                break;
+        case 2:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+                /* still running */
+                ASSERT_EQ(client->state, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_init_reboot_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int ipv6_only_rapid_commit_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+TEST(ipv6_only) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+
+        /* case 1: IPv6 connectivity is acquired before starting the client. */
+        setup(ipv6_only_io_handler, ipv6_only_before_discover_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 2: IPv6 connectivity is acquired after DHCPOFFER received. */
+        setup(ipv6_only_io_handler, ipv6_only_after_offer_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 3: IPv6 connectivity is acquired before sending DHCPREQUEST. */
+        setup(ipv6_only_io_handler, ipv6_only_before_request_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 4: IPv6 connectivity is acquired before DHCPACK received. */
+        setup(ipv6_only_io_handler, ipv6_only_before_ack_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 5: IPv6 connectivity is acquired after DHCPACK received. */
+        setup(ipv6_only_io_handler, ipv6_only_after_ack_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 6: IPv6 connectivity is acquired on reboot. */
+        setup(ipv6_only_io_handler, ipv6_only_init_reboot_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_set_request_address(client, &client_address.in));
+        ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 7: IPv6 connectivity is acquired on rapid commit. */
+        setup(ipv6_only_io_handler, ipv6_only_rapid_commit_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_rapid_commit(client, true));
+        ASSERT_OK(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED));
+        ASSERT_OK(sd_dhcp_client_set_ipv6_connectivity(client, true));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+}
+
+static int discover_attempt_io_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        sd_dhcp_client *client = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u", __func__, count);
+
+        switch (count) {
+        case 1 ... 5:     /* test case: no reply */
+        case 6 ... 9:     /* test case: reset on bound (1st cycle) */
+        case 12 ... 15: { /* test case: reset on bound (2nd cycle) */
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                /* Boost the retransmit timer. */
+                ASSERT_OK(sd_event_source_set_time_relative(client->timeout_resend, /* usec= */ 0));
+                break;
+        }
+        case 10:
+        case 16: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                verify_request(request, DHCP_DISCOVER);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_OFFER, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        case 11:
+        case 17: {
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *request = NULL;
+                receive_message(fd, /* raw= */ true, /* check_xid= */ true, client, &request);
+
+                /* REQUEST (selecting) */
+                verify_request(request, DHCP_REQUEST);
+                verify_request_server_address(request);
+                verify_request_client_address(request, /* header= */ false);
+
+                _cleanup_(sd_dhcp_message_unrefp) sd_dhcp_message *reply = NULL;
+                create_reply(client, request, DHCP_ACK, &reply);
+
+                send_message(fd, /* raw= */ true, client, reply);
+                break;
+        }
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int discover_attempt_no_reply_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1 ... 3: /* The event triggered after sending the 3rd, 4th, 5th DISCOVER message. */
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_TRANSIENT_FAILURE);
+                ASSERT_EQ(client->state, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, count + 2u);
+                break;
+        case 4:
+                ASSERT_EQ(event, -ETIMEDOUT);
+                ASSERT_EQ(client->state, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, 5u);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+static int discover_attempt_reset_on_bound_client_handler(sd_dhcp_client *client, int event, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+        static unsigned count = 0;
+
+        count++;
+        log_debug("%s: count=%u, event=%i", __func__, count, event);
+
+        switch (count) {
+        case 1 ... 3: /* The event triggered after sending the 3rd, 4th, 5th DISCOVER message. */
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_TRANSIENT_FAILURE);
+                ASSERT_EQ(client->state, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, count + 2u);
+                break;
+        case 4:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, 5u);
+                break;
+        case 5:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_EQ(client->discover_attempt, 0u);
+                /* expire the lease now. */
+                ASSERT_OK(sd_event_source_set_time_relative(client->timeout_expire, 0));
+                break;
+        case 6:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_EXPIRED);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_EQ(client->discover_attempt, 0u);
+                break;
+        case 7 ... 9: /* The event triggered after sending the 3rd, 4th, 5th DISCOVER message. */
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_TRANSIENT_FAILURE);
+                ASSERT_EQ(client->state, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, count - 4u);
+                break;
+        case 10:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_SELECTING);
+                verify_reply(client, DHCP_STATE_SELECTING);
+                ASSERT_EQ(client->discover_attempt, 5u);
+                break;
+        case 11:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_IP_ACQUIRE);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_EQ(client->discover_attempt, 0u);
+                ASSERT_OK(sd_dhcp_client_stop(client));
+                break;
+        case 12:
+                ASSERT_EQ(event, SD_DHCP_CLIENT_EVENT_STOP);
+                verify_reply(client, DHCP_STATE_BOUND);
+                ASSERT_EQ(client->discover_attempt, 0u);
+                ASSERT_OK(sd_event_exit(e, 0));
+                break;
+        default:
+                assert_not_reached();
+        }
+
+        return 0;
+}
+
+TEST(discover_attempt) {
+        _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
+
+        /* case 1: no reply */
+        setup(discover_attempt_io_handler, discover_attempt_no_reply_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_max_attempts(client, 5));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+
+        client = sd_dhcp_client_unref(client);
+
+        /* case 2: attempt is reset on bound */
+        setup(discover_attempt_io_handler, discover_attempt_reset_on_bound_client_handler, &client);
+        ASSERT_OK(sd_dhcp_client_set_max_attempts(client, 5));
+        ASSERT_OK(sd_dhcp_client_start(client));
+        ASSERT_OK(sd_event_loop(sd_dhcp_client_get_event(client)));
+}
+
+static int intro(void) {
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_NETWORK_TEST_MODE", "1", /* overwrite= */ true));
+        return 0;
+}
+
+DEFINE_TEST_MAIN_WITH_INTRO(LOG_DEBUG, intro);

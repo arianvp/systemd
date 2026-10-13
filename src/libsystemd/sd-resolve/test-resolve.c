@@ -1,19 +1,17 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
-#include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
-#include <resolv.h>
 #include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
+#include <stdlib.h>
 
 #include "sd-resolve.h"
 
 #include "alloc-util.h"
-#include "macro.h"
 #include "socket-util.h"
 #include "string-util.h"
+#include "tests.h"
 #include "time-util.h"
 
 #define TEST_TIMEOUT_USEC (20*USEC_PER_SEC)
@@ -55,18 +53,20 @@ static int getnameinfo_handler(sd_resolve_query *q, int ret, const char *host, c
 int main(int argc, char *argv[]) {
         _cleanup_(sd_resolve_query_unrefp) sd_resolve_query *q1 = NULL, *q2 = NULL;
         _cleanup_(sd_resolve_unrefp) sd_resolve *resolve = NULL;
-        int r = 0;
+        int r;
 
         struct addrinfo hints = {
-                .ai_family = PF_UNSPEC,
+                .ai_family = AF_UNSPEC,
                 .ai_socktype = SOCK_STREAM,
-                .ai_flags = AI_CANONNAME
+                .ai_flags = AI_CANONNAME,
         };
 
-        struct sockaddr_in sa = {
-                .sin_family = AF_INET,
-                .sin_port = htons(80)
+        union sockaddr_union sa = {
+                .in.sin_family = AF_INET,
+                .in.sin_port = htobe16(80),
         };
+
+        test_setup_logging(LOG_DEBUG);
 
         assert_se(sd_resolve_default(&resolve) >= 0);
 
@@ -81,8 +81,8 @@ int main(int argc, char *argv[]) {
                 log_error_errno(r, "sd_resolve_getaddrinfo(): %m");
 
         /* Make an address -> name query */
-        sa.sin_addr.s_addr = inet_addr(argc >= 3 ? argv[2] : "193.99.144.71");
-        r = sd_resolve_getnameinfo(resolve, &q2, (struct sockaddr*) &sa, sizeof(sa), 0, SD_RESOLVE_GET_BOTH, getnameinfo_handler, NULL);
+        sa.in.sin_addr.s_addr = inet_addr(argc >= 3 ? argv[2] : "193.99.144.71");
+        r = sd_resolve_getnameinfo(resolve, &q2, &sa.sa, sockaddr_len(&sa), 0, SD_RESOLVE_GET_BOTH, getnameinfo_handler, NULL);
         if (r < 0)
                 log_error_errno(r, "sd_resolve_getnameinfo(): %m");
 
@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
                 }
                 if (r < 0) {
                         log_error_errno(r, "sd_resolve_wait(): %m");
-                        assert_not_reached("sd_resolve_wait() failed");
+                        assert_not_reached();
                 }
         }
 

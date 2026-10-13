@@ -1,19 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "sd-event.h"
-
+#include "core-forward.h"
 #include "list.h"
-#include "unit-name.h"
-
-typedef struct Job Job;
-typedef struct JobDependency JobDependency;
-typedef enum JobType JobType;
-typedef enum JobState JobState;
-typedef enum JobMode JobMode;
-typedef enum JobResult JobResult;
 
 /* Be careful when changing the job types! Adjust job_merging_table[] accordingly! */
 enum JobType {
@@ -57,47 +46,36 @@ enum JobType {
         JOB_RELOAD_OR_START,        /* if running, reload, otherwise start */
 
         _JOB_TYPE_MAX,
-        _JOB_TYPE_INVALID = -1
+        _JOB_TYPE_INVALID = -EINVAL,
 };
 
-enum JobState {
+typedef enum JobState {
         JOB_WAITING,
         JOB_RUNNING,
+        JOB_FINISHED,
         _JOB_STATE_MAX,
-        _JOB_STATE_INVALID = -1
-};
+        _JOB_STATE_INVALID = -EINVAL,
+} JobState;
 
-enum JobMode {
-        JOB_FAIL,                /* Fail if a conflicting job is already queued */
-        JOB_REPLACE,             /* Replace an existing conflicting job */
-        JOB_REPLACE_IRREVERSIBLY,/* Like JOB_REPLACE + produce irreversible jobs */
-        JOB_ISOLATE,             /* Start a unit, and stop all others */
-        JOB_FLUSH,               /* Flush out all other queued jobs when queueing this one */
-        JOB_IGNORE_DEPENDENCIES, /* Ignore both requirement and ordering dependencies */
-        JOB_IGNORE_REQUIREMENTS, /* Ignore requirement dependencies */
-        _JOB_MODE_MAX,
-        _JOB_MODE_INVALID = -1
-};
-
-enum JobResult {
-        JOB_DONE,                /* Job completed successfully (or skipped due to a failed ConditionXYZ=) */
+typedef enum JobResult {
+        JOB_DONE,                /* Job completed successfully (or skipped due to an unmet ConditionXYZ=) */
         JOB_CANCELED,            /* Job canceled by a conflicting job installation or by explicit cancel request */
         JOB_TIMEOUT,             /* Job timeout elapsed */
         JOB_FAILED,              /* Job failed */
         JOB_DEPENDENCY,          /* A required dependency job did not result in JOB_DONE */
-        JOB_SKIPPED,             /* Negative result of JOB_VERIFY_ACTIVE */
+        JOB_SKIPPED,             /* Negative result of JOB_VERIFY_ACTIVE or skip due to ExecCondition= */
         JOB_INVALID,             /* JOB_RELOAD of inactive unit */
         JOB_ASSERT,              /* Couldn't start a unit, because an assert didn't hold */
         JOB_UNSUPPORTED,         /* Couldn't start a unit, because the unit type is not supported on the system */
         JOB_COLLECTED,           /* Job was garbage collected, since nothing needed it anymore */
         JOB_ONCE,                /* Unit was started before, and hence can't be started again */
+        JOB_FROZEN,              /* Unit is currently frozen, so we can't safely operate on it */
+        JOB_CONCURRENCY,         /* Slice the unit is in has its hard concurrency limit reached */
         _JOB_RESULT_MAX,
-        _JOB_RESULT_INVALID = -1
-};
+        _JOB_RESULT_INVALID = -EINVAL,
+} JobResult;
 
-#include "unit.h"
-
-struct JobDependency {
+typedef struct JobDependency {
         /* Encodes that the 'subject' job needs the 'object' job in
          * some way. This structure is used only while building a transaction. */
         Job *subject;
@@ -108,14 +86,13 @@ struct JobDependency {
 
         bool matters:1;
         bool conflicts:1;
-};
+} JobDependency;
 
-struct Job {
+typedef struct Job {
         Manager *manager;
         Unit *unit;
 
         LIST_FIELDS(Job, transaction);
-        LIST_FIELDS(Job, run_queue);
         LIST_FIELDS(Job, dbus_queue);
         LIST_FIELDS(Job, gc_queue);
 
@@ -123,13 +100,16 @@ struct Job {
         LIST_HEAD(JobDependency, object_list);
 
         /* Used for graph algs as a "I have been here" marker */
-        Job* marker;
+        Job *marker;
         unsigned generation;
 
         uint32_t id;
 
         JobType type;
         JobState state;
+        JobResult result;
+
+        unsigned run_queue_idx;
 
         sd_event_source *timer_event_source;
         usec_t begin_usec;
@@ -145,26 +125,40 @@ struct Job {
         sd_bus_track *bus_track;
         char **deserialized_clients;
 
-        JobResult result;
+        /* If non-NULL, a varlink connection streaming updates. */
+        sd_varlink *varlink;
+
+        /* If the job had a specific trigger that needs to be advertised (eg: a path unit), store it. */
+        ActivationDetails *activation_details;
 
         bool installed:1;
         bool in_run_queue:1;
+
         bool matters_to_anchor:1;
-        bool in_dbus_queue:1;
-        bool sent_dbus_new_signal:1;
+        bool refuse_late_merge:1;
         bool ignore_order:1;
         bool irreversible:1;
-        bool in_gc_queue:1;
+
+        bool in_dbus_queue:1;
+        bool sent_dbus_new_signal:1;
+
         bool ref_by_private_bus:1;
-};
+
+        bool in_gc_queue:1;
+
+        bool varlink_notify_job_changes:1;
+} Job;
 
 Job* job_new(Unit *unit, JobType type);
 Job* job_new_raw(Unit *unit);
 void job_unlink(Job *job);
 Job* job_free(Job *job);
+DEFINE_TRIVIAL_CLEANUP_FUNC(Job*, job_free);
+
 Job* job_install(Job *j);
 int job_install_deserialized(Job *j);
 void job_uninstall(Job *j);
+
 void job_dump(Job *j, FILE *f, const char *prefix);
 int job_serialize(Job *j, FILE *f);
 int job_deserialize(Job *j, FILE *f);
@@ -173,19 +167,17 @@ int job_coldplug(Job *j);
 JobDependency* job_dependency_new(Job *subject, Job *object, bool matters, bool conflicts);
 void job_dependency_free(JobDependency *l);
 
-int job_merge(Job *j, Job *other);
+JobType job_type_lookup_merge(JobType a, JobType b) _const_;
 
-JobType job_type_lookup_merge(JobType a, JobType b) _pure_;
-
-_pure_ static inline bool job_type_is_mergeable(JobType a, JobType b) {
+static inline bool job_type_is_mergeable(JobType a, JobType b) {
         return job_type_lookup_merge(a, b) >= 0;
 }
 
-_pure_ static inline bool job_type_is_conflicting(JobType a, JobType b) {
+static inline bool job_type_is_conflicting(JobType a, JobType b) {
         return a != JOB_NOP && b != JOB_NOP && !job_type_is_mergeable(a, b);
 }
 
-_pure_ static inline bool job_type_is_superset(JobType a, JobType b) {
+static inline bool job_type_is_superset(JobType a, JobType b) {
         /* Checks whether operation a is a "superset" of b in its actions */
         if (b == JOB_NOP)
                 return true;
@@ -194,7 +186,7 @@ _pure_ static inline bool job_type_is_superset(JobType a, JobType b) {
         return a == job_type_lookup_merge(a, b);
 }
 
-bool job_type_is_redundant(JobType a, UnitActiveState b) _pure_;
+bool job_type_is_redundant(JobType a, UnitActiveState b) _const_;
 
 /* Collapses a state-dependent job type into a simpler type by observing
  * the state of the unit which it is going to be applied to. */
@@ -210,11 +202,11 @@ int job_start_timer(Job *j, bool job_running);
 int job_run_and_invalidate(Job *j);
 int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool already);
 
-char *job_dbus_path(Job *j);
+char* job_dbus_path(Job *j);
 
 void job_shutdown_magic(Job *j);
 
-int job_get_timeout(Job *j, usec_t *timeout) _pure_;
+int job_get_timeout(Job *j, usec_t *ret);
 
 bool job_may_gc(Job *j);
 void job_add_to_gc_queue(Job *j);
@@ -222,18 +214,14 @@ void job_add_to_gc_queue(Job *j);
 int job_get_before(Job *j, Job*** ret);
 int job_get_after(Job *j, Job*** ret);
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(Job*, job_free);
+DECLARE_STRING_TABLE_LOOKUP(job_type, JobType);
 
-const char* job_type_to_string(JobType t) _const_;
-JobType job_type_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(job_state, JobState);
 
-const char* job_state_to_string(JobState t) _const_;
-JobState job_state_from_string(const char *s) _pure_;
-
-const char* job_mode_to_string(JobMode t) _const_;
-JobMode job_mode_from_string(const char *s) _pure_;
-
-const char* job_result_to_string(JobResult t) _const_;
-JobResult job_result_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(job_result, JobResult);
 
 const char* job_type_to_access_method(JobType t);
+
+int job_compare(Job *a, Job *b, UnitDependencyAtom assume_dep);
+
+void job_set_activation_details(Job *j, ActivationDetails *info);

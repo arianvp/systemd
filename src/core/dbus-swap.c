@@ -1,29 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2010 Maarten Lankhorst
 ***/
 
-#include "bus-util.h"
+#include "bus-get-properties.h"
 #include "dbus-cgroup.h"
 #include "dbus-execute.h"
 #include "dbus-swap.h"
-#include "string-util.h"
 #include "swap.h"
 #include "unit.h"
-
-static int swap_get_priority(Swap *s) {
-        if (s->from_proc_swaps)
-                return s->parameters_proc_swaps.priority;
-        if (s->from_fragment)
-                return s->parameters_fragment.priority;
-        return -1;
-}
-
-static const char *swap_get_options(Swap *s) {
-        if (s->from_fragment)
-                return s->parameters_fragment.options;
-        return NULL;
-}
 
 static BUS_DEFINE_PROPERTY_GET(property_get_priority, "i", Swap, swap_get_priority);
 static BUS_DEFINE_PROPERTY_GET(property_get_options, "s", Swap, swap_get_options);
@@ -35,7 +20,7 @@ const sd_bus_vtable bus_swap_vtable[] = {
         SD_BUS_PROPERTY("Priority", "i", property_get_priority, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Options", "s", property_get_options, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("TimeoutUSec", "t", bus_property_get_usec, offsetof(Swap, timeout_usec), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Swap, control_pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Swap, control_pid.pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Swap, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("GID", "u", bus_property_get_gid, offsetof(Unit, ref_gid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -49,7 +34,7 @@ int bus_swap_set_property(
                 const char *name,
                 sd_bus_message *message,
                 UnitWriteFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         Swap *s = SWAP(u);
 
@@ -57,14 +42,13 @@ int bus_swap_set_property(
         assert(name);
         assert(message);
 
-        return bus_cgroup_set_property(u, &s->cgroup_context, name, message, flags, error);
+        return bus_cgroup_set_property(u, &s->cgroup_context, name, message, flags, reterr_error);
 }
 
 int bus_swap_commit_properties(Unit *u) {
         assert(u);
 
-        unit_invalidate_cgroup_members_masks(u);
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

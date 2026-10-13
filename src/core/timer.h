@@ -1,9 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Timer Timer;
-
-#include "calendarspec.h"
+#include "core-forward.h"
 #include "unit.h"
 
 typedef enum TimerBase {
@@ -14,7 +12,7 @@ typedef enum TimerBase {
         TIMER_UNIT_INACTIVE,
         TIMER_CALENDAR,
         _TIMER_BASE_MAX,
-        _TIMER_BASE_INVALID = -1
+        _TIMER_BASE_INVALID = -EINVAL,
 } TimerBase;
 
 typedef struct TimerValue {
@@ -33,14 +31,15 @@ typedef enum TimerResult {
         TIMER_FAILURE_RESOURCES,
         TIMER_FAILURE_START_LIMIT_HIT,
         _TIMER_RESULT_MAX,
-        _TIMER_RESULT_INVALID = -1
+        _TIMER_RESULT_INVALID = -EINVAL,
 } TimerResult;
 
-struct Timer {
+typedef struct Timer {
         Unit meta;
 
         usec_t accuracy_usec;
-        usec_t random_usec;
+        usec_t random_delay_usec;
+        usec_t random_offset_usec;
 
         LIST_HEAD(TimerValue, values);
         usec_t next_elapse_realtime;
@@ -59,20 +58,31 @@ struct Timer {
         bool remain_after_elapse;
         bool on_clock_change;
         bool on_timezone_change;
+        bool fixed_random_delay;
+        bool defer_reactivation;
 
         char *stamp_path;
-};
+} Timer;
 
-#define TIMER_MONOTONIC_CLOCK(t) ((t)->wake_system && clock_boottime_supported() ? CLOCK_BOOTTIME_ALARM : CLOCK_MONOTONIC)
+typedef struct ActivationDetailsTimer {
+        ActivationDetails meta;
+        dual_timestamp last_trigger;
+} ActivationDetailsTimer;
+
+#define TIMER_MONOTONIC_CLOCK(t) ((t)->wake_system ? CLOCK_BOOTTIME_ALARM : CLOCK_MONOTONIC)
+
+uint64_t timer_next_elapse_monotonic(const Timer *t);
 
 void timer_free_values(Timer *t);
 
 extern const UnitVTable timer_vtable;
+extern const ActivationDetailsVTable activation_details_timer_vtable;
 
-const char *timer_base_to_string(TimerBase i) _const_;
-TimerBase timer_base_from_string(const char *s) _pure_;
+DECLARE_STRING_TABLE_LOOKUP(timer_base, TimerBase);
 
-const char* timer_result_to_string(TimerResult i) _const_;
-TimerResult timer_result_from_string(const char *s) _pure_;
+char* timer_base_to_usec_string(TimerBase i);
+
+DECLARE_STRING_TABLE_LOOKUP(timer_result, TimerResult);
 
 DEFINE_CAST(TIMER, Timer);
+DEFINE_ACTIVATION_DETAILS_CAST(ACTIVATION_DETAILS_TIMER, ActivationDetailsTimer, TIMER);

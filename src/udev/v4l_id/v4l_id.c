@@ -1,77 +1,92 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright (c) 2009 Filippo Argiolas <filippo.argiolas@gmail.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details:
  */
 
-#include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
 #include <linux/videodev2.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
 
+#include "sd-json.h"
+
+#include "build.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "util.h"
+#include "log.h"
+#include "main-func.h"
+#include "string-util.h"
+#include "strv.h"
+#include "utf8.h"
+#include "verbs.h"
 
-int main(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "help", no_argument, NULL, 'h' },
-                {}
-        };
-        _cleanup_close_ int fd = -1;
-        char *device;
-        struct v4l2_capability v2cap;
-        int c;
+static const char *arg_device = NULL;
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+COMMAND(
+        "v4l_id\0",
+        "Identify Video4Linux devices.",
+        .argspec = "DEVICE\0",
+);
 
+static int parse_argv(int argc, char *argv[]) {
+        assert(argc >= 0);
+        assert(argv);
+
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'h':
-                        printf("%s [-h,--help] <device file>\n\n"
-                               "Video4Linux device identification.\n\n"
-                               "  -h  Print this message\n"
-                               , program_invocation_short_name);
-                        return 0;
-                case '?':
-                        return -EINVAL;
 
-                default:
-                        assert_not_reached("Unhandled option");
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        device = argv[optind];
-        if (!device)
-                return 2;
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need exactly one DEVICE argument.");
 
-        fd = open(device, O_RDONLY);
-        if (fd < 0)
-                return 3;
+        arg_device = args[0];
+        return 1;
+}
+
+static int run(int argc, char *argv[]) {
+        _cleanup_close_ int fd = -EBADF;
+        struct v4l2_capability v2cap;
+        int r;
+
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
+
+        fd = open(arg_device, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        if (fd < 0) {
+                bool ignore = ERRNO_IS_DEVICE_ABSENT_OR_EMPTY(errno);
+                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, errno,
+                               "Failed to open device node '%s'%s: %m",
+                               arg_device, ignore ? ", ignoring" : "");
+                return ignore ? 0 : -errno;
+        }
 
         if (ioctl(fd, VIDIOC_QUERYCAP, &v2cap) == 0) {
                 int capabilities;
+
                 printf("ID_V4L_VERSION=2\n");
-                printf("ID_V4L_PRODUCT=%s\n", v2cap.card);
+                if (utf8_is_valid((char *)v2cap.card) && !string_has_cc((char *)v2cap.card, /* ok= */ NULL))
+                        printf("ID_V4L_PRODUCT=%s\n", v2cap.card);
                 printf("ID_V4L_CAPABILITIES=:");
+
                 if (v2cap.capabilities & V4L2_CAP_DEVICE_CAPS)
                         capabilities = v2cap.device_caps;
                 else
                         capabilities = v2cap.capabilities;
+
                 if ((capabilities & V4L2_CAP_VIDEO_CAPTURE) > 0 ||
                     (capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) > 0)
                         printf("capture:");
@@ -91,3 +106,5 @@ int main(int argc, char *argv[]) {
 
         return 0;
 }
+
+DEFINE_MAIN_FUNCTION(run);

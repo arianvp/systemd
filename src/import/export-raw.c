@@ -1,32 +1,26 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/sendfile.h>
 
-/* When we include libgen.h because we need dirname() we immediately
- * undefine basename() since libgen.h defines it as a macro to the POSIX
- * version which is really broken. We prefer GNU basename(). */
-#include <libgen.h>
-#undef basename
-
 #include "sd-daemon.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "copy.h"
 #include "export-raw.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
-#include "import-common.h"
-#include "missing.h"
+#include "log.h"
+#include "pretty-print.h"
 #include "ratelimit.h"
 #include "stat-util.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
-#define COPY_BUFFER_SIZE (16*1024)
-
-struct RawExport {
+typedef struct RawExport {
         sd_event *event;
 
         RawExportFinished on_finished;
@@ -37,7 +31,7 @@ struct RawExport {
         int input_fd;
         int output_fd;
 
-        ImportCompress compress;
+        Compressor *compress;
 
         sd_event_source *output_event_source;
 
@@ -49,14 +43,14 @@ struct RawExport {
         uint64_t written_uncompressed;
 
         unsigned last_percent;
-        RateLimit progress_rate_limit;
+        RateLimit progress_ratelimit;
 
         struct stat st;
 
         bool eof;
         bool tried_reflink;
         bool tried_sendfile;
-};
+} RawExport;
 
 RawExport *raw_export_unref(RawExport *e) {
         if (!e)
@@ -64,7 +58,7 @@ RawExport *raw_export_unref(RawExport *e) {
 
         sd_event_source_unref(e->output_event_source);
 
-        import_compress_free(&e->compress);
+        e->compress = compressor_free(e->compress);
 
         sd_event_unref(e->event);
 
@@ -91,14 +85,13 @@ int raw_export_new(
                 return -ENOMEM;
 
         *e = (RawExport) {
-                .output_fd = -1,
-                .input_fd = -1,
+                .output_fd = -EBADF,
+                .input_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
-                .last_percent = (unsigned) -1,
+                .last_percent = UINT_MAX,
+                .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
         };
-
-        RATELIMIT_INIT(e->progress_rate_limit, 100 * USEC_PER_MSEC, 1);
 
         if (event)
                 e->event = sd_event_ref(event);
@@ -125,11 +118,20 @@ static void raw_export_report_progress(RawExport *e) {
         if (percent == e->last_percent)
                 return;
 
-        if (!ratelimit_below(&e->progress_rate_limit))
+        if (!ratelimit_below(&e->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Exported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->st.st_size));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -140,13 +142,13 @@ static int raw_export_process(RawExport *e) {
 
         assert(e);
 
-        if (!e->tried_reflink && e->compress.type == IMPORT_COMPRESS_UNCOMPRESSED) {
+        if (!e->tried_reflink && compressor_type(e->compress) == COMPRESSION_NONE) {
 
                 /* If we shall take an uncompressed snapshot we can
                  * reflink source to destination directly. Let's see
                  * if this works. */
 
-                r = btrfs_reflink(e->input_fd, e->output_fd);
+                r = reflink(e->input_fd, e->output_fd);
                 if (r >= 0) {
                         r = 0;
                         goto finish;
@@ -155,9 +157,9 @@ static int raw_export_process(RawExport *e) {
                 e->tried_reflink = true;
         }
 
-        if (!e->tried_sendfile && e->compress.type == IMPORT_COMPRESS_UNCOMPRESSED) {
+        if (!e->tried_sendfile && compressor_type(e->compress) == COMPRESSION_NONE) {
 
-                l = sendfile(e->output_fd, e->input_fd, NULL, COPY_BUFFER_SIZE);
+                l = sendfile(e->output_fd, e->input_fd, NULL, COMPRESS_PIPE_BUFFER_SIZE);
                 if (l < 0) {
                         if (errno == EAGAIN)
                                 return 0;
@@ -177,7 +179,7 @@ static int raw_export_process(RawExport *e) {
         }
 
         while (e->buffer_size <= 0) {
-                uint8_t input[COPY_BUFFER_SIZE];
+                uint8_t input[COMPRESS_PIPE_BUFFER_SIZE];
 
                 if (e->eof) {
                         r = 0;
@@ -192,10 +194,10 @@ static int raw_export_process(RawExport *e) {
 
                 if (l == 0) {
                         e->eof = true;
-                        r = import_compress_finish(&e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_finish(e->compress, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 } else {
                         e->written_uncompressed += l;
-                        r = import_compress(&e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
+                        r = compressor_start(e->compress, input, l, &e->buffer, &e->buffer_size, &e->buffer_allocated);
                 }
                 if (r < 0) {
                         r = log_error_errno(r, "Failed to encode: %m");
@@ -223,8 +225,11 @@ static int raw_export_process(RawExport *e) {
 
 finish:
         if (r >= 0) {
+                if (isatty_safe(STDERR_FILENO))
+                        clear_progress_bar(/* prefix= */ NULL);
+
                 (void) copy_times(e->input_fd, e->output_fd, COPY_CRTIME);
-                (void) copy_xattr(e->input_fd, e->output_fd);
+                (void) copy_xattr(e->input_fd, NULL, e->output_fd, NULL, 0);
         }
 
         if (e->on_finished)
@@ -265,7 +270,7 @@ static int reflink_snapshot(int fd, const char *path) {
                 (void) unlink(t);
         }
 
-        r = btrfs_reflink(fd, new_fd);
+        r = reflink(fd, new_fd);
         if (r < 0) {
                 safe_close(new_fd);
                 return r;
@@ -274,15 +279,15 @@ static int reflink_snapshot(int fd, const char *path) {
         return new_fd;
 }
 
-int raw_export_start(RawExport *e, const char *path, int fd, ImportCompressType compress) {
-        _cleanup_close_ int sfd = -1, tfd = -1;
+int raw_export_start(RawExport *e, const char *path, int fd, Compression compress) {
+        _cleanup_close_ int sfd = -EBADF, tfd = -EBADF;
         int r;
 
         assert(e);
         assert(path);
         assert(fd >= 0);
-        assert(compress < _IMPORT_COMPRESS_TYPE_MAX);
-        assert(compress != IMPORT_COMPRESS_UNKNOWN);
+        assert(compress >= 0);
+        assert(compress < _COMPRESSION_MAX);
 
         if (e->output_fd >= 0)
                 return -EBUSY;
@@ -312,7 +317,7 @@ int raw_export_start(RawExport *e, const char *path, int fd, ImportCompressType 
         else
                 e->input_fd = TAKE_FD(sfd);
 
-        r = import_compress_init(&e->compress, compress);
+        r = compressor_new(&e->compress, compress);
         if (r < 0)
                 return r;
 

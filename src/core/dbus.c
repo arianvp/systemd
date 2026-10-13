@@ -1,16 +1,17 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <sys/epoll.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-internal.h"
+#include "bus-object.h"
 #include "bus-util.h"
+#include "dbus.h"
 #include "dbus-automount.h"
 #include "dbus-cgroup.h"
 #include "dbus-device.h"
@@ -28,114 +29,65 @@
 #include "dbus-target.h"
 #include "dbus-timer.h"
 #include "dbus-unit.h"
-#include "dbus.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "fdset.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "missing.h"
-#include "mkdir.h"
+#include "manager.h"
+#include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
-#include "selinux-access.h"
+#include "selinux-access.h"     /* IWYU pragma: keep */
 #include "serialize.h"
-#include "service.h"
+#include "set.h"
 #include "special.h"
 #include "string-util.h"
 #include "strv.h"
-#include "strxcpyx.h"
-#include "user-util.h"
+#include "umask-util.h"
 
 #define CONNECTIONS_MAX 4096
 
 static void destroy_bus(Manager *m, sd_bus **bus);
 
-int bus_send_pending_reload_message(Manager *m) {
+void bus_send_pending_reload_message(Manager *m) {
         int r;
 
         assert(m);
 
-        if (!m->pending_reload_message)
-                return 0;
+        if (!m->pending_reload_message_dbus)
+                return;
 
         /* If we cannot get rid of this message we won't dispatch any D-Bus messages, so that we won't end up wanting
          * to queue another message. */
 
-        r = sd_bus_send(NULL, m->pending_reload_message, NULL);
+        r = sd_bus_message_send(m->pending_reload_message_dbus);
         if (r < 0)
-                log_warning_errno(r, "Failed to send queued message, ignoring: %m");
+                log_warning_errno(r, "Failed to send queued reload message, ignoring: %m");
 
-        m->pending_reload_message = sd_bus_message_unref(m->pending_reload_message);
+        m->pending_reload_message_dbus = sd_bus_message_unref(m->pending_reload_message_dbus);
 
-        return 0;
+        return;
 }
 
-int bus_forward_agent_released(Manager *m, const char *path) {
-        int r;
-
-        assert(m);
-        assert(path);
-
-        if (!MANAGER_IS_SYSTEM(m))
-                return 0;
-
-        if (!m->system_bus)
-                return 0;
-
-        /* If we are running a system instance we forward the agent message on the system bus, so that the user
-         * instances get notified about this, too */
-
-        r = sd_bus_emit_signal(m->system_bus,
-                               "/org/freedesktop/systemd1/agent",
-                               "org.freedesktop.systemd1.Agent",
-                               "Released",
-                               "s", path);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to propagate agent release message: %m");
-
-        return 1;
-}
-
-static int signal_agent_released(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-        Manager *m = userdata;
-        const char *cgroup;
-        uid_t sender_uid;
-        int r;
-
-        assert(message);
-        assert(m);
-
-        /* only accept org.freedesktop.systemd1.Agent from UID=0 */
-        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_EUID, &creds);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_creds_get_euid(creds, &sender_uid);
-        if (r < 0 || sender_uid != 0)
-                return 0;
-
-        /* parse 'cgroup-empty' notification */
-        r = sd_bus_message_read(message, "s", &cgroup);
-        if (r < 0) {
-                bus_log_parse_error(r);
-                return 0;
-        }
-
-        manager_notify_cgroup_empty(m, cgroup);
-        return 0;
-}
-
-static int signal_disconnected(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Manager *m = userdata;
+static int signal_disconnected(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         sd_bus *bus;
 
         assert(message);
-        assert(m);
         assert_se(bus = sd_bus_message_get_bus(message));
 
-        if (bus == m->api_bus)
+        if (bus == m->api_bus) {
+                log_notice("Got disconnect on API bus.");
                 bus_done_api(m);
-        if (bus == m->system_bus)
+        }
+        if (bus == m->system_bus) {
+                /* If we are the system manager, this is already logged by the API bus. */
+                if (!MANAGER_IS_SYSTEM(m))
+                        log_notice("Got disconnect on system bus.");
                 bus_done_system(m);
+        }
 
         if (set_remove(m->private_buses, bus)) {
                 log_debug("Got disconnect on private connection.");
@@ -148,13 +100,12 @@ static int signal_disconnected(sd_bus_message *message, void *userdata, sd_bus_e
 static int signal_activation_request(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *name;
         Unit *u;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0) {
@@ -162,9 +113,9 @@ static int signal_activation_request(sd_bus_message *message, void *userdata, sd
                 return 0;
         }
 
-        if (manager_unit_inactive_or_pending(m, SPECIAL_DBUS_SERVICE) ||
-            manager_unit_inactive_or_pending(m, SPECIAL_DBUS_SOCKET)) {
-                r = sd_bus_error_setf(&error, BUS_ERROR_SHUTTING_DOWN, "Refusing activation, D-Bus is shutting down.");
+        if (manager_unit_inactive_or_pending(m, SPECIAL_DBUS_SOCKET) ||
+            manager_unit_inactive_or_pending(m, SPECIAL_DBUS_SERVICE)) {
+                r = sd_bus_error_set(&error, BUS_ERROR_SHUTTING_DOWN, "Refusing activation, D-Bus is shutting down.");
                 goto failed;
         }
 
@@ -177,7 +128,7 @@ static int signal_activation_request(sd_bus_message *message, void *userdata, sd
                 goto failed;
         }
 
-        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, NULL, &error, NULL);
+        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, &error, /* ret= */ NULL);
         if (r < 0)
                 goto failed;
 
@@ -210,7 +161,7 @@ failed:
 }
 
 #if HAVE_SELINUX
-static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_error *reterr_error) {
         Manager *m = userdata;
         const char *verb, *path;
         Unit *u = NULL;
@@ -234,39 +185,36 @@ static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_er
                 return 0;
 
         path = sd_bus_message_get_path(message);
+        if (!path)
+                return 0;
 
         if (object_path_startswith("/org/freedesktop/systemd1", path)) {
-                r = mac_selinux_access_check(message, verb, error);
+                r = mac_selinux_access_check(message, verb, reterr_error);
                 if (r < 0)
                         return r;
 
                 return 0;
         }
 
-        if (streq_ptr(path, "/org/freedesktop/systemd1/unit/self")) {
-                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-                pid_t pid;
+        if (streq(path, "/org/freedesktop/systemd1/unit/self")) {
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
 
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID, &creds);
+                r = bus_query_sender_pidref(message, &pidref);
                 if (r < 0)
                         return 0;
 
-                r = sd_bus_creds_get_pid(creds, &pid);
-                if (r < 0)
-                        return 0;
-
-                u = manager_get_unit_by_pid(m, pid);
+                u = manager_get_unit_by_pidref(m, &pidref);
         } else {
                 r = manager_get_job_from_dbus_path(m, path, &j);
                 if (r >= 0)
                         u = j->unit;
                 else
-                        manager_load_unit_from_dbus_path(m, path, NULL, &u);
+                        (void) manager_load_unit_from_dbus_path(m, path, NULL, &u);
         }
         if (!u)
                 return 0;
 
-        r = mac_selinux_unit_access_check(u, message, verb, error);
+        r = mac_selinux_unit_access_check(u, message, verb, reterr_error);
         if (r < 0)
                 return r;
 
@@ -274,55 +222,32 @@ static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_er
 }
 #endif
 
-static int bus_job_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
-        Job *j;
-        int r;
-
-        assert(bus);
-        assert(path);
-        assert(interface);
-        assert(found);
-        assert(m);
-
-        r = manager_get_job_from_dbus_path(m, path, &j);
-        if (r < 0)
-                return 0;
-
-        *found = j;
-        return 1;
-}
-
-static int find_unit(Manager *m, sd_bus *bus, const char *path, Unit **unit, sd_bus_error *error) {
+static int find_unit(Manager *m, sd_bus *bus, const char *path, Unit **unit, sd_bus_error *reterr_error) {
         Unit *u = NULL;  /* just to appease gcc, initialization is not really necessary */
         int r;
 
         assert(m);
         assert(bus);
         assert(path);
+        assert(unit);
 
-        if (streq_ptr(path, "/org/freedesktop/systemd1/unit/self")) {
-                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        if (streq(path, "/org/freedesktop/systemd1/unit/self")) {
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
                 sd_bus_message *message;
-                pid_t pid;
 
                 message = sd_bus_get_current_message(bus);
                 if (!message)
                         return 0;
 
-                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_PID, &creds);
+                r = bus_query_sender_pidref(message, &pidref);
                 if (r < 0)
                         return r;
 
-                r = sd_bus_creds_get_pid(creds, &pid);
-                if (r < 0)
-                        return r;
-
-                u = manager_get_unit_by_pid(m, pid);
+                u = manager_get_unit_by_pidref(m, &pidref);
                 if (!u)
                         return 0;
         } else {
-                r = manager_load_unit_from_dbus_path(m, path, error, &u);
+                r = manager_load_unit_from_dbus_path(m, path, reterr_error, &u);
                 if (r < 0)
                         return 0;
                 assert(u);
@@ -332,20 +257,19 @@ static int find_unit(Manager *m, sd_bus *bus, const char *path, Unit **unit, sd_
         return 1;
 }
 
-static int bus_unit_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+static int bus_unit_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        return find_unit(m, bus, path, (Unit**) found, error);
+        return find_unit(m, bus, path, (Unit**) found, reterr_error);
 }
 
-static int bus_unit_interface_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+static int bus_unit_interface_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
         int r;
 
@@ -353,9 +277,8 @@ static int bus_unit_interface_find(sd_bus *bus, const char *path, const char *in
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        r = find_unit(m, bus, path, &u, error);
+        r = find_unit(m, bus, path, &u, reterr_error);
         if (r <= 0)
                 return r;
 
@@ -366,8 +289,8 @@ static int bus_unit_interface_find(sd_bus *bus, const char *path, const char *in
         return 1;
 }
 
-static int bus_unit_cgroup_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+static int bus_unit_cgroup_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
         int r;
 
@@ -375,9 +298,8 @@ static int bus_unit_cgroup_find(sd_bus *bus, const char *path, const char *inter
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        r = find_unit(m, bus, path, &u, error);
+        r = find_unit(m, bus, path, &u, reterr_error);
         if (r <= 0)
                 return r;
 
@@ -391,8 +313,8 @@ static int bus_unit_cgroup_find(sd_bus *bus, const char *path, const char *inter
         return 1;
 }
 
-static int bus_cgroup_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+static int bus_cgroup_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         CGroupContext *c;
         Unit *u;
         int r;
@@ -401,9 +323,8 @@ static int bus_cgroup_context_find(sd_bus *bus, const char *path, const char *in
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        r = find_unit(m, bus, path, &u, error);
+        r = find_unit(m, bus, path, &u, reterr_error);
         if (r <= 0)
                 return r;
 
@@ -418,9 +339,8 @@ static int bus_cgroup_context_find(sd_bus *bus, const char *path, const char *in
         return 1;
 }
 
-static int bus_exec_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
-        ExecContext *c;
+static int bus_unit_exec_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         Unit *u;
         int r;
 
@@ -428,14 +348,34 @@ static int bus_exec_context_find(sd_bus *bus, const char *path, const char *inte
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        r = find_unit(m, bus, path, &u, error);
+        r = find_unit(m, bus, path, &u, reterr_error);
         if (r <= 0)
                 return r;
 
         if (!streq_ptr(interface, unit_dbus_interface_from_type(u->type)))
                 return 0;
+
+        if (!UNIT_HAS_EXEC_CONTEXT(u))
+                return 0;
+
+        *found = u;
+        return 1;
+}
+
+static int bus_exec_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        ExecContext *c;
+        int r;
+
+        assert(bus);
+        assert(path);
+        assert(interface);
+        assert(found);
+
+        Unit *u;
+        r = bus_unit_exec_context_find(bus, path, interface, userdata, (void**) &u, reterr_error);
+        if (r <= 0)
+                return r;
 
         c = unit_get_exec_context(u);
         if (!c)
@@ -445,8 +385,8 @@ static int bus_exec_context_find(sd_bus *bus, const char *path, const char *inte
         return 1;
 }
 
-static int bus_kill_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
+static int bus_kill_context_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
         KillContext *c;
         Unit *u;
         int r;
@@ -455,9 +395,8 @@ static int bus_kill_context_find(sd_bus *bus, const char *path, const char *inte
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
-        r = find_unit(m, bus, path, &u, error);
+        r = find_unit(m, bus, path, &u, reterr_error);
         if (r <= 0)
                 return r;
 
@@ -472,44 +411,19 @@ static int bus_kill_context_find(sd_bus *bus, const char *path, const char *inte
         return 1;
 }
 
-static int bus_job_enumerate(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
+static int bus_unit_enumerate(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *reterr_error) {
         _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         unsigned k = 0;
-        Iterator i;
-        Job *j;
-
-        l = new0(char*, hashmap_size(m->jobs)+1);
-        if (!l)
-                return -ENOMEM;
-
-        HASHMAP_FOREACH(j, m->jobs, i) {
-                l[k] = job_dbus_path(j);
-                if (!l[k])
-                        return -ENOMEM;
-
-                k++;
-        }
-
-        assert(hashmap_size(m->jobs) == k);
-
-        *nodes = TAKE_PTR(l);
-
-        return k;
-}
-
-static int bus_unit_enumerate(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
-        _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
-        unsigned k = 0;
-        Iterator i;
         Unit *u;
+
+        assert(nodes);
 
         l = new0(char*, hashmap_size(m->units)+1);
         if (!l)
                 return -ENOMEM;
 
-        HASHMAP_FOREACH(u, m->units, i) {
+        HASHMAP_FOREACH(u, m->units) {
                 l[k] = unit_dbus_path(u);
                 if (!l[k])
                         return -ENOMEM;
@@ -522,8 +436,151 @@ static int bus_unit_enumerate(sd_bus *bus, const char *path, void *userdata, cha
         return k;
 }
 
+static const BusObjectImplementation unit_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Unit",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_unit_vtable,        bus_unit_find }),
+        .node_enumerator = bus_unit_enumerate,
+};
+
+static const BusObjectImplementation bus_automount_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Automount",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_automount_vtable,   bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_device_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Device",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_device_vtable,      bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_mount_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Mount",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_mount_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_unit_exec_vtable,   bus_unit_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_path_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Path",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_path_vtable,        bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_scope_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Scope",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_scope_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_service_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Service",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_service_vtable,     bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_unit_exec_vtable,   bus_unit_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_slice_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Slice",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_slice_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find }),
+};
+
+static const BusObjectImplementation bus_socket_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Socket",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_socket_vtable,      bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_unit_exec_vtable,   bus_unit_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_swap_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Swap",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_swap_vtable,        bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_unit_exec_vtable,   bus_unit_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_target_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Target",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_target_vtable,      bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_timer_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Timer",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_timer_vtable,       bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_manager_object = {
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        .vtables = BUS_VTABLES(bus_manager_vtable),
+        .children = BUS_IMPLEMENTATIONS(
+                        &job_object,
+                        &unit_object,
+                        &bus_automount_object,
+                        &bus_device_object,
+                        &bus_mount_object,
+                        &bus_path_object,
+                        &bus_scope_object,
+                        &bus_service_object,
+                        &bus_slice_object,
+                        &bus_socket_object,
+                        &bus_swap_object,
+                        &bus_target_object,
+                        &bus_timer_object),
+};
+
+static const BusObjectImplementation manager_log_control_object = {
+        "/org/freedesktop/LogControl1",
+        "org.freedesktop.LogControl1",
+        .vtables = BUS_VTABLES(bus_manager_log_control_vtable),
+};
+
+int bus_manager_introspect_implementations(FILE *out, const char *pattern) {
+        return bus_introspect_implementations(
+                        out,
+                        pattern,
+                        BUS_IMPLEMENTATIONS(&bus_manager_object,
+                                            &manager_log_control_object));
+}
+
 static int bus_setup_api_vtables(Manager *m, sd_bus *bus) {
-        UnitType t;
         int r;
 
         assert(m);
@@ -535,59 +592,11 @@ static int bus_setup_api_vtables(Manager *m, sd_bus *bus) {
                 return log_error_errno(r, "Failed to add SELinux access filter: %m");
 #endif
 
-        r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", bus_manager_vtable, m);
+        r = bus_add_implementation(bus, &bus_manager_object, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to register Manager vtable: %m");
+                return r;
 
-        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/job", "org.freedesktop.systemd1.Job", bus_job_vtable, bus_job_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to register Job vtable: %m");
-
-        r = sd_bus_add_node_enumerator(bus, NULL, "/org/freedesktop/systemd1/job", bus_job_enumerate, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add job enumerator: %m");
-
-        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", "org.freedesktop.systemd1.Unit", bus_unit_vtable, bus_unit_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to register Unit vtable: %m");
-
-        r = sd_bus_add_node_enumerator(bus, NULL, "/org/freedesktop/systemd1/unit", bus_unit_enumerate, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add job enumerator: %m");
-
-        for (t = 0; t < _UNIT_TYPE_MAX; t++) {
-                const char *interface;
-
-                assert_se(interface = unit_dbus_interface_from_type(t));
-
-                r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, unit_vtable[t]->bus_vtable, bus_unit_interface_find, m);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to register type specific vtable for %s: %m", interface);
-
-                if (unit_vtable[t]->cgroup_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_unit_cgroup_vtable, bus_unit_cgroup_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register control group unit vtable for %s: %m", interface);
-
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_cgroup_vtable, bus_cgroup_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register control group vtable for %s: %m", interface);
-                }
-
-                if (unit_vtable[t]->exec_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_exec_vtable, bus_exec_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register execute vtable for %s: %m", interface);
-                }
-
-                if (unit_vtable[t]->kill_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_kill_vtable, bus_kill_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register kill vtable for %s: %m", interface);
-                }
-        }
-
-        return 0;
+        return bus_add_implementation(bus, &manager_log_control_object, m);
 }
 
 static int bus_setup_disconnected_match(Manager *m, sd_bus *bus) {
@@ -612,13 +621,12 @@ static int bus_setup_disconnected_match(Manager *m, sd_bus *bus) {
 
 static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_close_ int nfd = -1;
-        Manager *m = userdata;
+        _cleanup_close_ int nfd = -EBADF;
+        Manager *m = ASSERT_PTR(userdata);
         sd_id128_t id;
         int r;
 
         assert(s);
-        assert(m);
 
         nfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (nfd < 0) {
@@ -631,12 +639,6 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
 
         if (set_size(m->private_buses) >= CONNECTIONS_MAX) {
                 log_warning("Too many concurrent connections, refusing");
-                return 0;
-        }
-
-        r = set_ensure_allocated(&m->private_buses, NULL);
-        if (r < 0) {
-                log_oom();
                 return 0;
         }
 
@@ -654,7 +656,7 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
                 return 0;
         }
 
-        nfd = -1;
+        TAKE_FD(nfd);
 
         r = bus_check_peercred(bus);
         if (r < 0) {
@@ -673,7 +675,8 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
         r = sd_bus_negotiate_creds(bus, 1,
                                    SD_BUS_CREDS_PID|SD_BUS_CREDS_UID|
                                    SD_BUS_CREDS_EUID|SD_BUS_CREDS_EFFECTIVE_CAPS|
-                                   SD_BUS_CREDS_SELINUX_CONTEXT);
+                                   SD_BUS_CREDS_SELINUX_CONTEXT|
+                                   SD_BUS_CREDS_COMM|SD_BUS_CREDS_DESCRIPTION);
         if (r < 0) {
                 log_warning_errno(r, "Failed to enable credentials for new connection: %m");
                 return 0;
@@ -691,7 +694,24 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
                 return 0;
         }
 
-        r = sd_bus_attach_event(bus, m->event, SD_EVENT_PRIORITY_NORMAL);
+        if (DEBUG_LOGGING) {
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *c = NULL;
+                const char *comm = NULL, *description = NULL;
+                pid_t pid = 0;
+
+                r = sd_bus_get_owner_creds(bus, SD_BUS_CREDS_PID|SD_BUS_CREDS_COMM|SD_BUS_CREDS_DESCRIPTION, &c);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to get peer creds, ignoring: %m");
+                else {
+                        (void) sd_bus_creds_get_pid(c, &pid);
+                        (void) sd_bus_creds_get_comm(c, &comm);
+                        (void) sd_bus_creds_get_description(c, &description);
+                }
+
+                log_debug("Accepting direct incoming connection from " PID_FMT " (%s) [%s]", pid, strna(comm), strna(description));
+        }
+
+        r = sd_bus_attach_event(bus, m->event, EVENT_PRIORITY_IPC);
         if (r < 0) {
                 log_warning_errno(r, "Failed to attach new connection bus to event loop: %m");
                 return 0;
@@ -707,129 +727,46 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
                 return 0;
         }
 
-        r = set_put(m->private_buses, bus);
+        r = bus_register_malloc_status(bus, "org.freedesktop.systemd1");
+        if (r < 0)
+                log_warning_errno(r, "Failed to register MemoryAllocation1, ignoring: %m");
+
+        r = set_ensure_put(&m->private_buses, NULL, bus);
+        if (r == -ENOMEM) {
+                log_oom();
+                return 0;
+        }
         if (r < 0) {
                 log_warning_errno(r, "Failed to add new connection bus to set: %m");
                 return 0;
         }
 
-        bus = NULL;
+        TAKE_PTR(bus);
 
         log_debug("Accepted new private connection.");
 
         return 0;
 }
 
-static int manager_dispatch_sync_bus_names(sd_event_source *es, void *userdata) {
-        _cleanup_strv_free_ char **names = NULL;
-        Manager *m = userdata;
-        const char *name;
-        Iterator i;
-        Unit *u;
+static int bus_track_coldplug(sd_bus *bus, sd_bus_track **t, char * const *l) {
         int r;
 
-        assert(es);
-        assert(m);
-        assert(m->sync_bus_names_event_source == es);
+        assert(bus);
+        assert(t);
 
-        /* First things first, destroy the defer event so that we aren't triggered again */
-        m->sync_bus_names_event_source = sd_event_source_unref(m->sync_bus_names_event_source);
-
-        /* Let's see if there's anything to do still? */
-        if (!m->api_bus)
-                return 0;
-        if (hashmap_isempty(m->watch_bus))
+        if (strv_isempty(l))
                 return 0;
 
-        /* OK, let's sync up the names. Let's see which names are currently on the bus. */
-        r = sd_bus_list_names(m->api_bus, &names, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get initial list of names: %m");
-
-        /* We have to synchronize the current bus names with the
-         * list of active services. To do this, walk the list of
-         * all units with bus names. */
-        HASHMAP_FOREACH_KEY(u, name, m->watch_bus, i) {
-                Service *s = SERVICE(u);
-
-                assert(s);
-
-                if (!streq_ptr(s->bus_name, name)) {
-                        log_unit_warning(u, "Bus name has changed from %s → %s, ignoring.", s->bus_name, name);
-                        continue;
-                }
-
-                /* Check if a service's bus name is in the list of currently
-                 * active names */
-                if (strv_contains(names, name)) {
-                        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-                        const char *unique;
-
-                        /* If it is, determine its current owner */
-                        r = sd_bus_get_name_creds(m->api_bus, name, SD_BUS_CREDS_UNIQUE_NAME, &creds);
-                        if (r < 0) {
-                                log_full_errno(r == -ENXIO ? LOG_DEBUG : LOG_ERR, r, "Failed to get bus name owner %s: %m", name);
-                                continue;
-                        }
-
-                        r = sd_bus_creds_get_unique_name(creds, &unique);
-                        if (r < 0) {
-                                log_full_errno(r == -ENXIO ? LOG_DEBUG : LOG_ERR, r, "Failed to get unique name for %s: %m", name);
-                                continue;
-                        }
-
-                        /* Now, let's compare that to the previous bus owner, and
-                         * if it's still the same, all is fine, so just don't
-                         * bother the service. Otherwise, the name has apparently
-                         * changed, so synthesize a name owner changed signal. */
-
-                        if (!streq_ptr(unique, s->bus_name_owner))
-                                UNIT_VTABLE(u)->bus_name_owner_change(u, name, s->bus_name_owner, unique);
-                } else {
-                        /* So, the name we're watching is not on the bus.
-                         * This either means it simply hasn't appeared yet,
-                         * or it was lost during the daemon reload.
-                         * Check if the service has a stored name owner,
-                         * and synthesize a name loss signal in this case. */
-
-                        if (s->bus_name_owner)
-                                UNIT_VTABLE(u)->bus_name_owner_change(u, name, s->bus_name_owner, NULL);
-                }
+        if (!*t) {
+                r = sd_bus_track_new(bus, t, NULL, NULL);
+                if (r < 0)
+                        return r;
         }
 
-        return 0;
-}
-
-int manager_enqueue_sync_bus_names(Manager *m) {
-        int r;
-
-        assert(m);
-
-        /* Enqueues a request to synchronize the bus names in a later event loop iteration. The callers generally don't
-         * want us to invoke ->bus_name_owner_change() unit calls from their stack frames as this might result in event
-         * dispatching on its own creating loops, hence we simply create a defer event for the event loop and exit. */
-
-        if (m->sync_bus_names_event_source)
-                return 0;
-
-        r = sd_event_add_defer(m->event, &m->sync_bus_names_event_source, manager_dispatch_sync_bus_names, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create bus name synchronization event: %m");
-
-        r = sd_event_source_set_priority(m->sync_bus_names_event_source, SD_EVENT_PRIORITY_IDLE);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set event priority: %m");
-
-        r = sd_event_source_set_enabled(m->sync_bus_names_event_source, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set even to oneshot: %m");
-
-        (void) sd_event_source_set_description(m->sync_bus_names_event_source, "manager-sync-bus-names");
-        return 0;
+        return bus_track_add_name_many(*t, l);
 }
 
 static int bus_setup_api(Manager *m, sd_bus *bus) {
-        Iterator i;
         char *name;
         Unit *u;
         int r;
@@ -849,7 +786,7 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH_KEY(u, name, m->watch_bus, i) {
+        HASHMAP_FOREACH_KEY(u, name, m->watch_bus) {
                 r = unit_install_bus_match(u, bus, name);
                 if (r < 0)
                         log_error_errno(r, "Failed to subscribe to NameOwnerChanged signal for '%s': %m", name);
@@ -873,7 +810,75 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
+        r = bus_register_malloc_status(bus, "org.freedesktop.systemd1");
+        if (r < 0)
+                log_warning_errno(r, "Failed to register MemoryAllocation1, ignoring: %m");
+
+        m->api_bus_ready = true;
+
         log_debug("Successfully connected to API bus.");
+
+        return 0;
+}
+
+static int api_bus_instance_id_reply(sd_bus_message *reply, void *userdata, sd_bus_error *reterr_error) {
+        Manager *m = ASSERT_PTR(userdata);
+        const sd_bus_error *e;
+        sd_bus *bus;
+        const char *id;
+        int r;
+
+        assert(reply);
+        assert_se(bus = sd_bus_message_get_bus(reply));
+
+        /* Whatever the outcome, we get only one shot at coldplugging the saved subscription state onto
+         * this connection: consume it. */
+        _cleanup_strv_free_ char **subscribed_as_strv = TAKE_PTR(m->subscribed_as_strv);
+        sd_id128_t deserialized_bus_id = m->deserialized_bus_id;
+        m->deserialized_bus_id = SD_ID128_NULL;
+
+        e = sd_bus_message_get_error(reply);
+        if (e) {
+                r = sd_bus_error_get_errno(e);
+                log_full_errno(subscribed_as_strv ? LOG_WARNING : LOG_DEBUG, r,
+                               "Failed to query API bus instance ID%s: %s",
+                               subscribed_as_strv ? ", not deserializing subscriptions" : ", ignoring",
+                               bus_error_message(e, r));
+                goto setup_api;
+        }
+
+        r = sd_bus_message_read_basic(reply, 's', &id);
+        if (r < 0) {
+                log_full_errno(subscribed_as_strv ? LOG_WARNING : LOG_DEBUG, r,
+                               "Failed to read API bus instance ID%s: %m",
+                               subscribed_as_strv ? ", not deserializing subscriptions" : ", ignoring");
+                goto setup_api;
+        }
+
+        r = sd_id128_from_string(id, &m->bus_id);
+        if (r < 0) {
+                log_full_errno(subscribed_as_strv ? LOG_WARNING : LOG_DEBUG, r,
+                               "API bus instance ID not in expected format%s: %m",
+                               subscribed_as_strv ? ", not deserializing subscriptions" : ", ignoring");
+                goto setup_api;
+        }
+
+        /* Coldplug the subscriptions deserialized from a previous reload/reexec (or saved when the
+         * previous connection was torn down), but only onto the same bus instance they were recorded on.
+         * If no instance ID was recorded, retain the historical behavior and coldplug without comparison. */
+        if (sd_id128_is_null(deserialized_bus_id) || sd_id128_equal(m->bus_id, deserialized_bus_id))
+                (void) bus_track_coldplug(bus, &m->subscribed, subscribed_as_strv);
+
+setup_api:
+        r = bus_setup_api(m, bus);
+        if (r < 0) {
+                log_error_errno(r, "Failed to set up API bus: %m");
+
+                if (m->system_bus == bus)
+                        bus_done_system(m);
+                if (m->api_bus == bus)
+                        bus_done_api(m);
+        }
 
         return 0;
 }
@@ -881,6 +886,8 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
 int bus_init_api(Manager *m) {
         _cleanup_(sd_bus_close_unrefp) sd_bus *bus = NULL;
         int r;
+
+        assert(m);
 
         if (m->api_bus)
                 return 0;
@@ -896,7 +903,7 @@ int bus_init_api(Manager *m) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to connect to API bus: %m");
 
-                r = sd_bus_attach_event(bus, m->event, SD_EVENT_PRIORITY_NORMAL);
+                r = sd_bus_attach_event(bus, m->event, EVENT_PRIORITY_IPC);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach API bus to event loop: %m");
 
@@ -905,40 +912,42 @@ int bus_init_api(Manager *m) {
                         return r;
         }
 
-        r = bus_setup_api(m, bus);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set up API bus: %m");
+        /* Query the bus instance ID asynchronously, and let the reply handler decide whether the
+         * subscription state deserialized from a previous reload/reexec (or saved when the previous
+         * connection was torn down) may be coldplugged onto this connection. Set up the API only after the
+         * reply is processed, so new subscriptions cannot be mixed with the pending state before its bus
+         * instance is validated. A synchronous call is not OK here: this is reached on every
+         * (re-)connection attempt, and if the D-Bus socket unit is
+         * listening while the message bus daemon behind it is gone (e.g. it crashed during shutdown while
+         * we still consider its service to be up), a synchronous call over the never-answered connection
+         * blocks the whole manager for BUS_AUTH_TIMEOUT — repeatedly, since every queued bus operation
+         * triggers another reconnection attempt. The previous connection's instance ID is meaningless for
+         * this connection, hence reset it: only ever populate the live ID from the reply, while any pending
+         * validation ID and subscription state remain serializable across a racing reload/reexec. */
+        m->bus_id = SD_ID128_NULL;
+        r = sd_bus_call_method_async(
+                        bus,
+                        /* ret_slot= */ NULL,
+                        "org.freedesktop.DBus",
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "GetId",
+                        api_bus_instance_id_reply,
+                        m,
+                        /* types= */ NULL);
+        if (r < 0) {
+                log_full_errno(m->subscribed_as_strv ? LOG_WARNING : LOG_DEBUG, r,
+                               "Failed to enqueue API bus instance ID query%s: %m",
+                               m->subscribed_as_strv ? ", not deserializing subscriptions" : ", ignoring");
+                m->subscribed_as_strv = strv_free(m->subscribed_as_strv);
+                m->deserialized_bus_id = SD_ID128_NULL;
 
-        m->api_bus = TAKE_PTR(bus);
-
-        r = manager_enqueue_sync_bus_names(m);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
-static int bus_setup_system(Manager *m, sd_bus *bus) {
-        int r;
-
-        assert(m);
-        assert(bus);
-
-        /* if we are a user instance we get the Released message via the system bus */
-        if (MANAGER_IS_USER(m)) {
-                r = sd_bus_match_signal_async(
-                                bus,
-                                NULL,
-                                NULL,
-                                "/org/freedesktop/systemd1/agent",
-                                "org.freedesktop.systemd1.Agent",
-                                "Released",
-                                signal_agent_released, NULL, m);
+                r = bus_setup_api(m, bus);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to request Released match on system bus: %m");
+                        return log_error_errno(r, "Failed to set up API bus: %m");
         }
 
-        log_debug("Successfully connected to system bus.");
+        m->api_bus = TAKE_PTR(bus);
         return 0;
 }
 
@@ -957,7 +966,7 @@ int bus_init_system(Manager *m) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to connect to system bus: %m");
 
-                r = sd_bus_attach_event(bus, m->event, SD_EVENT_PRIORITY_NORMAL);
+                r = sd_bus_attach_event(bus, m->event, EVENT_PRIORITY_IPC);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach system bus to event loop: %m");
 
@@ -966,20 +975,19 @@ int bus_init_system(Manager *m) {
                         return r;
         }
 
-        r = bus_setup_system(m, bus);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set up system bus: %m");
-
         m->system_bus = TAKE_PTR(bus);
+
+        log_debug("Successfully connected to system bus.");
 
         return 0;
 }
 
 int bus_init_private(Manager *m) {
-        _cleanup_close_ int fd = -1;
-        union sockaddr_union sa = {};
+        _cleanup_close_ int fd = -EBADF;
+        union sockaddr_union sa;
+        socklen_t sa_len;
         sd_event_source *s;
-        int r, salen;
+        int r;
 
         assert(m);
 
@@ -992,33 +1000,32 @@ int bus_init_private(Manager *m) {
                 if (getpid_cached() != 1)
                         return 0;
 
-                salen = sockaddr_un_set_path(&sa.un, "/run/systemd/private");
+                r = sockaddr_un_set_path(&sa.un, "/run/systemd/private");
         } else {
-                const char *e, *joined;
+                _cleanup_free_ char *p = NULL;
 
-                e = secure_getenv("XDG_RUNTIME_DIR");
-                if (!e)
-                        return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN),
-                                               "XDG_RUNTIME_DIR is not set, refusing.");
+                p = path_join(m->prefix[EXEC_DIRECTORY_RUNTIME], "systemd/private");
+                if (!p)
+                        return log_oom();
 
-                joined = strjoina(e, "/systemd/private");
-                salen = sockaddr_un_set_path(&sa.un, joined);
+                r = sockaddr_un_set_path(&sa.un, p);
         }
-        if (salen < 0)
-                return log_error_errno(salen, "Can't set path for AF_UNIX socket to bind to: %m");
+        if (r < 0)
+                return log_error_errno(r, "Failed to set socket path for private bus: %m");
+        sa_len = r;
 
-        (void) mkdir_parents_label(sa.un.sun_path, 0755);
         (void) sockaddr_un_unlink(&sa.un);
 
         fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (fd < 0)
                 return log_error_errno(errno, "Failed to allocate private socket: %m");
 
-        r = bind(fd, &sa.sa, salen);
+        WITH_UMASK(0077)
+                r = bind(fd, &sa.sa, sa_len);
         if (r < 0)
                 return log_error_errno(errno, "Failed to bind private socket: %m");
 
-        r = listen(fd, SOMAXCONN);
+        r = listen(fd, SOMAXCONN_DELUXE);
         if (r < 0)
                 return log_error_errno(errno, "Failed to make private socket listening: %m");
 
@@ -1040,7 +1047,6 @@ int bus_init_private(Manager *m) {
 }
 
 static void destroy_bus(Manager *m, sd_bus **bus) {
-        Iterator i;
         Unit *u;
         Job *j;
 
@@ -1051,35 +1057,54 @@ static void destroy_bus(Manager *m, sd_bus **bus) {
                 return;
 
         /* Make sure all bus slots watching names are released. */
-        HASHMAP_FOREACH(u, m->watch_bus, i) {
-                if (!u->match_bus_slot)
-                        continue;
-
-                if (sd_bus_slot_get_bus(u->match_bus_slot) != *bus)
-                        continue;
-
-                u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
+        HASHMAP_FOREACH(u, m->watch_bus) {
+                if (u->match_bus_slot && sd_bus_slot_get_bus(u->match_bus_slot) == *bus)
+                        u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
+                if (u->get_name_owner_slot && sd_bus_slot_get_bus(u->get_name_owner_slot) == *bus)
+                        u->get_name_owner_slot = sd_bus_slot_unref(u->get_name_owner_slot);
         }
 
         /* Get rid of tracked clients on this bus */
-        if (m->subscribed && sd_bus_track_get_bus(m->subscribed) == *bus)
-                m->subscribed = sd_bus_track_unref(m->subscribed);
+        if (m->subscribed && sd_bus_track_get_bus(m->subscribed) == *bus) {
+                _cleanup_strv_free_ char **subscribed = NULL;
+                int r;
 
-        HASHMAP_FOREACH(j, m->jobs, i)
+                r = bus_track_to_strv(m->subscribed, &subscribed);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to serialize api subscribers, ignoring: %m");
+                strv_free_and_replace(m->subscribed_as_strv, subscribed);
+
+                m->deserialized_bus_id = m->bus_id;
+                m->bus_id = SD_ID128_NULL;
+
+                m->subscribed = sd_bus_track_unref(m->subscribed);
+        }
+
+        HASHMAP_FOREACH(j, m->jobs)
                 if (j->bus_track && sd_bus_track_get_bus(j->bus_track) == *bus)
                         j->bus_track = sd_bus_track_unref(j->bus_track);
 
-        HASHMAP_FOREACH(u, m->units, i)
+        HASHMAP_FOREACH(u, m->units) {
                 if (u->bus_track && sd_bus_track_get_bus(u->bus_track) == *bus)
                         u->bus_track = sd_bus_track_unref(u->bus_track);
 
-        /* Get rid of queued message on this bus */
-        if (m->pending_reload_message && sd_bus_message_get_bus(m->pending_reload_message) == *bus)
-                m->pending_reload_message = sd_bus_message_unref(m->pending_reload_message);
+                /* Get rid of pending freezer messages on this bus */
+                if (u->pending_freezer_invocation && sd_bus_message_get_bus(u->pending_freezer_invocation) == *bus)
+                        u->pending_freezer_invocation = sd_bus_message_unref(u->pending_freezer_invocation);
+        }
 
-        /* Possibly flush unwritten data, but only if we are
-         * unprivileged, since we don't want to sync here */
-        if (!MANAGER_IS_SYSTEM(m))
+        /* Get rid of queued message on this bus */
+        if (m->pending_reload_message_dbus && sd_bus_message_get_bus(m->pending_reload_message_dbus) == *bus)
+                m->pending_reload_message_dbus = sd_bus_message_unref(m->pending_reload_message_dbus);
+
+        /* Possibly flush unwritten data, but only if we are unprivileged, since we don't want to sync
+         * here, and only if the connection is currently RUNNING: sd_bus_flush() first drives the
+         * connection to completion via bus_ensure_running(), which blocks us synchronously for up to
+         * BUS_AUTH_TIMEOUT if the peer accepted the connection but never answers authentication (e.g. a
+         * socket-activated D-Bus service that is hung or already gone during session teardown).
+         * sd_bus_flush() only touches the write queue once that step succeeds, so anything queued on a
+         * connection that does not reach RUNNING is discarded either way - not worth blocking for. */
+        if (!MANAGER_IS_SYSTEM(m) && sd_bus_is_ready(*bus) > 0)
                 sd_bus_flush(*bus);
 
         /* And destroy the object */
@@ -1088,6 +1113,8 @@ static void destroy_bus(Manager *m, sd_bus **bus) {
 
 void bus_done_api(Manager *m) {
         destroy_bus(m, &m->api_bus);
+
+        m->api_bus_ready = false;
 }
 
 void bus_done_system(Manager *m) {
@@ -1104,7 +1131,7 @@ void bus_done_private(Manager *m) {
 
         m->private_buses = set_free(m->private_buses);
 
-        m->private_listen_event_source = sd_event_source_unref(m->private_listen_event_source);
+        m->private_listen_event_source = sd_event_source_disable_unref(m->private_listen_event_source);
         m->private_listen_fd = safe_close(m->private_listen_fd);
 }
 
@@ -1117,12 +1144,10 @@ void bus_done(Manager *m) {
 
         assert(!m->subscribed);
 
-        m->deserialized_subscribed = strv_free(m->deserialized_subscribed);
-        bus_verify_polkit_async_registry_free(m->polkit_registry);
+        m->polkit_registry = hashmap_free(m->polkit_registry);
 }
 
 int bus_fdset_add_all(Manager *m, FDSet *fds) {
-        Iterator i;
         sd_bus *b;
         int fd;
 
@@ -1131,7 +1156,7 @@ int bus_fdset_add_all(Manager *m, FDSet *fds) {
 
         /* When we are about to reexecute we add all D-Bus fds to the
          * set to pass over to the newly executed systemd. They won't
-         * be used there however, except thatt they are closed at the
+         * be used there however, except that they are closed at the
          * very end of deserialization, those making it possible for
          * clients to synchronously wait for systemd to reexec by
          * simply waiting for disconnection */
@@ -1145,7 +1170,7 @@ int bus_fdset_add_all(Manager *m, FDSet *fds) {
                 }
         }
 
-        SET_FOREACH(b, m->private_buses, i) {
+        SET_FOREACH(b, m->private_buses) {
                 fd = sd_bus_get_fd(b);
                 if (fd >= 0) {
                         fd = fdset_put_dup(fds, fd);
@@ -1167,32 +1192,29 @@ int bus_foreach_bus(
                 int (*send_message)(sd_bus *bus, void *userdata),
                 void *userdata) {
 
-        Iterator i;
-        sd_bus *b;
-        int r, ret = 0;
+        int r = 0;
+
+        assert(m);
+        assert(send_message);
 
         /* Send to all direct buses, unconditionally */
-        SET_FOREACH(b, m->private_buses, i) {
+        sd_bus *b;
+        SET_FOREACH(b, m->private_buses) {
 
-                /* Don't bother with enqueing these messages to clients that haven't started yet */
+                /* Don't bother with enqueuing these messages to clients that haven't started yet */
                 if (sd_bus_is_ready(b) <= 0)
                         continue;
 
-                r = send_message(b, userdata);
-                if (r < 0)
-                        ret = r;
+                RET_GATHER(r, send_message(b, userdata));
         }
 
         /* Send to API bus, but only if somebody is subscribed */
         if (m->api_bus &&
             (sd_bus_track_count(m->subscribed) > 0 ||
-             sd_bus_track_count(subscribed2) > 0)) {
-                r = send_message(m->api_bus, userdata);
-                if (r < 0)
-                        ret = r;
-        }
+             sd_bus_track_count(subscribed2) > 0))
+                RET_GATHER(r, send_message(m->api_bus, userdata));
 
-        return ret;
+        return r;
 }
 
 void bus_track_serialize(sd_bus_track *t, FILE *f, const char *prefix) {
@@ -1210,56 +1232,14 @@ void bus_track_serialize(sd_bus_track *t, FILE *f, const char *prefix) {
         }
 }
 
-int bus_track_coldplug(Manager *m, sd_bus_track **t, bool recursive, char **l) {
-        int r = 0;
-
-        assert(m);
-        assert(t);
-
-        if (strv_isempty(l))
-                return 0;
-
-        if (!m->api_bus)
-                return 0;
-
-        if (!*t) {
-                r = sd_bus_track_new(m->api_bus, t, NULL, NULL);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_bus_track_set_recursive(*t, recursive);
-        if (r < 0)
-                return r;
-
-        return bus_track_add_name_many(*t, l);
-}
-
-int bus_verify_manage_units_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
-        return bus_verify_polkit_async(call, CAP_SYS_ADMIN, "org.freedesktop.systemd1.manage-units", NULL, false, UID_INVALID, &m->polkit_registry, error);
-}
-
-int bus_verify_manage_unit_files_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
-        return bus_verify_polkit_async(call, CAP_SYS_ADMIN, "org.freedesktop.systemd1.manage-unit-files", NULL, false, UID_INVALID, &m->polkit_registry, error);
-}
-
-int bus_verify_reload_daemon_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
-        return bus_verify_polkit_async(call, CAP_SYS_ADMIN, "org.freedesktop.systemd1.reload-daemon", NULL, false, UID_INVALID, &m->polkit_registry, error);
-}
-
-int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
-        return bus_verify_polkit_async(call, CAP_SYS_ADMIN, "org.freedesktop.systemd1.set-environment", NULL, false, UID_INVALID, &m->polkit_registry, error);
-}
-
 uint64_t manager_bus_n_queued_write(Manager *m) {
         uint64_t c = 0;
-        Iterator i;
         sd_bus *b;
         int r;
 
         /* Returns the total number of messages queued for writing on all our direct and API buses. */
 
-        SET_FOREACH(b, m->private_buses, i) {
+        SET_FOREACH(b, m->private_buses) {
                 uint64_t k;
 
                 r = sd_bus_get_n_queued_write(b, &k);
@@ -1301,6 +1281,7 @@ void dump_bus_properties(FILE *f) {
         vtable_dump_bus_properties(f, bus_cgroup_vtable);
         vtable_dump_bus_properties(f, bus_device_vtable);
         vtable_dump_bus_properties(f, bus_exec_vtable);
+        vtable_dump_bus_properties(f, bus_unit_exec_vtable);
         vtable_dump_bus_properties(f, bus_job_vtable);
         vtable_dump_bus_properties(f, bus_kill_vtable);
         vtable_dump_bus_properties(f, bus_manager_vtable);

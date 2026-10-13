@@ -1,22 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "alloc-util.h"
 #include "bitmap.h"
-#include "hashmap.h"
-#include "macro.h"
 #include "memory-util.h"
-
-struct Bitmap {
-        uint64_t *bitmaps;
-        size_t n_bitmaps;
-        size_t bitmaps_allocated;
-};
 
 /* Bitmaps are only meant to store relatively small numbers
  * (corresponding to, say, an enum), so it is ok to limit
@@ -24,17 +12,17 @@ struct Bitmap {
 #define BITMAPS_MAX_ENTRY 0xffff
 
 /* This indicates that we reached the end of the bitmap */
-#define BITMAP_END ((unsigned) -1)
+#define BITMAP_END (UINT_MAX)
 
 #define BITMAP_NUM_TO_OFFSET(n)           ((n) / (sizeof(uint64_t) * 8))
 #define BITMAP_NUM_TO_REM(n)              ((n) % (sizeof(uint64_t) * 8))
 #define BITMAP_OFFSET_TO_NUM(offset, rem) ((offset) * sizeof(uint64_t) * 8 + (rem))
 
-Bitmap *bitmap_new(void) {
+Bitmap* bitmap_new(void) {
         return new0(Bitmap, 1);
 }
 
-Bitmap *bitmap_copy(Bitmap *b) {
+Bitmap* bitmap_copy(Bitmap *b) {
         Bitmap *ret;
 
         ret = bitmap_new();
@@ -45,16 +33,16 @@ Bitmap *bitmap_copy(Bitmap *b) {
         if (!ret->bitmaps)
                 return mfree(ret);
 
-        ret->n_bitmaps = ret->bitmaps_allocated = b->n_bitmaps;
+        ret->n_bitmaps = b->n_bitmaps;
         return ret;
 }
 
-void bitmap_free(Bitmap *b) {
+Bitmap* bitmap_free(Bitmap *b) {
         if (!b)
-                return;
+                return NULL;
 
         free(b->bitmaps);
-        free(b);
+        return mfree(b);
 }
 
 int bitmap_ensure_allocated(Bitmap **b) {
@@ -87,7 +75,7 @@ int bitmap_set(Bitmap *b, unsigned n) {
         offset = BITMAP_NUM_TO_OFFSET(n);
 
         if (offset >= b->n_bitmaps) {
-                if (!GREEDY_REALLOC0(b->bitmaps, b->bitmaps_allocated, offset + 1))
+                if (!GREEDY_REALLOC0(b->bitmaps, offset + 1))
                         return -ENOMEM;
 
                 b->n_bitmaps = offset + 1;
@@ -117,7 +105,7 @@ void bitmap_unset(Bitmap *b, unsigned n) {
         b->bitmaps[offset] &= ~bitmask;
 }
 
-bool bitmap_isset(Bitmap *b, unsigned n) {
+bool bitmap_isset(const Bitmap *b, unsigned n) {
         uint64_t bitmask;
         unsigned offset;
 
@@ -134,30 +122,27 @@ bool bitmap_isset(Bitmap *b, unsigned n) {
         return !!(b->bitmaps[offset] & bitmask);
 }
 
-bool bitmap_isclear(Bitmap *b) {
-        unsigned i;
+bool bitmap_isclear(const Bitmap *b) {
 
         if (!b)
                 return true;
 
-        for (i = 0; i < b->n_bitmaps; i++)
-                if (b->bitmaps[i] != 0)
+        FOREACH_ARRAY(i, b->bitmaps, b->n_bitmaps)
+                if (*i != 0)
                         return false;
 
         return true;
 }
 
 void bitmap_clear(Bitmap *b) {
-
         if (!b)
                 return;
 
         b->bitmaps = mfree(b->bitmaps);
         b->n_bitmaps = 0;
-        b->bitmaps_allocated = 0;
 }
 
-bool bitmap_iterate(Bitmap *b, Iterator *i, unsigned *n) {
+bool bitmap_iterate(const Bitmap *b, Iterator *i, unsigned *n) {
         uint64_t bitmask;
         unsigned offset, rem;
 
@@ -171,9 +156,9 @@ bool bitmap_iterate(Bitmap *b, Iterator *i, unsigned *n) {
         rem = BITMAP_NUM_TO_REM(i->idx);
         bitmask = UINT64_C(1) << rem;
 
-        for (; offset < b->n_bitmaps; offset ++) {
+        for (; offset < b->n_bitmaps; offset++) {
                 if (b->bitmaps[offset]) {
-                        for (; bitmask; bitmask <<= 1, rem ++) {
+                        for (; bitmask; bitmask <<= 1, rem++) {
                                 if (b->bitmaps[offset] & bitmask) {
                                         *n = BITMAP_OFFSET_TO_NUM(offset, rem);
                                         i->idx = *n + 1;
@@ -192,10 +177,9 @@ bool bitmap_iterate(Bitmap *b, Iterator *i, unsigned *n) {
         return false;
 }
 
-bool bitmap_equal(Bitmap *a, Bitmap *b) {
+bool bitmap_equal(const Bitmap *a, const Bitmap *b) {
         size_t common_n_bitmaps;
-        Bitmap *c;
-        unsigned i;
+        const Bitmap *c;
 
         if (a == b)
                 return true;
@@ -211,7 +195,7 @@ bool bitmap_equal(Bitmap *a, Bitmap *b) {
                 return false;
 
         c = a->n_bitmaps > b->n_bitmaps ? a : b;
-        for (i = common_n_bitmaps; i < c->n_bitmaps; i++)
+        for (unsigned i = common_n_bitmaps; i < c->n_bitmaps; i++)
                 if (c->bitmaps[i] != 0)
                         return false;
 

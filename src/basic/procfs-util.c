@@ -1,71 +1,53 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
-#include "def.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "log.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "procfs-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "time-util.h"
 
-int procfs_tasks_get_limit(uint64_t *ret) {
+int procfs_get_pid_max(uint64_t *ret) {
         _cleanup_free_ char *value = NULL;
-        uint64_t pid_max, threads_max;
         int r;
 
         assert(ret);
-
-        /* So there are two sysctl files that control the system limit of processes:
-         *
-         * 1. kernel.threads-max: this is probably the sysctl that makes more sense, as it directly puts a limit on
-         *    concurrent tasks.
-         *
-         * 2. kernel.pid_max: this limits the numeric range PIDs can take, and thus indirectly also limits the number
-         *    of concurrent threads. AFAICS it's primarily a compatibility concept: some crappy old code used a signed
-         *    16bit type for PIDs, hence the kernel provides a way to ensure the PIDs never go beyond INT16_MAX by
-         *    default.
-         *
-         * By default #2 is set to much lower values than #1, hence the limit people come into contact with first, as
-         * it's the lowest boundary they need to bump when they want higher number of processes.
-         *
-         * Also note the weird definition of #2: PIDs assigned will be kept below this value, which means the number of
-         * tasks that can be created is one lower, as PID 0 is not a valid process ID. */
 
         r = read_one_line_file("/proc/sys/kernel/pid_max", &value);
         if (r < 0)
                 return r;
 
-        r = safe_atou64(value, &pid_max);
-        if (r < 0)
-                return r;
+        return safe_atou64(value, ret);
+}
 
-        value = mfree(value);
+int procfs_get_threads_max(uint64_t *ret) {
+        _cleanup_free_ char *value = NULL;
+        int r;
+
+        assert(ret);
+
         r = read_one_line_file("/proc/sys/kernel/threads-max", &value);
         if (r < 0)
                 return r;
 
-        r = safe_atou64(value, &threads_max);
-        if (r < 0)
-                return r;
-
-        /* Subtract one from pid_max, since PID 0 is not a valid PID */
-        *ret = MIN(pid_max-1, threads_max);
-        return 0;
+        return safe_atou64(value, ret);
 }
 
 int procfs_tasks_set_limit(uint64_t limit) {
         char buffer[DECIMAL_STR_MAX(uint64_t)+1];
-        _cleanup_free_ char *value = NULL;
         uint64_t pid_max;
         int r;
 
         if (limit == 0) /* This makes no sense, we are userspace and hence count as tasks too, and we want to live,
                          * hence the limit conceptually has to be above 0. Also, most likely if anyone asks for a zero
-                         * limit he/she probably means "no limit", hence let's better refuse this to avoid
+                         * limit they probably mean "no limit", hence let's better refuse this to avoid
                          * confusion. */
                 return -EINVAL;
 
@@ -74,23 +56,20 @@ int procfs_tasks_set_limit(uint64_t limit) {
          * set it to the maximum. */
         limit = CLAMP(limit, 20U, TASKS_MAX);
 
-        r = read_one_line_file("/proc/sys/kernel/pid_max", &value);
-        if (r < 0)
-                return r;
-        r = safe_atou64(value, &pid_max);
+        r = procfs_get_pid_max(&pid_max);
         if (r < 0)
                 return r;
 
         /* As pid_max is about the numeric pid_t range we'll bump it if necessary, but only ever increase it, never
          * decrease it, as threads-max is the much more relevant sysctl. */
         if (limit > pid_max-1) {
-                sprintf(buffer, "%" PRIu64, limit+1); /* Add one, since PID 0 is not a valid PID */
+                xsprintf(buffer, "%" PRIu64, limit+1); /* Add one, since PID 0 is not a valid PID */
                 r = write_string_file("/proc/sys/kernel/pid_max", buffer, WRITE_STRING_FILE_DISABLE_BUFFER);
                 if (r < 0)
                         return r;
         }
 
-        sprintf(buffer, "%" PRIu64, limit);
+        xsprintf(buffer, "%" PRIu64, limit);
         r = write_string_file("/proc/sys/kernel/threads-max", buffer, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0) {
                 uint64_t threads_max;
@@ -98,14 +77,10 @@ int procfs_tasks_set_limit(uint64_t limit) {
                 /* Hmm, we couldn't write this? If so, maybe it was already set properly? In that case let's not
                  * generate an error */
 
-                value = mfree(value);
-                if (read_one_line_file("/proc/sys/kernel/threads-max", &value) < 0)
+                if (procfs_get_threads_max(&threads_max) < 0)
                         return r; /* return original error */
 
-                if (safe_atou64(value, &threads_max) < 0)
-                        return r; /* return original error */
-
-                if (MIN(pid_max-1, threads_max) != limit)
+                if (MIN(pid_max - 1, threads_max) != limit)
                         return r; /* return original error */
 
                 /* Yay! Value set already matches what we were trying to set, hence consider this a success. */
@@ -134,7 +109,7 @@ int procfs_tasks_get_current(uint64_t *ret) {
 
         p++;
         n = strspn(p, DIGITS);
-        nr = strndupa(p, n);
+        nr = strndupa_safe(p, n);
 
         return safe_atou64(nr, ret);
 }
@@ -153,13 +128,36 @@ static uint64_t calc_gcd64(uint64_t a, uint64_t b) {
         return a;
 }
 
+nsec_t procfs_ticks_to_nsec(uint64_t ticks) {
+        uint64_t ticks_per_second = sysconf_clock_ticks_cached(),
+                gcd = calc_gcd64(NSEC_PER_SEC, ticks_per_second);
+
+        /* Reduce NSEC_PER_SEC/ticks_per_second first to avoid overflow of ticks * NSEC_PER_SEC, and split
+         * the multiplication into whole and remainder parts, so that the result stays exact.
+         *
+         * Note that in most cases b == 1 and the second term is trivial. */
+        uint64_t a = NSEC_PER_SEC / gcd,
+                 b = ticks_per_second / gcd;
+
+        return ticks / b * a + DIV_ROUND_UP(ticks % b * a, b);
+}
+
 int procfs_cpu_get_usage(nsec_t *ret) {
+        int r;
+
+        assert(ret);
+
+        ProcfsCpuTicks ticks;
+        r = procfs_cpu_get_ticks(&ticks);
+        if (r < 0)
+                return r;
+
+        *ret = procfs_ticks_to_nsec(ticks.user + ticks.nice + ticks.system + ticks.irq + ticks.softirq);
+        return 0;
+}
+
+int procfs_cpu_get_ticks(ProcfsCpuTicks *ret) {
         _cleanup_free_ char *first_line = NULL;
-        unsigned long user_ticks, nice_ticks, system_ticks, irq_ticks, softirq_ticks,
-                guest_ticks = 0, guest_nice_ticks = 0;
-        long ticks_per_second;
-        uint64_t sum, gcd, a, b;
-        const char *p;
         int r;
 
         assert(ret);
@@ -168,41 +166,66 @@ int procfs_cpu_get_usage(nsec_t *ret) {
         if (r < 0)
                 return r;
 
-        p = first_word(first_line, "cpu");
+        const char *p = first_word(first_line, "cpu");
         if (!p)
                 return -EINVAL;
 
-        if (sscanf(p, "%lu %lu %lu %*u %*u %lu %lu %*u %lu %lu",
-                   &user_ticks,
-                   &nice_ticks,
-                   &system_ticks,
-                   &irq_ticks,
-                   &softirq_ticks,
-                   &guest_ticks,
-                   &guest_nice_ticks) < 5) /* we only insist on the first five fields */
+        /* All eight fields exist on any kernel we support: iowait was added in 2.5.41, steal in 2.6.11.
+         * "guest" and "guest_nice" are not returned, the kernel already includes them in "user" and "nice".
+         * Nevertheless, this file might be synthesized slopilly, so let's not require the last three fields.
+         * We don't care about them in most cases anyway. */
+        ProcfsCpuTicks t = {};
+        r = sscanf(p, "%"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64" %"SCNu64,
+                   &t.user,
+                   &t.nice,
+                   &t.system,
+                   &t.idle,
+                   &t.iowait,
+                   &t.irq,
+                   &t.softirq,
+                   &t.steal);
+        if (r < 5)
+                return -EINVAL;
+        if (r < 8)
+                log_once(LOG_INFO, "Short read (%d fields) from /proc/stat, continuing.", r);
+
+        *ret = t;
+        return 0;
+}
+
+int convert_meminfo_value_to_uint64_bytes(const char *s, uint64_t *ret) {
+        _cleanup_free_ char *w = NULL;
+        uint64_t v;
+        int r;
+
+        assert(s);
+        assert(ret);
+
+        r = extract_first_word(&s, &w, /* separators= */ NULL, /* flags= */ 0);
+        if (r < 0)
+                return r;
+        if (r == 0)
                 return -EINVAL;
 
-        ticks_per_second = sysconf(_SC_CLK_TCK);
-        if (ticks_per_second  < 0)
-                return -errno;
-        assert(ticks_per_second > 0);
+        /* Ensure the line ends in "kB" */
+        if (!streq(s, "kB"))
+                return -EINVAL;
 
-        sum = (uint64_t) user_ticks + (uint64_t) nice_ticks + (uint64_t) system_ticks +
-                (uint64_t) irq_ticks + (uint64_t) softirq_ticks +
-                (uint64_t) guest_ticks + (uint64_t) guest_nice_ticks;
+        r = safe_atou64(w, &v);
+        if (r < 0)
+                return r;
+        if (v == UINT64_MAX)
+                return -EINVAL;
 
-        /* Let's reduce this fraction before we apply it to avoid overflows when converting this to µsec */
-        gcd = calc_gcd64(NSEC_PER_SEC, ticks_per_second);
+        if (!MUL_ASSIGN_SAFE(&v, U64_KB))
+                return -EOVERFLOW;
 
-        a = (uint64_t) NSEC_PER_SEC / gcd;
-        b = (uint64_t) ticks_per_second / gcd;
-
-        *ret = DIV_ROUND_UP((nsec_t) sum * (nsec_t) a, (nsec_t) b);
+        *ret = v;
         return 0;
 }
 
 int procfs_memory_get(uint64_t *ret_total, uint64_t *ret_used) {
-        uint64_t mem_total = UINT64_MAX, mem_free = UINT64_MAX;
+        uint64_t mem_total = UINT64_MAX, mem_available = UINT64_MAX;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
@@ -213,8 +236,7 @@ int procfs_memory_get(uint64_t *ret_total, uint64_t *ret_used) {
         for (;;) {
                 _cleanup_free_ char *line = NULL;
                 uint64_t *v;
-                char *p, *e;
-                size_t n;
+                char *p;
 
                 r = read_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
@@ -226,43 +248,27 @@ int procfs_memory_get(uint64_t *ret_total, uint64_t *ret_used) {
                 if (p)
                         v = &mem_total;
                 else {
-                        p = first_word(line, "MemFree:");
+                        p = first_word(line, "MemAvailable:");
                         if (p)
-                                v = &mem_free;
+                                v = &mem_available;
                         else
                                 continue;
                 }
 
-                /* Determine length of numeric value */
-                n = strspn(p, DIGITS);
-                if (n == 0)
-                        return -EINVAL;
-                e = p + n;
-
-                /* Ensure the line ends in " kB" */
-                n = strspn(e, WHITESPACE);
-                if (n == 0)
-                        return -EINVAL;
-                if (!streq(e + n, "kB"))
-                        return -EINVAL;
-
-                *e = 0;
-                r = safe_atou64(p, v);
+                r = convert_meminfo_value_to_uint64_bytes(p, v);
                 if (r < 0)
                         return r;
-                if (*v == UINT64_MAX)
-                        return -EINVAL;
 
-                if (mem_total != UINT64_MAX && mem_free != UINT64_MAX)
+                if (mem_total != UINT64_MAX && mem_available != UINT64_MAX)
                         break;
         }
 
-        if (mem_free > mem_total)
+        if (mem_available > mem_total)
                 return -EINVAL;
 
         if (ret_total)
-                *ret_total = mem_total * 1024U;
+                *ret_total = mem_total;
         if (ret_used)
-                *ret_used = (mem_total - mem_free) * 1024U;
+                *ret_used = mem_total - mem_available;
         return 0;
 }

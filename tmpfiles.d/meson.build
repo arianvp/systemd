@@ -1,54 +1,65 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-enable_tmpfiles = conf.get('ENABLE_TMPFILES') == 1
+if conf.get('ENABLE_TMPFILES') != 1
+        subdir_done()
+endif
 
-tmpfiles = [['home.conf',            ''],
-            ['journal-nocow.conf',   ''],
-            ['systemd-nologin.conf', 'HAVE_PAM'],
-            ['systemd-nspawn.conf',  'ENABLE_MACHINED'],
-            ['systemd-tmp.conf',     ''],
-            ['portables.conf',       'ENABLE_PORTABLED'],
-            ['tmp.conf',             ''],
-            ['x11.conf',             ''],
-            ['legacy.conf',          'HAVE_SYSV_COMPAT'],
-           ]
+files = [['README'                                  ],
+         ['home.conf'                               ],
+         ['root.conf'                               ],
+         ['journal-nocow.conf'                      ],
+         ['portables.conf',       'ENABLE_PORTABLED'],
+         ['systemd-network.conf', 'ENABLE_NETWORKD' ],
+         ['systemd-nologin.conf', 'HAVE_PAM'        ],
+         ['systemd-nspawn.conf',  'ENABLE_MACHINED' ],
+         ['systemd-pstore.conf',  'ENABLE_PSTORE'   ],
+         ['systemd-resolve.conf', 'ENABLE_RESOLVE'  ],
+         ['20-systemd-varlink.conf'                 ],
+         ['systemd-tmp.conf'                        ],
+         ['tmp.conf'                                ],
+         ['x11.conf'                                ],
+         ['provision.conf'                          ],
+         ['credstore.conf'                          ],
+        ]
 
-foreach pair : tmpfiles
-        if not enable_tmpfiles
-                # do nothing
-        elif pair[1] == '' or conf.get(pair[1]) == 1
-                install_data(pair[0], install_dir : tmpfilesdir)
+foreach f : files
+        if f.length() == 1 or conf.get(f[1]) == 1
+                install_data(f[0], install_dir : tmpfilesdir)
         else
                 message('Not installing tmpfiles.d/@0@ because @1@ is @2@'
-                        .format(pair[0], pair[1], conf.get(pair[1], 0)))
+                        .format(f[0], f[1], conf.get(f[1], 0)))
         endif
 endforeach
 
-m4_files = [['etc.conf',             ''],
-            ['systemd.conf',         ''],
-            ['var.conf',             ''],
-           ]
+in_files = [
+        ['20-systemd-shell-extra.conf',   'LINK_SHELL_EXTRA_DROPIN'      ],
+        ['20-systemd-osc-context.conf',   'LINK_OSC_CONTEXT_DROPIN'      ],
+        ['20-systemd-ssh-generator.conf', 'ENABLE_SSH_PROXY_CONFIG'      ],
+        ['20-systemd-stub.conf',          'ENABLE_EFI'                   ],
+        ['20-systemd-userdb.conf',        'ENABLE_SSH_USERDB_CONFIG'     ],
+        ['etc.conf'                                                      ],
+        ['legacy.conf',                   'ENABLE_COMPAT_SYSV_INTERFACES'],
+        ['static-nodes-permissions.conf'                                 ],
+        ['systemd.conf'                                                  ],
+        ['var.conf'                                                      ],
+]
 
-foreach pair : m4_files
-        if not enable_tmpfiles
-                # do nothing
-        elif pair[1] == '' or conf.get(pair[1]) == 1
+foreach f : in_files
+        if f.length() == 1 or conf.get(f[1]) == 1
                 custom_target(
-                        'tmpfiles.d_' + pair[0],
-                         input : pair[0] + '.m4',
-                         output: pair[0],
-                         command : [meson_apply_m4, config_h, '@INPUT@'],
-                         capture : true,
-                         install : true,
-                         install_dir : tmpfilesdir)
+                        input : f[0] + '.in',
+                        output: f[0],
+                        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+                        install : true,
+                        install_dir : tmpfilesdir)
         else
-                message('Not installing tmpfiles.d/@0@.m4 because @1@ is @2@'
-                        .format(pair[0], pair[1], conf.get(pair[1], 0)))
+                message('Not installing tmpfiles.d/@0@ because @1@ is @2@'
+                        .format(f[0], f[1], conf.get(f[1], 0)))
         endif
 endforeach
 
-if enable_tmpfiles
-        meson.add_install_script(
-                'sh', '-c',
-                mkdir_p.format(join_paths(sysconfdir, 'tmpfiles.d')))
+if install_sysconfdir
+        install_emptydir(sysconfdir / 'tmpfiles.d')
 endif
+
+subdir('user')

@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -12,12 +12,12 @@ Description=Process Core Dump
 Documentation=man:systemd-coredump(8)
 DefaultDependencies=no
 Conflicts=shutdown.target
-After=systemd-remount-fs.service systemd-journald.socket
+After=systemd-journald.socket
 Requires=systemd-journald.socket
 Before=shutdown.target
 
 [Service]
-ExecStart=-@rootlibexecdir@/systemd-coredump
+ExecStart=-{{LIBEXECDIR}}/systemd-coredump
 IPAddressDeny=any
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -26,19 +26,18 @@ NoNewPrivileges=yes
 OOMScoreAdjust=500
 PrivateDevices=yes
 PrivateNetwork=yes
-PrivateTmp=yes
+PrivateTmp=disconnected
 ProtectControlGroups=yes
-ProtectHome=yes
+ProtectHome=read-only
 ProtectHostname=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
+ProtectKernelLogs=yes
 ProtectSystem=strict
 RestrictAddressFamilies=AF_UNIX
-RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 RuntimeMaxSec=5min
 StateDirectory=systemd/coredump
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service @mount

@@ -1,6 +1,16 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <unistd.h>
+
+#include "sd-bus.h"
+#include "sd-journal.h"
 
 #include "acl-util.h"
+#include "alloc-util.h"
+#include "bus-error.h"
+#include "bus-locator.h"
+#include "bus-util.h"
+#include "fd-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
 #include "journal-internal.h"
@@ -10,10 +20,6 @@
 #include "user-util.h"
 
 static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
-#if HAVE_ACL
-        _cleanup_strv_free_ char **g = NULL;
-        const char* dir;
-#endif
         int r;
 
         assert(j);
@@ -31,7 +37,10 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
                 return 0;
 
 #if HAVE_ACL
-        if (laccess("/run/log/journal", F_OK) >= 0)
+        _cleanup_strv_free_ char **g = NULL;
+        const char* dir;
+
+        if (access_nofollow("/run/log/journal", F_OK) >= 0)
                 dir = "/run/log/journal";
         else
                 dir = "/var/log/journal";
@@ -55,8 +64,7 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
                 if (r < 0)
                         return log_oom();
 
-                strv_sort(g);
-                strv_uniq(g);
+                strv_sort_uniq(g);
 
                 s = strv_join(g, "', '");
                 if (!s)
@@ -80,8 +88,11 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
         return 1;
 }
 
+int journal_access_blocked(sd_journal *j) {
+        return hashmap_contains(j->errors, INT_TO_PTR(-EACCES));
+}
+
 int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_users) {
-        Iterator it;
         void *code;
         char *path;
         int r = 0;
@@ -95,7 +106,7 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
                 return 0;
         }
 
-        if (hashmap_contains(j->errors, INT_TO_PTR(-EACCES))) {
+        if (journal_access_blocked(j)) {
                 if (!quiet)
                         (void) access_check_var_log_journal(j, want_other_users);
 
@@ -103,10 +114,10 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
                         r = log_error_errno(EACCES, "No journal files were opened due to insufficient permissions.");
         }
 
-        HASHMAP_FOREACH_KEY(path, code, j->errors, it) {
+        HASHMAP_FOREACH_KEY(path, code, j->errors) {
                 int err;
 
-                err = abs(PTR_TO_INT(code));
+                err = ABS(PTR_TO_INT(code));
 
                 switch (err) {
                 case EACCES:
@@ -126,49 +137,56 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
                         log_warning_errno(err, "Journal file %s corrupted, ignoring file.", path);
                         break;
 
+                case ETOOMANYREFS:
+                        log_warning_errno(err, "Too many journal files (limit is at %u) in scope, ignoring file '%s'.", JOURNAL_FILES_MAX, path);
+                        break;
+
                 default:
                         log_warning_errno(err, "An error was encountered while opening journal file or directory %s, ignoring file: %m", path);
-                        break;
                 }
         }
 
         return r;
 }
 
-bool journal_field_valid(const char *p, size_t l, bool allow_protected) {
-        const char *a;
+int journal_open_machine(sd_journal **ret, const char *machine, int flags) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_journal_closep) sd_journal *j = NULL;
+        _cleanup_close_ int machine_fd = -EBADF;
+        int fd, r;
 
-        /* We kinda enforce POSIX syntax recommendations for
-           environment variables here, but make a couple of additional
-           requirements.
+        assert(ret);
+        assert(machine);
 
-           http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap08.html */
+        if (geteuid() != 0)
+                /* The file descriptor returned by OpenMachineRootDirectory() will be owned by users/groups of
+                 * the container, thus we need root privileges to override them. */
+                return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Using the --machine= switch requires root privileges.");
 
-        if (l == (size_t) -1)
-                l = strlen(p);
+        r = sd_bus_open_system(&bus);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open system bus: %m");
 
-        /* No empty field names */
-        if (l <= 0)
-                return false;
+        r = bus_call_method(bus, bus_machine_mgr, "OpenMachineRootDirectory", &error, &reply, "s", machine);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open root directory of machine '%s': %s",
+                                       machine, bus_error_message(&error, r));
 
-        /* Don't allow names longer than 64 chars */
-        if (l > 64)
-                return false;
+        r = sd_bus_message_read(reply, "h", &fd);
+        if (r < 0)
+                return bus_log_parse_error(r);
 
-        /* Variables starting with an underscore are protected */
-        if (!allow_protected && p[0] == '_')
-                return false;
+        machine_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (machine_fd < 0)
+                return log_error_errno(errno, "Failed to duplicate file descriptor: %m");
 
-        /* Don't allow digits as first character */
-        if (p[0] >= '0' && p[0] <= '9')
-                return false;
+        r = sd_journal_open_directory_fd(&j, machine_fd, SD_JOURNAL_OS_ROOT | SD_JOURNAL_TAKE_DIRECTORY_FD | flags);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open journal in machine '%s': %m", machine);
 
-        /* Only allow A-Z0-9 and '_' */
-        for (a = p; a < p + l; a++)
-                if ((*a < 'A' || *a > 'Z') &&
-                    (*a < '0' || *a > '9') &&
-                    *a != '_')
-                        return false;
-
-        return true;
+        TAKE_FD(machine_fd);
+        *ret = TAKE_PTR(j);
+        return 0;
 }

@@ -1,8 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
+#include "forward.h"
 
-#include "path-lookup.h"
-
-int verify_units(char **filenames, UnitFileScope scope, bool check_man, bool run_generators);
+int verb_verify(int argc, char *argv[], uintptr_t _data, void *userdata);

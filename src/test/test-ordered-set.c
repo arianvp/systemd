@@ -1,12 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <stdio.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "ordered-set.h"
-#include "string-util.h"
 #include "strv.h"
+#include "tests.h"
 
-static void test_set_steal_first(void) {
+TEST(set_steal_first) {
         _cleanup_ordered_set_free_ OrderedSet *m = NULL;
         int seen[3] = {};
         char *val;
@@ -39,14 +37,18 @@ static void item_seen(Item *item) {
 
 DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(item_hash_ops, void, trivial_hash_func, trivial_compare_func, Item, item_seen);
 
-static void test_set_free_with_hash_ops(void) {
+TEST(set_free_with_hash_ops) {
         OrderedSet *m;
         struct Item items[4] = {};
-        unsigned i;
 
         assert_se(m = ordered_set_new(&item_hash_ops));
-        for (i = 0; i < ELEMENTSOF(items) - 1; i++)
-                assert_se(ordered_set_put(m, items + i) == 1);
+
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(ordered_set_put(m, item) == 1);
+
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(ordered_set_put(m, item) == 0);  /* We get 0 here, because we use trivial hash
+                                                                 * ops. Also see below... */
 
         m = ordered_set_free(m);
         assert_se(items[0].seen == 1);
@@ -55,9 +57,9 @@ static void test_set_free_with_hash_ops(void) {
         assert_se(items[3].seen == 0);
 }
 
-static void test_set_put(void) {
+TEST(set_put) {
         _cleanup_ordered_set_free_ OrderedSet *m = NULL;
-        _cleanup_free_ char **t = NULL;
+        _cleanup_free_ char **t = NULL, *str = NULL;
 
         m = ordered_set_new(&string_hash_ops);
         assert_se(m);
@@ -71,51 +73,38 @@ static void test_set_put(void) {
         assert_se(ordered_set_put(m, (void*) "333") == 0);
         assert_se(ordered_set_put(m, (void*) "22") == 0);
 
+        assert_se(str = strdup("333"));
+        assert_se(ordered_set_put(m, str) == -EEXIST); /* ... and we get -EEXIST here, because we use
+                                                        * non-trivial hash ops. */
+
         assert_se(t = ordered_set_get_strv(m));
-        assert_se(streq(t[0], "1"));
-        assert_se(streq(t[1], "22"));
-        assert_se(streq(t[2], "333"));
+        ASSERT_STREQ(t[0], "1");
+        ASSERT_STREQ(t[1], "22");
+        ASSERT_STREQ(t[2], "333");
         assert_se(!t[3]);
 
         ordered_set_print(stdout, "FOO=", m);
 }
 
-static void test_set_put_string_set(void) {
-        _cleanup_ordered_set_free_free_ OrderedSet *m = NULL;
-        _cleanup_ordered_set_free_ OrderedSet *q = NULL;
+TEST(set_put_string_set) {
+        _cleanup_ordered_set_free_ OrderedSet *m = NULL, *q = NULL;
         _cleanup_free_ char **final = NULL; /* "just free" because the strings are in the set */
-        void *t;
 
-        m = ordered_set_new(&string_hash_ops);
-        assert_se(m);
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&m, "1"));
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&m, "22"));
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&m, "333"));
 
-        q = ordered_set_new(&string_hash_ops);
-        assert_se(q);
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&q, "11"));
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&q, "22"));
+        ASSERT_OK_POSITIVE(ordered_set_put_strdup(&q, "33"));
 
-        assert_se(t = strdup("1"));
-        assert_se(ordered_set_put(m, t) == 1);
-        assert_se(t = strdup("22"));
-        assert_se(ordered_set_put(m, t) == 1);
-        assert_se(t = strdup("333"));
-        assert_se(ordered_set_put(m, t) == 1);
+        ASSERT_OK_POSITIVE(ordered_set_put_string_set(&m, q));
+        ASSERT_OK_ZERO(ordered_set_put_string_set(&m, q));
 
-        assert_se(ordered_set_put(q, (void*) "11") == 1);
-        assert_se(ordered_set_put(q, (void*) "22") == 1);
-        assert_se(ordered_set_put(q, (void*) "33") == 1);
-
-        assert_se(ordered_set_put_string_set(m, q) == 2);
-
-        assert_se(final = ordered_set_get_strv(m));
-        assert_se(strv_equal(final, STRV_MAKE("1", "22", "333", "11", "33")));
+        ASSERT_NOT_NULL(final = ordered_set_get_strv(m));
+        ASSERT_TRUE(strv_equal(final, STRV_MAKE("1", "22", "333", "11", "33")));
 
         ordered_set_print(stdout, "BAR=", m);
 }
 
-int main(int argc, const char *argv[]) {
-        test_set_steal_first();
-        test_set_free_with_hash_ops();
-        test_set_put();
-        test_set_put_string_set();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

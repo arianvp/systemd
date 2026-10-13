@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-machine-id-setup"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -39,31 +39,35 @@
 
     <para>If the tool is invoked without the <option>--commit</option>
     switch, <filename>/etc/machine-id</filename> is initialized with a
-    valid, new machined ID if it is missing or empty. The new machine
+    valid, new machine ID if it is missing or empty. The new machine
     ID will be acquired in the following fashion:</para>
 
     <orderedlist>
-      <listitem><para>If a valid D-Bus machine ID is already
-      configured for the system, the D-Bus machine ID is copied and
-      used to initialize the machine ID in
-      <filename>/etc/machine-id</filename>.</para></listitem>
+      <listitem><para>If a valid machine ID is stored in <filename>/run/machine-id</filename>, the machine ID
+      is copied and used to initialize the machine ID in <filename>/etc/machine-id</filename>. This step is
+      skipped if <option>--root=</option> is specified or running in a chroot environment.</para></listitem>
 
-      <listitem><para>If run inside a KVM virtual machine and a UUID
-      is configured (via the <option>-uuid</option>
-      option), this UUID is used to initialize the machine ID. The
-      caller must ensure that the UUID passed is sufficiently unique
-      and is different for every booted instance of the
-      VM.</para></listitem>
+      <listitem><para>If a valid D-Bus machine ID is already configured for the system, the D-Bus machine ID
+      is copied and used to initialize the machine ID in <filename>/etc/machine-id</filename>.
+      </para></listitem>
 
-      <listitem><para>Similarly, if run inside a Linux container
-      environment and a UUID is configured for the container, this is
-      used to initialize the machine ID. For details, see the
-      documentation of the <ulink
-      url="https://www.freedesktop.org/wiki/Software/systemd/ContainerInterface">Container
-      Interface</ulink>.</para></listitem>
+      <listitem><para>If a valid machine ID is provided through <option>system.machine_id</option> credential,
+      the machine ID is copied and used to initialize the machine ID in <filename>/etc/machine-id</filename>.
+      This step is skipped if <option>--root=</option> is specified or running in a chroot environment.
+      </para></listitem>
 
-      <listitem><para>Otherwise, a new ID is randomly
-      generated.</para></listitem>
+      <listitem><para>If run inside a KVM virtual machine and a UUID is configured (via the
+      <option>-uuid</option> option), this UUID is used to initialize the machine ID. The caller must ensure
+      that the UUID passed is sufficiently unique and is different for every booted instance of the VM. This
+      step is skipped if <option>--root=</option> is specified or running in a chroot environment.
+      </para></listitem>
+
+      <listitem><para>Similarly, if run inside a Linux container environment and a UUID is configured for the
+      container, this is used to initialize the machine ID. For details, see the documentation of the <ulink
+      url="https://systemd.io/CONTAINER_INTERFACE">Container Interface</ulink>. This step is skipped if
+      <option>--root=</option> is specified or running in a chroot environment.</para></listitem>
+
+      <listitem><para>Otherwise, a new ID is randomly generated.</para></listitem>
     </orderedlist>
 
     <para>The <option>--commit</option> switch may be used to commit a
@@ -85,12 +89,24 @@
     <variablelist>
 
       <varlistentry>
-        <term><option>--root=<replaceable>root</replaceable></option></term>
-        <listitem><para>Takes a directory path as argument. All paths
-        operated will be prefixed with the given alternate
-        <replaceable>root</replaceable> path, including the path for
-        <filename>/etc/machine-id</filename> itself.</para></listitem>
+        <term><option>--root=<replaceable>path</replaceable></option></term>
+        <listitem><para>Takes a directory path as argument. All paths operated on will be prefixed with the
+        given alternate <replaceable>root</replaceable> path, including the path for
+        <filename>/etc/machine-id</filename> itself.</para>
+
+        <xi:include href="version-info.xml" xpointer="v212"/></listitem>
       </varlistentry>
+
+      <varlistentry>
+        <term><option>--image=<replaceable>path</replaceable></option></term>
+        <listitem><para>Takes a path to a device node or regular file as argument. This is similar to
+        <option>--root=</option> as described above, but operates on a disk image instead of a directory
+        tree.</para>
+
+        <xi:include href="version-info.xml" xpointer="v249"/></listitem>
+      </varlistentry>
+
+      <xi:include href="standard-options.xml" xpointer="image-policy-open" />
 
       <varlistentry>
         <term><option>--commit</option></term>
@@ -101,12 +117,12 @@
         <literal>tmpfs</literal>) to
         <filename>/etc/machine-id</filename> during the early phase of
         the boot process. This may happen because
-        <filename>/etc</filename> is initially read-only and was
+        <filename>/etc/</filename> is initially read-only and was
         missing a valid machine ID file at that point.</para>
 
         <para>This command will execute no operation if
         <filename>/etc/machine-id</filename> is not mounted from a
-        memory file system, or if <filename>/etc</filename> is
+        memory file system, or if <filename>/etc/</filename> is
         read-only. The command will write the current transient
         machine ID to disk and unmount the
         <filename>/etc/machine-id</filename> mount point in a
@@ -115,13 +131,17 @@
 
         <para>This command is primarily used by the
         <citerefentry><refentrytitle>systemd-machine-id-commit.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        early boot service.</para></listitem>
+        early boot service.</para>
+
+        <xi:include href="version-info.xml" xpointer="v227"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--print</option></term>
 
-        <listitem><para>Print the machine ID generated or committed after the operation is complete.</para></listitem>
+        <listitem><para>Print the machine ID generated or committed after the operation is complete.</para>
+
+        <xi:include href="version-info.xml" xpointer="v231"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -139,13 +159,13 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>machine-id</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-machine-id-commit.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='dbus'><refentrytitle>dbus-uuidgen</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-firstboot</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>machine-id</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-machine-id-commit.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='dbus'><refentrytitle>dbus-uuidgen</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-firstboot</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

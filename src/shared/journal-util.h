@@ -1,11 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <sys/types.h>
+#include "sd-journal.h" /* IWYU pragma: export */
 
-#include "sd-journal.h"
+#include "forward.h"
 
-bool journal_field_valid(const char *p, size_t l, bool allow_protected);
-
+int journal_access_blocked(sd_journal *j);
 int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_users);
+int journal_open_machine(sd_journal **ret, const char *machine, int flags);

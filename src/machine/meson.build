@@ -1,42 +1,55 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-systemd_machined_sources = files('''
-        machined.c
-        machined.h
-'''.split())
-
-libmachine_core_sources = files('''
-        machine.c
-        machine.h
-        machined-dbus.c
-        machined-core.c
-        machine-dbus.c
-        machine-dbus.h
-        image-dbus.c
-        image-dbus.h
-        operation.c
-        operation.h
-'''.split())
-
-libmachine_core = static_library(
-        'machine-core',
-        libmachine_core_sources,
-        include_directories : includes,
-        dependencies : [threads])
-
-if conf.get('ENABLE_MACHINED') == 1
-        install_data('org.freedesktop.machine1.conf',
-                     install_dir : dbuspolicydir)
-        install_data('org.freedesktop.machine1.service',
-                     install_dir : dbussystemservicedir)
-        install_data('org.freedesktop.machine1.policy',
-                     install_dir : polkitpolicydir)
+if conf.get('ENABLE_MACHINED') != 1
+        subdir_done()
 endif
 
-tests += [
-        [['src/machine/test-machine-tables.c'],
-         [libmachine_core,
-          libshared],
-         [threads],
-         'ENABLE_MACHINED'],
+systemd_machined_sources = files(
+        'machined.c'
+)
+systemd_machined_export_sources = files(
+        'image.c',
+        'image-dbus.c',
+        'image-varlink.c',
+        'machine-dbus.c',
+        'machine-varlink.c',
+        'machine.c',
+        'machined-core.c',
+        'machined-dbus.c',
+        'machined-resolve-hook.c',
+        'machined-varlink.c',
+        'operation.c',
+)
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-machined',
+                'dbus' : true,
+                'sources' : systemd_machined_sources,
+                'export' : systemd_machined_export_sources,
+        },
+        executable_template + {
+                'name' : 'machinectl',
+                'public' : true,
+                'sources' : files('machinectl.c'),
+                'dependencies' : [
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                ],
+        },
+        test_template + {
+                'sources' : files('test-machine-tables.c'),
+                'import' : ['systemd-machined'],
+        },
 ]
+
+install_data('org.freedesktop.machine1.conf',
+             install_dir : dbuspolicydir)
+install_data('org.freedesktop.machine1.service',
+             install_dir : dbussystemservicedir)
+install_data('org.freedesktop.machine1.service-for-session',
+             install_dir : dbussessionservicedir,
+             rename : 'org.freedesktop.machine1.service')
+install_data('org.freedesktop.machine1.policy',
+             install_dir : polkitpolicydir)

@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -9,13 +9,19 @@
 
 [Unit]
 Description=udev Kernel Socket
-Documentation=man:systemd-udevd.service(8) man:udev(7)
+Documentation=man:systemd-udevd-kernel.socket(8) man:udev(7)
 DefaultDependencies=no
 Before=sockets.target
 ConditionPathIsReadWrite=/sys
+
+# To prevent loss of kernel events from isolate requests. This is important on
+# switching root, as otherwise the unit is stopped by initrd-cleanup.service,
+# and several early events after switching root may be lost.
+IgnoreOnIsolate=yes
 
 [Socket]
 Service=systemd-udevd.service
 ReceiveBuffer=128M
 ListenNetlink=kobject-uevent 1
 PassCredentials=yes
+DeferTrigger=yes

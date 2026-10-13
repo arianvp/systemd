@@ -1,9 +1,9 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="systemd-journal-gatewayd.service" conditional='HAVE_MICROHTTPD'
+<refentry id="systemd-journal-gatewayd.service" conditional='ENABLE_REMOTE HAVE_MICROHTTPD'
           xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
@@ -58,26 +58,59 @@
       <varlistentry>
         <term><option>--cert=</option></term>
 
-        <listitem><para>Specify the path to a file containing a server
-        certificate in PEM format. This option switches
-        <command>systemd-journal-gatewayd</command> into HTTPS mode
-        and must be used together with
-        <option>--key=</option>.</para></listitem>
+        <listitem><para>Specify the path to a file or <constant>AF_UNIX</constant> stream socket to read the
+        server certificate from. The certificate must be in PEM format. This option switches
+        <command>systemd-journal-gatewayd</command> into HTTPS mode and must be used together with
+        <option>--key=</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v198"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--key=</option></term>
 
-        <listitem><para>Specify the path to a file containing a server
-        key in PEM format corresponding to the certificate specified
-        with <option>--cert=</option>.</para></listitem>
+        <listitem><para>Specify the path to a file or <constant>AF_UNIX</constant> stream socket to read the
+        secret server key corresponding to the certificate specified with <option>--cert=</option> from. The
+        key must be in PEM format.</para>
+
+        <xi:include href="version-info.xml" xpointer="v198"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--trust=</option></term>
 
-        <listitem><para>Specify the path to a file containing a
-        CA certificate in PEM format.</para></listitem>
+        <listitem><para>Specify the path to a file or <constant>AF_UNIX</constant> stream socket to read a CA
+        certificate from. The certificate must be in PEM format.</para>
+
+        <xi:include href="version-info.xml" xpointer="v236"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--system</option></term>
+        <term><option>--user</option></term>
+
+        <listitem><para>Limit served entries to entries from system
+        services and the kernel, or to entries from services of
+        current user. This has the same meaning as
+        <option>--system</option> and <option>--user</option> options
+        for
+        <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>. If
+        neither is specified, all accessible entries are served.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v249"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-m</option></term>
+        <term><option>--merge</option></term>
+
+        <listitem><para>Serve entries interleaved from all available
+        journals, including other machines. This has the same meaning
+        as <option>--merge</option> option for
+        <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v249"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -87,7 +120,24 @@
         <listitem><para>Takes a directory path as argument. If
         specified, <command>systemd-journal-gatewayd</command> will serve the
         specified journal directory <replaceable>DIR</replaceable> instead of
-        the default runtime and system journal paths.</para></listitem>
+        the default runtime and system journal paths.</para>
+
+        <xi:include href="version-info.xml" xpointer="v232"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--file=<replaceable>GLOB</replaceable></option></term>
+
+        <listitem><para>Takes a file glob as an argument. Serve
+        entries from the specified journal files matching
+        <replaceable>GLOB</replaceable> instead of the default runtime
+        and system journal paths. May be specified multiple times, in
+        which case files will be suitably interleaved. This has the same meaning as
+        <option>--file=</option> option for
+        <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v249"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -102,9 +152,22 @@
 
     <variablelist>
       <varlistentry>
+        <term><uri>/boots</uri></term>
+
+        <listitem><para>Returns json-seq (RFC 7464) response containing JSON objects, each one containing
+        boot number, its ID and the timestamps of the first and last message. Boots are returned starting
+        with the latest boot first and use the same schema as
+        <command>journalctl --list-boots --output json</command>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><uri>/browse</uri></term>
 
-        <listitem><para>Interactive browsing.</para></listitem>
+        <listitem><para>Interactive browsing.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -123,6 +186,8 @@
 
         <para>GET parameters can be used to modify what events are
         returned. Supported parameters are described below.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -139,6 +204,8 @@
   "virtualization" : "kvm",
   …}</programlisting>
         </para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -146,6 +213,8 @@
         <term><uri>/fields/<replaceable>FIELD_NAME</replaceable></uri></term>
 
         <listitem><para>Return a list of values of this field present in the logs.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -167,6 +236,8 @@
         <listitem><para>The default. Plaintext syslog-like output,
         one line per journal entry
         (like <command>journalctl --output short</command>).</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -176,9 +247,10 @@
         <listitem><para>Entries are formatted as JSON data structures,
         one per line
         (like <command>journalctl --output json</command>).
-        See <ulink
-        url="https://www.freedesktop.org/wiki/Software/systemd/json">Journal
-        JSON Format</ulink> for more information.</para>
+        See <ulink url="https://systemd.io/JOURNAL_EXPORT_FORMATS#journal-json-format">Journal JSON Format</ulink>
+        for more information.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -191,19 +263,20 @@
         Server-Sent Events</ulink>
         (like <command>journalctl --output json-sse</command>).
         </para>
+
+        <xi:include href="version-info.xml" xpointer="v229"/>
         </listitem>
       </varlistentry>
 
       <varlistentry>
         <term><constant>application/vnd.fdo.journal</constant></term>
 
-        <listitem><para>Entries are serialized into a binary (but
-        mostly text-based) stream suitable for backups and network
-        transfer
-        (like <command>journalctl --output export</command>).
-        See <ulink
-        url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal
-        Export Format</ulink> for more information.</para>
+        <listitem><para>Entries are serialized into a binary (but mostly text-based) stream suitable for
+        backups and network transfer (like <command>journalctl --output export</command>).  See <ulink
+        url="https://systemd.io/JOURNAL_EXPORT_FORMATS#journal-export-format">Journal Export Format</ulink>
+        for more information.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -213,16 +286,23 @@
     <title>Range header</title>
 
     <para>
-      <option>Range: entries=<replaceable>cursor</replaceable>[[:<replaceable>num_skip</replaceable>]:<replaceable>num_entries</replaceable>]</option>
+      <option>Range: entries=[<replaceable>cursor</replaceable>][[:<replaceable>num_skip</replaceable>]:[<replaceable>num_entries</replaceable>]]</option>
+    </para>
+    <para>
+      <option>Range: realtime=[<replaceable>since</replaceable>]:[<replaceable>until</replaceable>][[:<replaceable>num_skip</replaceable>]:<replaceable>num_entries</replaceable>]</option>
     </para>
 
     <para>where
-      <option>cursor</option> is a cursor string,
-      <option>num_skip</option> is an integer,
-      <option>num_entries</option> is an unsigned integer.
+      <replaceable>cursor</replaceable> is a cursor string, defaults to the first entry,
+      <replaceable>since</replaceable> and <replaceable>until</replaceable> are timestamps (seconds since 1970-01-01 00:00:00 UTC),
+      <replaceable>num_skip</replaceable> is an integer,
+      <replaceable>num_entries</replaceable> is an unsigned integer.
     </para>
 
     <para>Range defaults to all available events.</para>
+
+    <para>If <replaceable>num_skip</replaceable> is negative and no <replaceable>cursor</replaceable> is
+    given, the last entry will be the reference point.</para>
   </refsect1>
 
   <refsect1>
@@ -234,9 +314,11 @@
       <varlistentry>
         <term><uri>follow</uri></term>
 
-        <listitem><para>wait for new events
-        (like <command>journalctl --follow</command>, except that
-        the number of events returned is not limited).</para>
+        <listitem><para>wait for new events (like <command>journalctl --follow</command>, the number of
+        events returned is not limited, unless <replaceable>num_entries</replaceable> is specified in the
+        <replaceable>Range</replaceable> header).</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -245,6 +327,8 @@
 
         <listitem><para>Test that the specified cursor refers to an
         entry in the journal. Returns just this entry.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
 
@@ -252,7 +336,9 @@
         <term><uri>boot</uri></term>
 
         <listitem><para>Limit events to the current boot of the system
-        (like <command>journalctl -b</command>).</para></listitem>
+        (like <command>journalctl -b</command>).</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -260,6 +346,8 @@
 
         <listitem><para>Match journal fields. See
         <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v197"/>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -267,10 +355,8 @@
 
   <refsect1>
     <title>Examples</title>
-    <para>Retrieve events from this boot from local journal
-    in <ulink
-    url="https://www.freedesktop.org/wiki/Software/systemd/export">Journal
-    Export Format</ulink>:
+    <para>Retrieve events from this boot from local journal in
+    <ulink url="https://systemd.io/JOURNAL_EXPORT_FORMATS#journal-export-format">Journal Export Format</ulink>:
     <programlisting>curl --silent -H'Accept: application/vnd.fdo.journal' \
        'http://localhost:19531/entries?boot'</programlisting>
     </para>
@@ -281,14 +367,14 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journal-remote.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-journal-upload.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journal-remote.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journal-upload.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

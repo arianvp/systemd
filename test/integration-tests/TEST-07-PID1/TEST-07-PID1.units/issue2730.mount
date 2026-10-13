@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Mount]
+What=tmpfs
+Where=/issue2730
+Type=tmpfs
+
+[Install]
+WantedBy=local-fs.target
+Alias=issue2730-alias.mount

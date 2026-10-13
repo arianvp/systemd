@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_slot_set_floating" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -19,7 +19,7 @@
     <refname>sd_bus_slot_set_floating</refname>
     <refname>sd_bus_slot_get_floating</refname>
 
-    <refpurpose>Control whether a bus slot object is "floating".</refpurpose>
+    <refpurpose>Control whether a bus slot object is "floating"</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -51,8 +51,8 @@
     referenced bus slot object around. The floating state hence controls the direction of referencing between the bus
     object and the bus slot objects: if floating the bus pins the bus slot, and otherwise the bus slot pins the bus
     objects. Use <function>sd_bus_slot_set_floating()</function> to switch between both modes: if the
-    <parameter>b</parameter> parameter is zero, the slot object is considered floating, otherwise it is made a regular
-    (non-floating) slot object.</para>
+    <parameter>b</parameter> parameter is zero, the slot object is made into a regular (non-floating) slot object,
+    otherwise it is made into a floating slot object.</para>
 
     <para>Bus slot objects may be allocated with calls such as
     <citerefentry><refentrytitle>sd_bus_add_match</refentrytitle><manvolnum>3</manvolnum></citerefentry>. If the
@@ -88,7 +88,7 @@
         <varlistentry>
           <term><constant>-ECHILD</constant></term>
 
-          <listitem><para>The bus connection has been created in a different process.</para></listitem>
+          <listitem><para>The bus connection has been created in a different process, library or module instance.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -101,17 +101,23 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_slot_set_floating()</function> and
+    <function>sd_bus_slot_get_floating()</function> were added in version 239.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_slot_set_destroy_callback</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_add_match</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_slot_set_destroy_callback</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_add_match</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

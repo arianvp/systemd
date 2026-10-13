@@ -1,10 +1,5 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <string.h>
-
-#include "macro.h"
 #include "string-util.h"
 #include "xml.h"
 
@@ -88,26 +83,26 @@ int xml_tokenize(const char **p, char **name, void **state, unsigned *line) {
 
                         if (startswith(b, "!--")) {
                                 /* A comment */
-                                e = strstr(b + 3, "-->");
+                                e = strstrafter(b + 3, "-->");
                                 if (!e)
                                         return -EINVAL;
 
-                                inc_lines(line, b, e + 3 - b);
+                                inc_lines(line, b, e - b);
 
-                                c = e + 3;
+                                c = e;
                                 continue;
                         }
 
                         if (*b == '?') {
                                 /* Processing instruction */
 
-                                e = strstr(b + 1, "?>");
+                                e = strstrafter(b + 1, "?>");
                                 if (!e)
                                         return -EINVAL;
 
-                                inc_lines(line, b, e + 2 - b);
+                                inc_lines(line, b, e - b);
 
-                                c = e + 2;
+                                c = e;
                                 continue;
                         }
 
@@ -234,5 +229,5 @@ int xml_tokenize(const char **p, char **name, void **state, unsigned *line) {
 
         }
 
-        assert_not_reached("Bad state");
+        assert_not_reached();
 }

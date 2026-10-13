@@ -1,11 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "sd-bus.h"
+#include "sd-bus-vtable.h"
 
 #include "alloc-util.h"
 #include "busctl-introspect.h"
+#include "log.h"
+#include "path-util.h"
 #include "string-util.h"
-#include "util.h"
 #include "xml.h"
 
 #define NODE_DEPTH_MAX 16
@@ -146,7 +147,7 @@ static int parse_xml_annotation(Context *context, uint64_t *flags) {
                         break;
 
                 default:
-                        assert_not_reached("Bad state");
+                        assert_not_reached();
                 }
         }
 }
@@ -177,11 +178,10 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
         } state = STATE_NODE;
 
         _cleanup_free_ char *node_path = NULL, *argument_type = NULL, *argument_direction = NULL;
-        const char *np = prefix;
+        const char *np = ASSERT_PTR(prefix);
         int r;
 
         assert(context);
-        assert(prefix);
 
         if (n_depth > NODE_DEPTH_MAX)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "<node> depth too high.");
@@ -227,7 +227,7 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
                                    (t == XML_TAG_CLOSE && streq_ptr(name, "node"))) {
 
                                 if (context->ops->on_path) {
-                                        r = context->ops->on_path(node_path ? node_path : np, context->userdata);
+                                        r = context->ops->on_path(node_path ?: np, context->userdata);
                                         if (r < 0)
                                                 return r;
                                 }
@@ -249,11 +249,7 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
                                 if (name[0] == '/')
                                         node_path = TAKE_PTR(name);
                                 else {
-
-                                        if (endswith(prefix, "/"))
-                                                node_path = strappend(prefix, name);
-                                        else
-                                                node_path = strjoin(prefix, "/", name);
+                                        node_path = path_join(prefix, name);
                                         if (!node_path)
                                                 return log_oom();
                                 }
@@ -408,10 +404,10 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
 
                                         if (argument_type) {
                                                 if (!argument_direction || streq(argument_direction, "in")) {
-                                                        if (!strextend(&context->member_signature, argument_type, NULL))
+                                                        if (!strextend(&context->member_signature, argument_type))
                                                                 return log_oom();
                                                 } else if (streq(argument_direction, "out")) {
-                                                        if (!strextend(&context->member_result, argument_type, NULL))
+                                                        if (!strextend(&context->member_result, argument_type))
                                                                 return log_oom();
                                                 } else
                                                         log_error("Unexpected method <arg> direction value '%s'.", argument_direction);
@@ -543,7 +539,7 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
 
                                 if (argument_type) {
                                         if (!argument_direction || streq(argument_direction, "out")) {
-                                                if (!strextend(&context->member_signature, argument_type, NULL))
+                                                if (!strextend(&context->member_signature, argument_type))
                                                         return log_oom();
                                         } else
                                                 log_error("Unexpected signal <arg> direction value '%s'.", argument_direction);
@@ -681,7 +677,7 @@ static int parse_xml_node(Context *context, const char *prefix, unsigned n_depth
 }
 
 int parse_xml_introspect(const char *prefix, const char *xml, const XMLIntrospectOps *ops, void *userdata) {
-        Context context = {
+        _cleanup_(context_reset_interface) Context context = {
                 .ops = ops,
                 .userdata = userdata,
                 .current = xml,
@@ -697,36 +693,24 @@ int parse_xml_introspect(const char *prefix, const char *xml, const XMLIntrospec
                 _cleanup_free_ char *name = NULL;
 
                 r = xml_tokenize(&context.current, &name, &context.xml_state, NULL);
-                if (r < 0) {
-                        log_error("XML parse error");
-                        goto finish;
-                }
+                if (r < 0)
+                        return log_error_errno(r, "XML parse error");
 
-                if (r == XML_END) {
-                        r = 0;
+                if (r == XML_END)
                         break;
-                }
 
                 if (r == XML_TAG_OPEN) {
 
                         if (streq(name, "node")) {
                                 r = parse_xml_node(&context, prefix, 0);
                                 if (r < 0)
-                                        goto finish;
-                        } else {
-                                log_error("Unexpected tag '%s' in introspection data.", name);
-                                r = -EBADMSG;
-                                goto finish;
-                        }
-                } else if (r != XML_TEXT || !in_charset(name, WHITESPACE)) {
-                        log_error("Unexpected token.");
-                        r = -EBADMSG;
-                        goto finish;
-                }
+                                        return r;
+                        } else
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                                       "Unexpected tag '%s' in introspection data.", name);
+                } else if (r != XML_TEXT || !in_charset(name, WHITESPACE))
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Unexpected token.");
         }
 
-finish:
-        context_reset_interface(&context);
-
-        return r;
+        return 0;
 }

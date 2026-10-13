@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_journal_get_fd" xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -151,18 +151,18 @@ else {
     <function>poll()</function> and
     <function>sd_journal_process()</function> into one.</para>
 
-    <para><function>sd_journal_reliable_fd()</function> may be used to
-    check whether the wakeup events from the file descriptor returned
-    by <function>sd_journal_get_fd()</function> are known to be
-    immediately triggered. On certain file systems where file change
-    events from the OS are not available (such as NFS) changes need to
-    be polled for repeatedly, and hence are detected only with a
-    certain latency. This call will return a positive value if the
-    journal changes are detected immediately and zero when they need
-    to be polled for and hence might be noticed only with a certain
-    latency. Note that there is usually no need to invoke this function
-    directly as <function>sd_journal_get_timeout()</function> on these
-    file systems will ask for timeouts explicitly anyway.</para>
+    <para><function>sd_journal_reliable_fd()</function> may be used to check whether the wake-up events from
+    the file descriptor returned by <function>sd_journal_get_fd()</function> are known to be quickly
+    triggered. On certain file systems where file change events from the OS are not available (such as NFS)
+    changes need to be polled for repeatedly, and hence are detected only with a considerable latency. This
+    call will return a positive value if the journal changes are detected quickly and zero when they need to
+    be polled for. Note that there is usually no need to invoke this function directly as
+    <function>sd_journal_get_timeout()</function> will request appropriate timeouts anyway.</para>
+
+    <para>Note that all of the above change notification interfaces do not report changes
+    instantly. Latencies are introduced for multiple reasons: as mentioned certain storage backends require
+    time-based polling, in other cases wake-ups are optimized by coalescing events, and the OS introduces
+    additional IO/CPU scheduling latencies.</para>
   </refsect1>
 
   <refsect1>
@@ -192,7 +192,7 @@ else {
       invocation.</para></listitem>
 
       <listitem><para>If <constant>SD_JOURNAL_APPEND</constant> is returned, new entries have been appended to the end
-      of the journal. In this case it is sufficient to simply continue reading at the previous end location of the
+      of the journal. In this case, it is sufficient to simply continue reading at the previous end location of the
       journal, to read the newly added entries.</para></listitem>
 
       <listitem><para>If <constant>SD_JOURNAL_INVALIDATE</constant>, journal files were added to or removed from the
@@ -244,16 +244,26 @@ else {
   </refsect1>
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_journal_get_fd()</function>,
+    <function>sd_journal_process()</function>, and
+    <function>sd_journal_wait()</function> were added in version 187.</para>
+    <para><function>sd_journal_reliable_fd()</function> was added in version 196.</para>
+    <para><function>sd_journal_get_events()</function> and
+    <function>sd_journal_get_timeout()</function> were added in version 201.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_open</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_next</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>poll</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>clock_gettime</refentrytitle><manvolnum>2</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_open</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_next</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>poll</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>clock_gettime</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

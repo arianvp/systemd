@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-inhibit"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -23,10 +23,10 @@
 
   <refsynopsisdiv>
     <cmdsynopsis>
-      <command>systemd-inhibit <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>COMMAND</arg> <arg choice="opt" rep="repeat">ARGUMENTS</arg></command>
+      <command>systemd-inhibit</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>COMMAND</arg> <arg choice="opt" rep="repeat">ARGUMENTS</arg>
     </cmdsynopsis>
     <cmdsynopsis>
-      <command>systemd-inhibit <arg choice="opt" rep="repeat">OPTIONS</arg> --list</command>
+      <command>systemd-inhibit</command> <arg choice="opt" rep="repeat">OPTIONS</arg> <arg>--list</arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -44,9 +44,8 @@
     an optical disc is being recorded, or similar operations that
     should not be interrupted.</para>
 
-    <para>For more information see the <ulink
-    url="https://www.freedesktop.org/wiki/Software/systemd/inhibit">Inhibitor
-    Lock Developer Documentation</ulink>.</para>
+    <para>For more information see
+    <ulink url="https://systemd.io/INHIBITOR_LOCKS">Inhibitor Locks</ulink>.</para>
   </refsect1>
 
   <refsect1>
@@ -64,12 +63,13 @@
         <literal>sleep</literal>,
         <literal>idle</literal>,
         <literal>handle-power-key</literal>,
+        <literal>handle-reboot-key</literal>,
         <literal>handle-suspend-key</literal>,
         <literal>handle-hibernate-key</literal>,
         <literal>handle-lid-switch</literal>,
-        for inhibiting reboot/power-off/halt/kexec,
+        for inhibiting reboot/power-off/halt/kexec/soft-reboot,
         suspending/hibernating, the automatic idle detection, or the
-        low-level handling of the power/sleep key and the lid switch,
+        low-level handling of the power/reboot/sleep key and the lid switch,
         respectively. If omitted, defaults to
         <literal>idle:sleep:shutdown</literal>.</para></listitem>
       </varlistentry>
@@ -93,30 +93,31 @@
       <varlistentry>
         <term><option>--mode=</option></term>
 
-        <listitem><para>Takes either <literal>block</literal> or
-        <literal>delay</literal> and describes how the lock is
-        applied. If <literal>block</literal> is used (the default),
-        the lock prohibits any of the requested operations without
-        time limit, and only privileged users may override it. If
-        <literal>delay</literal> is used, the lock can only delay the
-        requested operations for a limited time. If the time elapses,
-        the lock is ignored and the operation executed. The time limit
-        may be specified in
+        <listitem><para>Takes <literal>block</literal>, <literal>delay</literal>, or
+        <literal>block-weak</literal> and describes how the lock is applied. If <literal>block</literal> is
+        used (the default), the lock prohibits any of the requested operations without time limit, and only
+        privileged users may override it. The <literal>block-weak</literal> inhibitor lock type is similar to
+        <literal>block</literal> but is not enforced against operations initiated by privileged clients or
+        those owned by the user that also owns the inhibitor lock. If <literal>delay</literal> is used, the
+        lock can only delay the requested operations for a limited time. If the time elapses, the lock is
+        ignored and the operation executed. The time limit may be specified in
         <citerefentry><refentrytitle>logind.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
-        Note that <literal>delay</literal> is only available for
-        <literal>sleep</literal> and
+        Note that <literal>delay</literal> is only available for <literal>sleep</literal> and
         <literal>shutdown</literal>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>--list</option></term>
 
-        <listitem><para>Lists all active inhibition locks instead of
-        acquiring one.</para></listitem>
+        <listitem><para>Lists all active inhibition locks instead of acquiring one. It can be filtered using
+        <option>--what=</option>, <option>--who=</option>, <option>--why=</option>, or
+        <option>--mode=</option>.</para></listitem>
       </varlistentry>
 
+      <xi:include href="standard-options.xml" xpointer="no-ask-password" />
       <xi:include href="standard-options.xml" xpointer="no-pager" />
       <xi:include href="standard-options.xml" xpointer="no-legend" />
+      <xi:include href="standard-options.xml" xpointer="json" />
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -141,14 +142,14 @@
     doing so.</para>
   </refsect1>
 
-  <xi:include href="less-variables.xml" />
+  <xi:include href="common-variables.xml" />
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>logind.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>logind.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-cgtop"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -42,19 +42,13 @@
 
     <para>If <command>systemd-cgtop</command> is not connected to a
     tty, no column headers are printed and the default is to only run
-    one iteration.  The <varname>--iterations=</varname> argument, if
+    one iteration. The <option>--iterations=</option> argument, if
     given, is honored. This mode is suitable for scripting.</para>
 
-    <para>Resource usage is only accounted for control groups in the
-    relevant hierarchy, i.e. CPU usage is only accounted for control
-    groups in the <literal>cpuacct</literal> hierarchy, memory usage
-    only for those in <literal>memory</literal> and disk I/O usage for
-    those in <literal>blkio</literal>. If resource monitoring for
-    these resources is required, it is recommended to add the
-    <varname>CPUAccounting=1</varname>,
-    <varname>MemoryAccounting=1</varname> and
-    <varname>BlockIOAccounting=1</varname> settings in the unit files
-    in question. See
+    <para>Resource usage is only accounted for control groups with the appropriate controllers turned on:
+    <literal>memory</literal> controller for memory usage and <literal>io</literal> controller for disk I/O consumption.
+    If resource monitoring for these resources is required, it is recommended to add the <varname>MemoryAccounting=1</varname>
+    and <varname>IOAccounting=1</varname> settings in the unit files in question. See
     <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for details.</para>
 
@@ -63,13 +57,9 @@
     the CPU load value is going to be between 0% and 800%. The number of
     processors can be found in <literal>/proc/cpuinfo</literal>.</para>
 
-    <para>To emphasize this: unless
-    <literal>CPUAccounting=1</literal>,
-    <literal>MemoryAccounting=1</literal> and
-    <literal>BlockIOAccounting=1</literal> are enabled for the
-    services in question, no resource accounting will be available for
-    system services and the data shown by
-    <command>systemd-cgtop</command> will be incomplete.</para>
+    <para>To emphasize: unless <literal>MemoryAccounting=1</literal> and <literal>IOAccounting=1</literal>
+    are enabled for the services in question, no resource accounting will be available for system services
+    and the data shown by <command>systemd-cgtop</command> will be incomplete.</para>
   </refsect1>
 
   <refsect1>
@@ -123,16 +113,20 @@
         <option>--iterations=</option> is exhausted or until killed.
         This mode could be useful for sending output from
         <command>systemd-cgtop</command> to other programs or to a
-        file.</para></listitem>
+        file.</para>
+
+        <xi:include href="version-info.xml" xpointer="v188"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-r</option></term>
         <term><option>--raw</option></term>
 
-        <listitem><para>Format byte counts (as in memory usage and I/O metrics)
+        <listitem><para>Format byte counts (as in memory usage and I/O metrics) and CPU time
         with raw numeric values rather than human-readable
-        numbers.</para></listitem>
+        numbers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v221"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -141,8 +135,12 @@
 
         <listitem><para>Controls whether the CPU usage is shown as
         percentage or time. By default, the CPU usage is shown as
-        percentage. This setting may also be toggled at runtime by
-        pressing the <keycap>%</keycap> key.</para></listitem>
+        percentage. When the option is used without an argument, it is
+        equivalent to <option>--cpu=time</option>. This setting may also
+        be toggled at runtime by pressing the <keycap>%</keycap>
+        key.</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -151,12 +149,14 @@
         <listitem><para>Count only userspace processes instead of all
         tasks. By default, all tasks are counted: each kernel thread
         and each userspace thread individually. With this setting,
-        kernel threads are excluded from the counting and each
-        userspace process only counts as one, regardless how many
+        kernel threads are excluded from the count and each userspace
+        process only counts as one task, regardless of how many
         threads it consists of. This setting may also be toggled at
         runtime by pressing the <keycap>P</keycap> key. This option
         may not be combined with
-        <option>-k</option>.</para></listitem>
+        <option>-k</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v227"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -166,11 +166,13 @@
         threads instead of all tasks. By default, all tasks are
         counted: each kernel thread and each userspace thread
         individually. With this setting, kernel threads are included in
-        the counting and each userspace process only counts as on one,
-        regardless how many threads it consists of. This setting may
+        the count and each userspace process only counts as one task,
+        regardless of how many threads it consists of. This setting may
         also be toggled at runtime by pressing the <keycap>k</keycap>
         key. This option may not be combined with
-        <option>-P</option>.</para></listitem>
+        <option>-P</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -186,8 +188,11 @@
         pressing the <keycap>r</keycap> key. Note that this setting
         only applies to process counting, i.e. when the
         <option>-P</option> or <option>-k</option> options are
-        used. It has not effect if all tasks are counted, in which
-        case the counting is always recursive.</para></listitem>
+        used. When all tasks are counted, setting this option to
+        <literal>no</literal> is rejected with an error, as task counting
+        is always recursive.</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -196,13 +201,17 @@
 
         <listitem><para>Perform only this many iterations. A value of
         0 indicates that the program should run
-        indefinitely.</para></listitem>
+        indefinitely.</para>
+
+        <xi:include href="version-info.xml" xpointer="v188"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><option>-1</option></term>
 
-        <listitem><para>A shortcut for <option>--iterations=1</option>.</para></listitem>
+        <listitem><para>A shortcut for <option>--iterations=1</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v238"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -235,7 +244,9 @@
         <listitem><para>Limit control groups shown to the part
         corresponding to the container
         <replaceable>MACHINE</replaceable>.
-        This option may not be used when a control group path is specified.</para></listitem>
+        This option may not be used when a control group path is specified.</para>
+
+        <xi:include href="version-info.xml" xpointer="v227"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -260,7 +271,9 @@
       <varlistentry>
         <term><keycap function="space"/></term>
 
-        <listitem><para>Immediately refresh output.</para></listitem>
+        <listitem><para>Immediately refresh output.</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -288,7 +301,9 @@
 
         <listitem><para>Toggle between showing CPU time as time or
         percentage. This setting may also be controlled using the
-        <option>--cpu=</option> command line switch.</para></listitem>
+        <option>--cpu=</option> command line switch.</para>
+
+        <xi:include href="version-info.xml" xpointer="v201"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -307,7 +322,9 @@
         <listitem><para>Toggle between counting all tasks, or only
         userspace processes. This setting may also be controlled using
         the <option>-P</option> command line switch (see
-        above).</para></listitem>
+        above).</para>
+
+        <xi:include href="version-info.xml" xpointer="v227"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -316,7 +333,9 @@
         <listitem><para>Toggle between counting all tasks, or only
         userspace processes and kernel threads. This setting may also
         be controlled using the <option>-k</option> command line
-        switch (see above).</para></listitem>
+        switch (see above).</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -329,7 +348,9 @@
         not available if all tasks are counted, it is only available
         if processes are counted, as enabled with the
         <keycap>P</keycap> or <keycap>k</keycap>
-        keys.</para></listitem>
+        keys.</para>
+
+        <xi:include href="version-info.xml" xpointer="v226"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -344,13 +365,13 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-cgls</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>top</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-cgls</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>top</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

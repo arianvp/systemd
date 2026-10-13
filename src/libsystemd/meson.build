@@ -1,116 +1,307 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-id128_sources = files('''
-        sd-id128/id128-util.c
-        sd-id128/id128-util.h
-        sd-id128/sd-id128.c
-'''.split())
+sd_journal_sources = files(
+        'sd-journal/catalog.c',
+        'sd-journal/journal-authenticate-internal.c',
+        'sd-journal/journal-file.c',
+        'sd-journal/journal-send.c',
+        'sd-journal/journal-vacuum.c',
+        'sd-journal/journal-verify.c',
+        'sd-journal/lookup3.c',
+        'sd-journal/mmap-cache.c',
+        'sd-journal/sd-journal.c',
+)
+
+############################################################
+
+sd_id128_sources = files(
+        'sd-id128/id128-util.c',
+        'sd-id128/sd-id128.c',
+)
+
+############################################################
 
 sd_daemon_sources = files('sd-daemon/sd-daemon.c')
 
-sd_event_sources = files('''
-        sd-event/event-source.h
-        sd-event/event-util.c
-        sd-event/event-util.h
-        sd-event/sd-event.c
-'''.split())
+############################################################
+
+sd_event_sources = files(
+        'sd-event/event-future.c',
+        'sd-event/event-util.c',
+        'sd-event/sd-event.c',
+)
+
+############################################################
+
+sd_bus_sources = files(
+        'sd-bus/bus-common-errors.c',
+        'sd-bus/bus-container.c',
+        'sd-bus/bus-control.c',
+        'sd-bus/bus-convenience.c',
+        'sd-bus/bus-creds.c',
+        'sd-bus/bus-dump.c',
+        'sd-bus/bus-dump-json.c',
+        'sd-bus/bus-error.c',
+        'sd-bus/bus-future.c',
+        'sd-bus/bus-internal.c',
+        'sd-bus/bus-introspect.c',
+        'sd-bus/bus-kernel.c',
+        'sd-bus/bus-match.c',
+        'sd-bus/bus-message.c',
+        'sd-bus/bus-objects.c',
+        'sd-bus/bus-signature.c',
+        'sd-bus/bus-slot.c',
+        'sd-bus/bus-socket.c',
+        'sd-bus/bus-track.c',
+        'sd-bus/bus-type.c',
+        'sd-bus/sd-bus.c',
+)
+
+############################################################
+
+sd_device_sources = files(
+        'sd-device/device-enumerator.c',
+        'sd-device/device-filter.c',
+        'sd-device/device-monitor.c',
+        'sd-device/device-private.c',
+        'sd-device/device-util.c',
+        'sd-device/sd-device.c',
+)
+
+############################################################
+
+sd_future_sources = files(
+        'sd-future/fiber-io.c',
+        'sd-future/fiber.c',
+        'sd-future/future-group.c',
+        'sd-future/sd-future.c',
+)
+
+############################################################
 
 sd_login_sources = files('sd-login/sd-login.c')
 
-libsystemd_sources = files('''
-        sd-bus/bus-common-errors.c
-        sd-bus/bus-common-errors.h
-        sd-bus/bus-container.c
-        sd-bus/bus-container.h
-        sd-bus/bus-control.c
-        sd-bus/bus-control.h
-        sd-bus/bus-convenience.c
-        sd-bus/bus-creds.c
-        sd-bus/bus-creds.h
-        sd-bus/bus-dump.c
-        sd-bus/bus-dump.h
-        sd-bus/bus-error.c
-        sd-bus/bus-error.h
-        sd-bus/bus-gvariant.c
-        sd-bus/bus-gvariant.h
-        sd-bus/bus-internal.c
-        sd-bus/bus-internal.h
-        sd-bus/bus-introspect.c
-        sd-bus/bus-introspect.h
-        sd-bus/bus-kernel.c
-        sd-bus/bus-kernel.h
-        sd-bus/bus-match.c
-        sd-bus/bus-match.h
-        sd-bus/bus-message.c
-        sd-bus/bus-message.h
-        sd-bus/bus-objects.c
-        sd-bus/bus-objects.h
-        sd-bus/bus-protocol.h
-        sd-bus/bus-signature.c
-        sd-bus/bus-signature.h
-        sd-bus/bus-slot.c
-        sd-bus/bus-slot.h
-        sd-bus/bus-socket.c
-        sd-bus/bus-socket.h
-        sd-bus/bus-track.c
-        sd-bus/bus-track.h
-        sd-bus/bus-type.c
-        sd-bus/bus-type.h
-        sd-bus/sd-bus.c
-        sd-device/device-enumerator-private.h
-        sd-device/device-enumerator.c
-        sd-device/device-internal.h
-        sd-device/device-monitor-private.h
-        sd-device/device-monitor.c
-        sd-device/device-private.c
-        sd-device/device-private.h
-        sd-device/device-util.h
-        sd-device/sd-device.c
-        sd-hwdb/hwdb-internal.h
-        sd-hwdb/hwdb-util.c
-        sd-hwdb/hwdb-util.h
-        sd-hwdb/sd-hwdb.c
-        sd-netlink/generic-netlink.c
-        sd-netlink/local-addresses.c
-        sd-netlink/local-addresses.h
-        sd-netlink/netlink-internal.h
-        sd-netlink/netlink-message.c
-        sd-netlink/netlink-slot.c
-        sd-netlink/netlink-slot.h
-        sd-netlink/netlink-socket.c
-        sd-netlink/netlink-types.c
-        sd-netlink/netlink-types.h
-        sd-netlink/netlink-util.c
-        sd-netlink/netlink-util.h
-        sd-netlink/rtnl-message.c
-        sd-netlink/sd-netlink.c
-        sd-network/network-util.c
-        sd-network/network-util.h
-        sd-network/sd-network.c
-        sd-path/sd-path.c
-        sd-resolve/resolve-private.h
-        sd-resolve/sd-resolve.c
-        sd-utf8/sd-utf8.c
-'''.split()) + id128_sources + sd_daemon_sources + sd_event_sources + sd_login_sources
+############################################################
 
-disable_mempool_c = files('disable-mempool.c')
+sd_json_sources = files(
+        'sd-json/json-stream.c',
+        'sd-json/json-util.c',
+        'sd-json/sd-json.c',
+)
+
+############################################################
+
+sd_varlink_sources = files(
+        'sd-varlink/sd-varlink.c',
+        'sd-varlink/sd-varlink-idl.c',
+        'sd-varlink/varlink-io.systemd.c',
+        'sd-varlink/varlink-org.varlink.service.c',
+        'sd-varlink/varlink-util.c',
+)
+
+############################################################
+
+sd_path_sources = files(
+        'sd-path/path-lookup.c',
+        'sd-path/sd-path.c',
+)
+
+############################################################
+
+sd_netlink_sources = files(
+        'sd-netlink/netlink-genl.c',
+        'sd-netlink/netlink-message-nfnl.c',
+        'sd-netlink/netlink-message-rtnl.c',
+        'sd-netlink/netlink-message.c',
+        'sd-netlink/netlink-slot.c',
+        'sd-netlink/netlink-sock-diag.c',
+        'sd-netlink/netlink-socket.c',
+        'sd-netlink/netlink-types-genl.c',
+        'sd-netlink/netlink-types-nfnl.c',
+        'sd-netlink/netlink-types-rtnl.c',
+        'sd-netlink/netlink-types-sdnl.c',
+        'sd-netlink/netlink-types.c',
+        'sd-netlink/netlink-util.c',
+        'sd-netlink/sd-netlink.c',
+)
+
+############################################################
+
+sd_network_sources = files(
+        'sd-network/network-util.c',
+        'sd-network/sd-network.c',
+)
+
+############################################################
+
+libsystemd_sources = files(
+        'sd-hwdb/sd-hwdb.c',
+        'sd-resolve/sd-resolve.c',
+) + sd_journal_sources + sd_id128_sources + sd_daemon_sources \
+  + sd_event_sources + sd_bus_sources + sd_device_sources \
+  + sd_future_sources + sd_login_sources + sd_json_sources \
+  + sd_varlink_sources + sd_path_sources + sd_netlink_sources \
+  + sd_network_sources
+
+sources += libsystemd_sources
 
 libsystemd_c_args = ['-fvisibility=default']
 
 libsystemd_static = static_library(
         'systemd_static',
         libsystemd_sources,
-        install : false,
-        include_directories : includes,
-        link_with : libbasic,
-        dependencies : [threads,
-                        librt],
-        c_args : libsystemd_c_args)
+        include_directories : libsystemd_includes,
+        implicit_include_directories : false,
+        c_args : libsystemd_c_args,
+        link_with : [libc_wrapper_static,
+                     libbasic_static],
+        dependencies : [libm,
+                        libucontext,
+                        userspace],
+        build_by_default : false)
 
-libsystemd_sym = 'src/libsystemd/libsystemd.sym'
+libsystemd_dir_path = meson.current_source_dir()
 
-configure_file(
+libsystemd_sym = files('libsystemd.sym')
+libsystemd_sym_path = libsystemd_dir_path / 'libsystemd.sym'
+
+static_libsystemd = get_option('static-libsystemd')
+static_libsystemd_pic = static_libsystemd == 'true' or static_libsystemd == 'pic'
+
+libsystemd_pc = custom_target(
         input : 'libsystemd.pc.in',
         output : 'libsystemd.pc',
-        configuration : substs,
-        install_dir : pkgconfiglibdir == 'no' ? '' : pkgconfiglibdir)
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : pkgconfiglibdir != 'no',
+        install_tag : 'devel',
+        install_dir : pkgconfiglibdir)
+
+############################################################
+
+simple_tests += files(
+        'sd-bus/test-bus-creds.c',
+        'sd-bus/test-bus-fiber.c',
+        'sd-bus/test-bus-introspect.c',
+        'sd-bus/test-bus-match.c',
+        'sd-bus/test-bus-vtable.c',
+        'sd-device/test-device-util.c',
+        'sd-device/test-sd-device-monitor.c',
+        'sd-event/test-event-future.c',
+        'sd-future/test-fiber.c',
+        'sd-future/test-fiber-io.c',
+        'sd-future/test-fiber-ops.c',
+        'sd-future/test-future-group.c',
+        'sd-hwdb/test-sd-hwdb.c',
+        'sd-id128/test-id128.c',
+        'sd-journal/test-catalog.c',
+        'sd-journal/test-journal-file.c',
+        'sd-journal/test-journal-flush.c',
+        'sd-journal/test-journal-init.c',
+        'sd-journal/test-journal-interleaving.c',
+        'sd-journal/test-journal-match.c',
+        'sd-journal/test-journal-send.c',
+        'sd-journal/test-journal-stream.c',
+        'sd-journal/test-journal.c',
+        'sd-journal/test-mmap-cache.c',
+        'sd-login/test-login.c',
+        'sd-login/test-sd-login.c',
+        'sd-netlink/test-netlink.c',
+        'sd-path/test-sd-path.c',
+)
+
+libsystemd_tests += [
+        {
+                'sources' : files('sd-bus/test-bus-address.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-benchmark.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('sd-bus/test-bus-chat.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-cleanup.c'),
+                'dependencies' : libseccomp_cflags,
+        },
+        {
+                'sources' : files('sd-bus/test-bus-marshal.c'),
+                'dependencies' : [
+                        libdbus_cflags,
+                        libglib_cflags,
+                ],
+        },
+        {
+                'sources' : files('sd-bus/test-bus-objects.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-peersockaddr.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-queue-ref-cycle.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-server.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-signature.c'),
+        },
+        {
+                'sources' : files('sd-bus/test-bus-track.c'),
+                'dependencies' : libseccomp_cflags,
+        },
+        {
+                'sources' : files('sd-bus/test-bus-watch-bind.c'),
+                'timeout' : 120,
+        },
+        {
+                'sources' : files('sd-device/test-sd-device.c'),
+                'dependencies' : libmount_cflags,
+        },
+        {
+                'sources' : files('sd-event/test-event.c'),
+                'timeout' : 120,
+        },
+        {
+                'sources' : files('sd-journal/test-journal-enum.c'),
+                'timeout' : 360,
+        },
+        {
+                'sources' : files('sd-journal/test-journal-append.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('sd-journal/test-journal-dump.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('sd-journal/test-journal-verify.c'),
+                'timeout' : 90,
+        },
+        {
+                'sources' : files('sd-json/test-json.c'),
+                'dependencies' : libm,
+        },
+        {
+                'sources' : files('sd-resolve/test-resolve.c'),
+                'timeout' : 120,
+        },
+        {
+                'sources' : files('sd-varlink/test-varlink.c'),
+        },
+        {
+                'sources' : files('sd-varlink/test-varlink-idl.c'),
+        },
+]
+
+if cxx_cmd != ''
+        simple_tests += files('sd-bus/test-bus-vtable-cc.cc')
+endif
+
+############################################################
+
+simple_fuzzers += files(
+        'sd-bus/fuzz-bus-match.c',
+        'sd-bus/fuzz-bus-message.c',
+        'sd-hwdb/fuzz-hwdb.c',
+)

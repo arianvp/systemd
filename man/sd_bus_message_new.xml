@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_message_new" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
@@ -99,14 +99,13 @@
     <citerefentry><refentrytitle>sd_bus_message_set_allow_interactive_authorization</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
     </para>
 
-    <para><function>sd_bus_message_ref()</function> increases the reference counter of
+    <para><function>sd_bus_message_ref()</function> increases the internal reference counter of
     <parameter>m</parameter> by one.</para>
 
-    <para><function>sd_bus_message_unref()</function> decreases the reference counter of
+    <para><function>sd_bus_message_unref()</function> decreases the internal reference counter of
     <parameter>m</parameter> by one. Once the reference count has dropped to zero, message object is
-    destroyed and cannot be used anymore, so further calls to
-    <function>sd_bus_message_ref()</function> or <function>sd_bus_message_unref()</function> are
-    illegal.</para>
+    destroyed and cannot be used anymore, so further calls to <function>sd_bus_message_ref()</function> or
+    <function>sd_bus_message_unref()</function> are illegal.</para>
 
     <para><function>sd_bus_message_unrefp()</function> is similar to
     <function>sd_bus_message_unref()</function> but takes a pointer to a
@@ -118,7 +117,7 @@
     for an example how to use the cleanup attribute.</para>
 
     <para><function>sd_bus_message_ref()</function> and <function>sd_bus_message_unref()</function>
-    execute no operation if the passed in bus object address is
+    execute no operation if the passed in bus message object address is
     <constant>NULL</constant>. <function>sd_bus_message_unrefp()</function> will first dereference
     its argument, which must not be <constant>NULL</constant>, and will execute no operation if
     <emphasis>that</emphasis> is <constant>NULL</constant>.
@@ -170,20 +169,29 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
+
+  <refsect1>
+    <title>History</title>
+    <para><function>sd_bus_message_new()</function>,
+    <function>sd_bus_message_ref()</function>,
+    <function>sd_bus_message_unref()</function>,
+    <function>sd_bus_message_unrefp()</function>, and
+    <function>sd_bus_message_get_bus()</function> were added in version 240.</para>
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_new_method_call</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_new_method_error</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_new_method_return</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_bus_message_new_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_new_method_call</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_new_method_error</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_new_method_return</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_message_new_signal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

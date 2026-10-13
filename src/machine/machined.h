@@ -1,28 +1,22 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
-#include "sd-bus.h"
-#include "sd-event.h"
-
-#include "hashmap.h"
 #include "list.h"
+#include "machine-forward.h"
+#include "runtime-scope.h"
 
-typedef struct Manager Manager;
-
-#include "image-dbus.h"
-#include "machine-dbus.h"
-#include "machine.h"
-#include "operation.h"
-
-struct Manager {
+typedef struct Manager {
         sd_event *event;
-        sd_bus *bus;
+        sd_bus *api_bus;              /* this is where we offer our services */
+        sd_bus *system_bus;           /* this is where we talk to system services on, for example PK or so */
 
         Hashmap *machines;
-        Hashmap *machine_units;
-        Hashmap *machine_leaders;
+        Hashmap *machines_by_unit;    /* This hashmap only tracks machines where a system-level encapsulates
+                                       * the machine fully, and exclusively. It's not used if a machine is
+                                       * run in a cgroup further down the tree. */
+        Hashmap *machines_by_leader;
+
+        sd_event_source *deferred_gc_event_source;
 
         Hashmap *polkit_registry;
 
@@ -36,24 +30,36 @@ struct Manager {
         LIST_HEAD(Operation, operations);
         unsigned n_operations;
 
-        sd_event_source *nscd_cache_flush_event;
-};
+        sd_varlink_server *varlink_userdb_server;
+        sd_varlink_server *varlink_machine_server;
+        sd_varlink_server *varlink_resolve_hook_server;
+        Set *query_filter_subscriptions;
 
-int manager_add_machine(Manager *m, const char *name, Machine **_machine);
-int manager_get_machine_by_pid(Manager *m, pid_t pid, Machine **machine);
+        RuntimeScope runtime_scope;
+        char *state_dir;
+} Manager;
 
-extern const sd_bus_vtable manager_vtable[];
+int manager_add_machine(Manager *m, const char *name, Machine **ret);
+int manager_get_machine_by_pidref(Manager *m, const PidRef *pidref, Machine **ret);
 
 int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int match_unit_removed(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int match_properties_changed(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *error);
 
-int manager_start_scope(Manager *manager, const char *scope, pid_t pid, const char *slice, const char *description, sd_bus_message *more_properties, sd_bus_error *error, char **job);
 int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job);
-int manager_kill_unit(Manager *manager, const char *unit, int signo, sd_bus_error *error);
+int manager_kill_unit(Manager *manager, const char *unit, const char *subgroup, int signo, sd_bus_error *error);
 int manager_unref_unit(Manager *m, const char *unit, sd_bus_error *error);
-int manager_unit_is_active(Manager *manager, const char *unit);
-int manager_job_is_active(Manager *manager, const char *path);
+int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *reterr_error);
+int manager_job_is_active(Manager *manager, const char *path, sd_bus_error *reterr_error);
 
-int manager_enqueue_nscd_cache_flush(Manager *m);
+int manager_find_machine_for_uid(Manager *m, uid_t host_uid, Machine **ret_machine, uid_t *ret_internal_uid);
+int manager_find_machine_for_gid(Manager *m, gid_t host_gid, Machine **ret_machine, gid_t *ret_internal_gid);
+
+void manager_gc(Manager *m, bool drop_not_started);
+void manager_enqueue_gc(Manager *m);
+
+int machine_get_addresses(Machine* machine, struct local_address **ret_addresses);
+int machine_get_os_release(Machine *machine, char ***ret_os_release);
+int manager_acquire_image(Manager *m, const char *name, Image **ret);
+int rename_image_and_update_cache(Manager *m, Image *image, const char* new_name);

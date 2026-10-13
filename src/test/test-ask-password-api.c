@@ -1,24 +1,29 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "alloc-util.h"
 #include "ask-password-api.h"
-#include "log.h"
 #include "strv.h"
+#include "tests.h"
 
-static void ask_password(void) {
-        int r;
+TEST(ask_password) {
         _cleanup_strv_free_ char **ret = NULL;
+        int r;
 
-        r = ask_password_tty(-1, "hello?", "da key", 0, 0, NULL, &ret);
-        assert(r >= 0);
-        assert(strv_length(ret) == 1);
+        static const AskPasswordRequest req = {
+                .tty_fd = -EBADF,
+                .message = "hello?",
+                .keyring = "da key",
+                .until = USEC_INFINITY,
+                .hup_fd = -EBADF,
+        };
 
-        log_info("Got %s", *ret);
+        r = ask_password_tty(&req, /* flags= */ ASK_PASSWORD_CONSOLE_COLOR, &ret);
+        if (r == -ECANCELED)
+                ASSERT_NULL(ret);
+        else {
+                ASSERT_OK(r);
+                assert_se(strv_length(ret) == 1);
+                log_info("Got \"%s\"", *ret);
+        }
 }
 
-int main(int argc, char **argv) {
-        log_parse_environment();
-
-        ask_password();
-        return EXIT_SUCCESS;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

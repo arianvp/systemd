@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-socket-activate"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -25,8 +25,9 @@
     <cmdsynopsis>
       <command>systemd-socket-activate</command>
       <arg choice="opt" rep="repeat">OPTIONS</arg>
-      <arg choice="plain"><replaceable>daemon</replaceable></arg>
-      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="plain"><replaceable>COMMAND</replaceable>
+      <arg choice="opt" rep="repeat">ARGS</arg>
+      </arg>
     </cmdsynopsis>
   </refsynopsisdiv>
 
@@ -62,6 +63,8 @@
         <listitem><para>Listen on this <replaceable>address</replaceable>.
         Takes a string like <literal>2000</literal> or
         <literal>127.0.0.1:2001</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/>
         </listitem>
       </varlistentry>
 
@@ -70,7 +73,9 @@
         <term><option>--accept</option></term>
 
         <listitem><para>Launch an instance of the service program for each connection and pass the connection
-        socket.</para></listitem>
+        socket. May not be combined with <option>--now</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -78,7 +83,9 @@
         <term><option>--datagram</option></term>
 
         <listitem><para>Listen on a datagram socket (<constant>SOCK_DGRAM</constant>), instead of a stream socket
-        (<constant>SOCK_STREAM</constant>). May not be combined with <option>--seqpacket</option>.</para></listitem>
+        (<constant>SOCK_STREAM</constant>). May not be combined with <option>--seqpacket</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -86,7 +93,9 @@
 
         <listitem><para>Listen on a sequential packet socket (<constant>SOCK_SEQPACKET</constant>), instead of a stream
         socket (<constant>SOCK_STREAM</constant>). May not be combined with
-        <option>--datagram</option>.</para></listitem>
+        <option>--datagram</option>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -94,7 +103,9 @@
 
         <listitem><para>Use the inetd protocol for passing file descriptors, i.e. as standard input and standard
         output, instead of the new-style protocol for passing file descriptors using <varname>$LISTEN_FDS</varname>
-        (see above).</para></listitem>
+        (see above).</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -106,11 +117,13 @@
         followed by <literal>=</literal>, assume that it is a
         variable–value pair. Otherwise, obtain the value from the
         environment of <command>systemd-socket-activate</command> itself.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--fdname=</option><replaceable>NAME</replaceable><optional>:<replaceable>NAME</replaceable>…</optional></term>
+        <term><option>--fdname=<replaceable>NAME</replaceable><optional>:<replaceable>NAME</replaceable>…</optional></option></term>
 
         <listitem><para>Specify names for the file descriptors passed. This is equivalent to setting
         <varname>FileDescriptorName=</varname> in socket unit files, and enables use of
@@ -118,7 +131,19 @@
         Multiple entries may be specifies using separate options or by separating names with colons
         (<literal>:</literal>) in one option. In case more names are given than descriptors, superfluous ones will be
         ignored. In case less names are given than descriptors, the remaining file descriptors will be unnamed.
-        </para></listitem>
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--now</option></term>
+
+        <listitem><para>Start the service program instantly, instead of waiting for a connection on the
+        socket(s). May not be combined with <option>--accept</option>.
+        </para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -132,20 +157,26 @@
       <varlistentry>
         <term><varname>$LISTEN_FDS</varname></term>
         <term><varname>$LISTEN_PID</varname></term>
+        <term><varname>$LISTEN_PIDFDID</varname></term>
         <term><varname>$LISTEN_FDNAMES</varname></term>
 
         <listitem><para>See
-        <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><varname>$SYSTEMD_LOG_TARGET</varname></term>
         <term><varname>$SYSTEMD_LOG_LEVEL</varname></term>
+        <term><varname>$SYSTEMD_LOG_TIME</varname></term>
         <term><varname>$SYSTEMD_LOG_COLOR</varname></term>
         <term><varname>$SYSTEMD_LOG_LOCATION</varname></term>
 
         <listitem><para>Same as in
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v230"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -168,14 +199,14 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.socket</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-run</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_listen_fds_with_names</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>cat</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.socket</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-run</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_listen_fds_with_names</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>cat</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

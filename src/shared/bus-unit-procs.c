@@ -1,10 +1,16 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "ansi-color.h"
+#include "bus-locator.h"
 #include "bus-unit-procs.h"
+#include "format-util.h"
+#include "glyph-util.h"
 #include "hashmap.h"
 #include "list.h"
-#include "locale-util.h"
-#include "macro.h"
+#include "log.h"
+#include "output-mode.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "sort-util.h"
@@ -31,8 +37,7 @@ static int add_cgroup(Hashmap *cgroups, const char *path, bool is_const, struct 
         assert(cgroups);
         assert(ret);
 
-        if (empty_or_root(path))
-                path = "/";
+        path = empty_to_root(path);
 
         cg = hashmap_get(cgroups, path);
         if (cg) {
@@ -47,9 +52,7 @@ static int add_cgroup(Hashmap *cgroups, const char *path, bool is_const, struct 
                 if (!e)
                         return -EINVAL;
 
-                pp = strndupa(path, e - path);
-                if (!pp)
-                        return -ENOMEM;
+                pp = strndupa_safe(path, e - path);
 
                 r = add_cgroup(cgroups, pp, false, &parent);
                 if (r < 0)
@@ -107,11 +110,7 @@ static int add_process(
         if (r < 0)
                 return r;
 
-        r = hashmap_ensure_allocated(&cg->pids, &trivial_hash_ops);
-        if (r < 0)
-                return r;
-
-        return hashmap_put(cg->pids, PID_TO_PTR(pid), (void*) name);
+        return hashmap_ensure_put(&cg->pids, &trivial_hash_ops, PID_TO_PTR(pid), (void*) name);
 }
 
 static void remove_cgroup(Hashmap *cgroups, struct CGroupInfo *cg) {
@@ -135,6 +134,9 @@ static void remove_cgroup(Hashmap *cgroups, struct CGroupInfo *cg) {
 }
 
 static int cgroup_info_compare_func(struct CGroupInfo * const *a, struct CGroupInfo * const *b) {
+        assert(a);
+        assert(b);
+
         return strcmp((*a)->cgroup_path, (*b)->cgroup_path);
 }
 
@@ -150,8 +152,7 @@ static int dump_processes(
 
         assert(prefix);
 
-        if (empty_or_root(cgroup_path))
-                cgroup_path = "/";
+        cgroup_path = empty_to_root(cgroup_path);
 
         cg = hashmap_get(cgroups, cgroup_path);
         if (!cg)
@@ -159,24 +160,22 @@ static int dump_processes(
 
         if (!hashmap_isempty(cg->pids)) {
                 const char *name;
-                size_t n = 0, i;
-                pid_t *pids;
                 void *pidp;
-                Iterator j;
-                int width;
+                size_t n = 0;
 
                 /* Order processes by their PID */
-                pids = newa(pid_t, hashmap_size(cg->pids));
+                pid_t *pids = newa(pid_t, hashmap_size(cg->pids));
 
-                HASHMAP_FOREACH_KEY(name, pidp, cg->pids, j)
+                HASHMAP_FOREACH_KEY(name, pidp, cg->pids)
                         pids[n++] = PTR_TO_PID(pidp);
 
                 assert(n == hashmap_size(cg->pids));
+                assert(n > 0);
                 typesafe_qsort(pids, n, pid_compare_func);
 
-                width = DECIMAL_STR_WIDTH(pids[n-1]);
+                int width = DECIMAL_STR_WIDTH(pids[n-1]);
 
-                for (i = 0; i < n; i++) {
+                for (size_t i = 0; i < n; i++) {
                         _cleanup_free_ char *e = NULL;
                         const char *special;
                         bool more;
@@ -195,18 +194,20 @@ static int dump_processes(
                         }
 
                         more = i+1 < n || cg->children;
-                        special = special_glyph(more ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT);
+                        special = glyph(more ? GLYPH_TREE_BRANCH : GLYPH_TREE_RIGHT);
 
-                        fprintf(stdout, "%s%s%*"PID_PRI" %s\n",
+                        fprintf(stdout, "%s%s%s%*"PID_PRI" %s%s\n",
                                 prefix,
                                 special,
+                                ansi_grey(),
                                 width, pids[i],
-                                name);
+                                name,
+                                ansi_normal());
                 }
         }
 
         if (cg->children) {
-                struct CGroupInfo **children, *child;
+                struct CGroupInfo **children;
                 size_t n = 0, i;
 
                 /* Order subcgroups by their name */
@@ -224,28 +225,26 @@ static int dump_processes(
                         const char *name, *special;
                         bool more;
 
-                        child = children[i];
-
-                        name = strrchr(child->cgroup_path, '/');
+                        name = strrchr(children[i]->cgroup_path, '/');
                         if (!name)
                                 return -EINVAL;
                         name++;
 
                         more = i+1 < n;
-                        special = special_glyph(more ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT);
+                        special = glyph(more ? GLYPH_TREE_BRANCH : GLYPH_TREE_RIGHT);
 
                         fputs(prefix, stdout);
                         fputs(special, stdout);
                         fputs(name, stdout);
                         fputc('\n', stdout);
 
-                        special = special_glyph(more ? SPECIAL_GLYPH_TREE_VERTICAL : SPECIAL_GLYPH_TREE_SPACE);
+                        special = glyph(more ? GLYPH_TREE_VERTICAL : GLYPH_TREE_SPACE);
 
-                        pp = strappend(prefix, special);
+                        pp = strjoin(prefix, special);
                         if (!pp)
                                 return -ENOMEM;
 
-                        r = dump_processes(cgroups, child->cgroup_path, pp, n_columns, flags);
+                        r = dump_processes(cgroups, children[i]->cgroup_path, pp, n_columns, flags);
                         if (r < 0)
                                 return r;
                 }
@@ -264,17 +263,15 @@ static int dump_extra_processes(
         _cleanup_free_ pid_t *pids = NULL;
         _cleanup_hashmap_free_ Hashmap *names = NULL;
         struct CGroupInfo *cg;
-        size_t n_allocated = 0, n = 0, k;
-        Iterator i;
+        size_t n = 0, k;
         int width, r;
 
         /* Prints the extra processes, i.e. those that are in cgroups we haven't displayed yet. We show them as
          * combined, sorted, linear list. */
 
-        HASHMAP_FOREACH(cg, cgroups, i) {
+        HASHMAP_FOREACH(cg, cgroups) {
                 const char *name;
                 void *pidp;
-                Iterator j;
 
                 if (cg->done)
                         continue;
@@ -286,10 +283,10 @@ static int dump_extra_processes(
                 if (r < 0)
                         return r;
 
-                if (!GREEDY_REALLOC(pids, n_allocated, n + hashmap_size(cg->pids)))
+                if (!GREEDY_REALLOC(pids, n + hashmap_size(cg->pids)))
                         return -ENOMEM;
 
-                HASHMAP_FOREACH_KEY(name, pidp, cg->pids, j) {
+                HASHMAP_FOREACH_KEY(name, pidp, cg->pids) {
                         pids[n++] = PTR_TO_PID(pidp);
 
                         r = hashmap_put(names, pidp, (void*) name);
@@ -323,7 +320,7 @@ static int dump_extra_processes(
 
                 fprintf(stdout, "%s%s %*" PID_PRI " %s\n",
                         prefix,
-                        special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET),
+                        glyph(GLYPH_TRIANGULAR_BULLET),
                         width, pids[k],
                         name);
         }
@@ -338,7 +335,7 @@ int unit_show_processes(
                 const char *prefix,
                 unsigned n_columns,
                 OutputFlags flags,
-                sd_bus_error *error) {
+                sd_bus_error *reterr_error) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Hashmap *cgroups = NULL;
@@ -355,13 +352,11 @@ int unit_show_processes(
 
         prefix = strempty(prefix);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "GetUnitProcesses",
-                        error,
+                        reterr_error,
                         &reply,
                         "s",
                         unit);
@@ -387,8 +382,11 @@ int unit_show_processes(
                         break;
 
                 r = add_process(cgroups, path, pid, name);
-                if (r < 0)
+                if (r == -ENOMEM)
                         goto finish;
+                if (r < 0)
+                        log_warning_errno(r, "Invalid process description in GetUnitProcesses reply: cgroup=\"%s\" pid=%u command=\"%s\", ignoring: %m",
+                                          path, pid, name);
         }
 
         r = sd_bus_message_exit_container(reply);
@@ -399,7 +397,13 @@ int unit_show_processes(
         if (r < 0)
                 goto finish;
 
-        r = dump_extra_processes(cgroups, prefix, n_columns, flags);
+        if (!FLAGS_SET(flags, OUTPUT_HIDE_EXTRA)) {
+                r = dump_extra_processes(cgroups, prefix, n_columns, flags);
+                if (r < 0)
+                        goto finish;
+        }
+
+        r = 0;
 
 finish:
         while ((cg = hashmap_first(cgroups)))

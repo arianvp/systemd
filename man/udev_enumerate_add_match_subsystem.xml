@@ -1,10 +1,10 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="udev_enumerate_add_match_subsystem"
   xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -106,31 +106,44 @@
     <title>Return Value</title>
 
     <para>On success,
-    <function>udev_enumerate_add_match_subsystem</function>,
-    <function>udev_enumerate_add_nomatch_subsystem</function>,
-    <function>udev_enumerate_add_match_sysattr</function>,
-    <function>udev_enumerate_add_nomatch_sysattr</function>,
-    <function>udev_enumerate_add_match_property</function>,
-    <function>udev_enumerate_add_match_sysname</function>,
-    <function>udev_enumerate_add_match_tag</function>,
-    <function>udev_enumerate_add_match_parent</function> and
-    <function>udev_enumerate_add_match_is_initialized</function>
+    <function>udev_enumerate_add_match_subsystem()</function>,
+    <function>udev_enumerate_add_nomatch_subsystem()</function>,
+    <function>udev_enumerate_add_match_sysattr()</function>,
+    <function>udev_enumerate_add_nomatch_sysattr()</function>,
+    <function>udev_enumerate_add_match_property()</function>,
+    <function>udev_enumerate_add_match_sysname()</function>,
+    <function>udev_enumerate_add_match_tag()</function>,
+    <function>udev_enumerate_add_match_parent()</function> and
+    <function>udev_enumerate_add_match_is_initialized()</function>
     return an integer greater than, or equal to,
     <constant>0</constant>.</para>
   </refsect1>
 
   <refsect1>
+    <title>History</title>
+    <para><function>udev_enumerate_add_match_subsystem()</function>,
+    <function>udev_enumerate_add_nomatch_subsystem()</function>,
+    <function>udev_enumerate_add_match_sysattr()</function>,
+    <function>udev_enumerate_add_nomatch_sysattr()</function>,
+    <function>udev_enumerate_add_match_property()</function>,
+    <function>udev_enumerate_add_match_sysname()</function>,
+    <function>udev_enumerate_add_match_tag()</function>,
+    <function>udev_enumerate_add_match_parent()</function>, and
+    <function>udev_enumerate_add_match_is_initialized()</function> were added in version 221.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>udev_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_device_new_from_syspath</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_enumerate_new</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_enumerate_scan_devices</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_monitor_new_from_netlink</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>udev_list_entry</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>udev_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_device_new_from_syspath</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_enumerate_new</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_enumerate_scan_devices</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_monitor_new_from_netlink</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>udev_list_entry</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

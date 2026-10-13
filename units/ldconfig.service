@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -10,14 +10,19 @@
 [Unit]
 Description=Rebuild Dynamic Linker Cache
 Documentation=man:ldconfig(8)
-DefaultDependencies=no
-Conflicts=shutdown.target
-After=local-fs.target
-Before=sysinit.target shutdown.target systemd-update-done.service
+
 ConditionNeedsUpdate=|/etc
 ConditionFileNotEmpty=|!/etc/ld.so.cache
+
+DefaultDependencies=no
+# systemd-confext.service or systemd-tmpfiles-setup.service might put the ld.so.conf configuration files in place so
+# order it after those.
+After=local-fs.target systemd-confext.service systemd-tmpfiles-setup.service
+Before=sysinit.target systemd-update-done.service
+Conflicts=shutdown.target initrd-switch-root.target
+Before=shutdown.target initrd-switch-root.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/sbin/ldconfig -X
+ExecStart=ldconfig -X

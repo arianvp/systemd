@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
@@ -6,5 +6,7 @@
   Authors:
         Nathaniel Chen <nathaniel.chen@intel.com>
 ***/
+
+#include "core-forward.h"
 
 int mac_smack_setup(bool *loaded_policy);

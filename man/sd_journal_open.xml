@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_journal_open"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -22,6 +22,7 @@
     <refname>sd_journal_open_directory_fd</refname>
     <refname>sd_journal_open_files</refname>
     <refname>sd_journal_open_files_fd</refname>
+    <refname>sd_journal_open_namespace</refname>
     <refname>sd_journal_close</refname>
     <refname>sd_journal</refname>
     <refname>SD_JOURNAL_LOCAL_ONLY</refname>
@@ -29,6 +30,9 @@
     <refname>SD_JOURNAL_SYSTEM</refname>
     <refname>SD_JOURNAL_CURRENT_USER</refname>
     <refname>SD_JOURNAL_OS_ROOT</refname>
+    <refname>SD_JOURNAL_ALL_NAMESPACES</refname>
+    <refname>SD_JOURNAL_INCLUDE_DEFAULT_NAMESPACE</refname>
+    <refname>SD_JOURNAL_TAKE_DIRECTORY_FD</refname>
     <refpurpose>Open the system journal for reading</refpurpose>
   </refnamediv>
 
@@ -39,6 +43,13 @@
       <funcprototype>
         <funcdef>int <function>sd_journal_open</function></funcdef>
         <paramdef>sd_journal **<parameter>ret</parameter></paramdef>
+        <paramdef>int <parameter>flags</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_journal_open_namespace</function></funcdef>
+        <paramdef>sd_journal **<parameter>ret</parameter></paramdef>
+        <paramdef>const char *<parameter>namespace</parameter></paramdef>
         <paramdef>int <parameter>flags</parameter></paramdef>
       </funcprototype>
 
@@ -101,6 +112,19 @@
     <constant>SD_JOURNAL_CURRENT_USER</constant> are specified, all
     journal file types will be opened.</para>
 
+    <para><function>sd_journal_open_namespace()</function> is similar to
+    <function>sd_journal_open()</function> but takes an additional <parameter>namespace</parameter> parameter
+    that specifies which journal namespace to operate on. If specified as <constant>NULL</constant> the call
+    is identical to <function>sd_journal_open()</function>. If non-<constant>NULL</constant> only data from
+    the namespace identified by the specified parameter is accessed. This call understands two additional
+    flags: if <constant>SD_JOURNAL_ALL_NAMESPACES</constant> is specified the
+    <parameter>namespace</parameter> parameter is ignored and all defined namespaces are accessed
+    simultaneously; if <constant>SD_JOURNAL_INCLUDE_DEFAULT_NAMESPACE</constant> the specified namespace and
+    the default namespace are accessed but no others (this flag has no effect when
+    <parameter>namespace</parameter> is passed as <constant>NULL</constant>). For details about journal
+    namespaces see
+    <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+
     <para><function>sd_journal_open_directory()</function> is similar to <function>sd_journal_open()</function> but
     takes an absolute directory path as argument. All journal files in this directory will be opened and interleaved
     automatically. This call also takes a flags argument. The flags parameters accepted by this call are
@@ -113,7 +137,13 @@
 
     <para><function>sd_journal_open_directory_fd()</function> is similar to
     <function>sd_journal_open_directory()</function>, but takes a file descriptor referencing a directory in the file
-    system instead of an absolute file system path.</para>
+    system instead of an absolute file system path. In addition to the flags accepted by
+    <function>sd_journal_open_directory()</function>, this function also accepts
+    <constant>SD_JOURNAL_TAKE_DIRECTORY_FD</constant>. If <constant>SD_JOURNAL_TAKE_DIRECTORY_FD</constant> is
+    specified, the function will take the ownership of the specified file descriptor on success, and it will be
+    closed by <function>sd_journal_close()</function>, hence the caller of the function must not close the file
+    descriptor. When the flag is not specified, <function>sd_journal_close()</function> will not close the file
+    descriptor, so the caller should close it after <function>sd_journal_close()</function>.</para>
 
     <para><function>sd_journal_open_files()</function> is similar to <function>sd_journal_open()</function> but takes a
     <constant>NULL</constant>-terminated list of file paths to open.  All files will be opened and interleaved
@@ -188,15 +218,26 @@
   </refsect1>
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_journal_open()</function>,
+    <function>sd_journal_open_directory()</function>, and
+    <function>sd_journal_close()</function> were added in version 187.</para>
+    <para><function>sd_journal_open_files()</function> was added in version 205.</para>
+    <para><function>sd_journal_open_directory_fd()</function> and
+    <function>sd_journal_open_files_fd()</function> were added in version 230.</para>
+    <para><function>sd_journal_open_namespace()</function> was added in version 245.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_next</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_journal_get_data</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-machined</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-journal</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_next</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_journal_get_data</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

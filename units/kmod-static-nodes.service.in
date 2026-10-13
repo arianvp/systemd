@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -8,13 +8,15 @@
 #  (at your option) any later version.
 
 [Unit]
-Description=Create list of required static device nodes for the current kernel
+Description=Create List of Static Device Nodes
+Documentation=man:kmod(8)
 DefaultDependencies=no
-Before=sysinit.target systemd-tmpfiles-setup-dev.service
+Before=sysinit.target systemd-tmpfiles-setup-dev-early.service
 ConditionCapability=CAP_SYS_MODULE
 ConditionFileNotEmpty=/lib/modules/%v/modules.devname
+ConditionPathExists={{KMOD}}
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=@KMOD@ static-nodes --format=tmpfiles --output=/run/tmpfiles.d/kmod.conf
+ExecStart={{KMOD}} static-nodes --format=tmpfiles --output=/run/tmpfiles.d/static-nodes.conf

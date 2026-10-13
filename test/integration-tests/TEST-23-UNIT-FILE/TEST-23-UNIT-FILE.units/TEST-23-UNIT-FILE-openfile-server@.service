@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[Unit]
+Description=OpenFile= test server service
+
+[Service]
+ExecStart=echo "Socket"
+StandardInput=socket
+StandardOutput=socket

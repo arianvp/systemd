@@ -1,7 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "missing_sched.h"
+#include <sched.h>
+
+#include "forward.h"
 
 /* The combination of all namespace flags defined by the kernel. The right type for this isn't clear. setns() and
  * unshare() expect these flags to be passed as (signed) "int", while clone() wants them as "unsigned long". The latter
@@ -14,16 +16,12 @@
                           CLONE_NEWNS|                                  \
                           CLONE_NEWPID|                                 \
                           CLONE_NEWUSER|                                \
-                          CLONE_NEWUTS))
+                          CLONE_NEWUTS|                                 \
+                          CLONE_NEWTIME))
 
-#define NAMESPACE_FLAGS_INITIAL  ((unsigned long) -1)
+#define NAMESPACE_FLAGS_INITIAL  ULONG_MAX
 
 int namespace_flags_from_string(const char *name, unsigned long *ret);
 int namespace_flags_to_string(unsigned long flags, char **ret);
-
-struct namespace_flag_map {
-        unsigned long flag;
-        const char *name;
-};
-
-extern const struct namespace_flag_map namespace_flag_map[];
+int namespace_flags_to_strv(unsigned long flags, char ***ret);
+const char* namespace_single_flag_to_string(unsigned long flag) _const_;

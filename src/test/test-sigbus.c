@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -9,12 +10,13 @@
 #endif
 
 #include "fd-util.h"
+#include "fs-util.h"
 #include "memory-util.h"
 #include "sigbus.h"
 #include "tests.h"
 
 int main(int argc, char *argv[]) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         char template[] = "/tmp/sigbus-test-XXXXXX";
         void *addr = NULL;
         uint8_t *p;
@@ -35,7 +37,7 @@ int main(int argc, char *argv[]) {
 
         assert_se((fd = mkostemp(template, O_RDWR|O_CREAT|O_EXCL)) >= 0);
         assert_se(unlink(template) >= 0);
-        assert_se(posix_fallocate(fd, 0, page_size() * 8) >= 0);
+        assert_se(posix_fallocate_loop(fd, 0, page_size() * 8) >= 0); /* NOLINT (posix-return) */
 
         p = mmap(NULL, page_size() * 16, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
         assert_se(p != MAP_FAILED);

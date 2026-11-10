@@ -2568,6 +2568,16 @@ Note that this setting is <emphasis>not</emphasis> influenced by the <varname>Us
             <entry>The hostname of the running system at the point in time the unit configuration is loaded, truncated at the first dot to remove any domain component.</entry>
           </row>
           <row>
+            <entry><literal>%k</literal></entry>
+            <entry>Unit-specific machine ID</entry>
+            <entry>The machine ID of the running system, made application-specific using a hash of the prefix name (as in <literal>%p</literal>) as the application ID, formatted as a 32-character hexadecimal string. This is a stable identifier that is unique to both this machine and the unit, and from which the machine ID cannot be derived. As neither the instance nor the type suffix is included, all instances of a template unit share the same identifier, and a unit's related units of other types (e.g. <filename>foo.socket</filename> and <filename>foo.service</filename>) resolve to the same identifier too. In particular, the identifier does not change when a socket-activated service is switched between <varname>Accept=yes</varname> and <varname>Accept=no</varname>. See <citerefentry><refentrytitle>sd_id128_get_machine_app_specific</refentrytitle><manvolnum>3</manvolnum></citerefentry> for details.</entry>
+          </row>
+          <row>
+            <entry><literal>%K</literal></entry>
+            <entry>Unit instance-specific machine ID</entry>
+            <entry>Same as <literal>%k</literal>, but for instantiated units the instance name (as in <literal>%i</literal>) is included in the hash, so that each instance gets a different identifier. For non-instantiated units this is the same as <literal>%k</literal>.</entry>
+          </row>
+          <row>
             <entry><literal>%L</literal></entry>
             <entry>Log directory root</entry>
             <entry>This is either <filename>/var/log</filename> (for the system manager) or the path <varname>$XDG_STATE_HOME</varname> resolves to with <filename index="false">/log</filename> appended (for user managers).</entry>

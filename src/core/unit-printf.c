@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-id128.h"
 #include "sd-path.h"
 
 #include "alloc-util.h"
@@ -7,6 +8,7 @@
 #include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "id128-util.h"
 #include "manager.h"
 #include "specifier.h"
 #include "string-util.h"
@@ -144,6 +146,52 @@ static int specifier_shared_data_dir(char specifier, const void *data, const cha
         return sd_path_lookup(MANAGER_IS_SYSTEM(u->manager) ? SD_PATH_SYSTEM_SHARED : SD_PATH_USER_SHARED, /* suffix= */ NULL, ret);
 }
 
+static int specifier_machine_id_app_specific(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
+        const Unit *u = ASSERT_PTR(userdata);
+        bool with_instance = PTR_TO_INT(data);
+        _cleanup_free_ char *prefix = NULL, *buf = NULL;
+        sd_id128_t machine_id, id;
+        size_t n;
+        int r;
+
+        assert(ret);
+
+        /* Derives an app-specific machine ID, using a hash of the unit prefix (%p) as the application ID.
+         * This gives every unit a stable identifier that is unique to this machine, without leaking the
+         * machine ID itself. The type suffix and the "@" are deliberately not included, so that the
+         * identifier stays the same when e.g. a socket-activated service is switched between Accept=yes and
+         * Accept=no. If with_instance is true, the instance (%i) is included too, separated by a NUL byte
+         * (which cannot be part of a unit name), if the unit has one. The escaped forms are used, as unlike
+         * the unescaped ones they map one-to-one to unit names. */
+
+        r = unit_name_to_prefix(u->id, &prefix);
+        if (r < 0)
+                return r;
+
+        n = strlen(prefix);
+
+        if (with_instance && !isempty(u->instance)) {
+                size_t m = strlen(u->instance);
+
+                buf = new(char, n + 1 + m);
+                if (!buf)
+                        return -ENOMEM;
+
+                memcpy(mempcpy(buf, prefix, n + 1), u->instance, m);
+                n += 1 + m;
+        }
+
+        r = id128_get_machine(root, &machine_id);
+        if (r < 0) /* Translate error for missing /etc/machine-id file to EUNATCH. */
+                return r == -ENOENT ? -EUNATCH : r;
+
+        r = sd_id128_get_app_specific(machine_id, id128_digest(buf ?: prefix, n), &id);
+        if (r < 0)
+                return r;
+
+        return specifier_id128(specifier, &id, root, userdata, ret);
+}
+
 int unit_name_printf(const Unit *u, const char *format, char **ret) {
         /*
          * This will use the passed string as format string and replace the following specifiers (which should all be
@@ -197,6 +245,9 @@ int unit_full_printf_full(const Unit *u, const char *format, size_t max_length, 
          * %h: the homedir of the running user
          * %s: the shell of the running user
          *
+         * %k: the machine ID made app-specific with a hash of the prefix (%p) as the app ID
+         * %K: like %k, but the instance (%i) is included in the hash, if there is one
+         *
          * NOTICE: When you add new entries here, please be careful: specifiers which depend on settings of
          * the unit file itself are broken by design, as they would resolve differently depending on whether
          * they are used before or after the relevant configuration setting. Hence: don't add them.
@@ -234,6 +285,9 @@ int unit_full_printf_full(const Unit *u, const char *format, size_t max_length, 
 
                 { 'h', specifier_user_home,                NULL },
                 { 's', specifier_user_shell,               NULL },
+
+                { 'k', specifier_machine_id_app_specific,  INT_TO_PTR(false) },
+                { 'K', specifier_machine_id_app_specific,  INT_TO_PTR(true) },
 
                 COMMON_SYSTEM_SPECIFIERS,
 

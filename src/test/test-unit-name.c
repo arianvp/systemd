@@ -13,6 +13,7 @@
 #include "format-util.h"
 #include "glob-util.h"
 #include "hostname-setup.h"
+#include "id128-util.h"
 #include "manager.h"
 #include "path-util.h"
 #include "rm-rf.h"
@@ -322,6 +323,16 @@ TEST(unit_name_mangle_with_suffix_strict) {
         test_unit_name_mangle_with_suffix_strict_one("foo", ".service", 1, "foo.service");
 }
 
+static char* unit_machine_id(const void *data, size_t size) {
+        sd_id128_t id;
+
+        /* Computed via the public API, independently of the specifier implementation */
+        if (sd_id128_get_machine_app_specific(id128_digest(data, size), &id) < 0)
+                return NULL;
+
+        return strdup(SD_ID128_TO_STRING(id));
+}
+
 TEST_RET(unit_printf, .sd_booted = true) {
         _cleanup_free_ char
                 *architecture, *os_image_version, *boot_id = NULL, *os_build_id,
@@ -412,8 +423,16 @@ TEST_RET(unit_printf, .sd_booted = true) {
         expect(u, "%H", hostname);
         expect(u, "%l", short_hostname);
         expect(u, "%q", pretty_hostname);
-        if (machine_id)
+        if (machine_id) {
+                _cleanup_free_ char *k = NULL;
+
                 expect(u, "%m", machine_id);
+
+                ASSERT_NOT_NULL(k = unit_machine_id("blah", STRLEN("blah")));
+                ASSERT_FALSE(streq(k, machine_id));
+                expect(u, "%k", k);
+                expect(u, "%K", k);
+        }
         expect(u, "%M", os_image_id);
         expect(u, "%o", os_id);
         expect(u, "%w", os_version_id);
@@ -466,6 +485,17 @@ TEST_RET(unit_printf, .sd_booted = true) {
         expect(u, "%J", "blah");
         expect(u, "%n", "blah@foo-foo.service");
         expect(u, "%N", "blah@foo-foo");
+        if (machine_id) {
+                _cleanup_free_ char *k = NULL, *k_prefix = NULL;
+
+                /* %p and %i, separated by a NUL byte */
+                ASSERT_NOT_NULL(k = unit_machine_id("blah\0foo-foo", STRLEN("blah\0foo-foo")));
+                /* Same as for blah.service, so that switching between Accept=yes/no keeps the ID */
+                ASSERT_NOT_NULL(k_prefix = unit_machine_id("blah", STRLEN("blah")));
+                ASSERT_FALSE(streq(k, k_prefix));
+                expect(u, "%k", k_prefix);
+                expect(u, "%K", k);
+        }
         expect(u, "%p", "blah");
         expect(u, "%P", "blah");
         expect(u, "%f", "/foo/foo");
